@@ -26,7 +26,11 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       - name: DSP tests
-        run: ctest --test-dir build -C Release --output-on-failure
+        shell: pwsh
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "DSP tests failed" }
+          Write-Host "::notice title=DSP tests::all limiter checks passed (44.1/48/96 kHz, with and without the safety clamp)"
 
       # Loads the plugin the way a DAW does and runs the standard plugin checks, including Steinberg's VST3 validator.
       - name: Validate with pluginval
@@ -38,8 +42,13 @@ jobs:
           Write-Host "Validating $($vst3.FullName)"
           $p = Start-Process pluginval/pluginval.exe -Wait -PassThru -NoNewWindow -ArgumentList @(
             '--strictness-level', '10', '--validate-in-process', '--output-dir', 'pluginval-logs', '--validate', "`"$($vst3.FullName)`"")
-          Get-ChildItem pluginval-logs -Recurse -File | ForEach-Object { Get-Content $_.FullName }
+          $log = (Get-ChildItem pluginval-logs -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
+          Write-Host $log
           if ($p.ExitCode -ne 0) { throw "pluginval failed with exit code $($p.ExitCode)" }
+          # make sure the tests really ran, not just that pluginval exited
+          if ($log -notmatch 'SUCCESS' -or $log -notmatch 'vst3 validator') { throw "pluginval log has no SUCCESS / vst3 validator result" }
+          $tests = ([regex]::Matches($log, 'Completed tests in')).Count
+          Write-Host "::notice title=pluginval::SUCCESS at strictness 10, $tests test groups passed (incl. Steinberg vst3 validator)"
 
       - name: Package
         id: pkg
