@@ -54,6 +54,7 @@ public:
         n_ = 0;
         rel_ = 1.0f;
         minGain_ = 1.0f;
+        inPeak_ = outPeak_ = 0.0f;
     }
 
     void setCeilingDb(float db) { ceiling_ = dbToGain(std::min(0.0f, db)); }
@@ -74,6 +75,10 @@ public:
         return std::min(0.0f, gainToDb(g));
     }
 
+    /// Loudest input (after Input Gain) and output sample since the last call, linear. For the meters.
+    float takeInputPeak() { const float v = inPeak_; inPeak_ = 0.0f; return v; }
+    float takeOutputPeak() { const float v = outPeak_; outPeak_ = 0.0f; return v; }
+
     /// in and out may point to the same buffers. bypass keeps the latency but applies no gain.
     void process(const float* const* in, float* const* out, int channels, int frames, bool bypass = false)
     {
@@ -90,6 +95,7 @@ public:
                 peak = std::max(peak, std::fabs(x[c]));
             }
             const float need = peak > ceiling_ ? ceiling_ / peak : 1.0f;
+            inPeak_ = std::max(inPeak_, peak);
 
             // 3. sliding minimum over the last L samples (monotonic queue)
             while (dqCount_ > 0 && dqVal_[back()] >= need) --dqCount_;
@@ -129,6 +135,7 @@ public:
 #else
                 out[c][i] = bypass ? y : std::max(-ceiling_, std::min(ceiling_, y));
 #endif
+                outPeak_ = std::max(outPeak_, std::fabs(out[c][i]));
             }
             for (int c = nch; c < channels; ++c) out[c][i] = 0.0f;
             if (++dPos_ == D_) dPos_ = 0;
@@ -157,6 +164,7 @@ private:
     int boxPos_ = 0, sinceResum_ = 0;
 
     float minGain_ = 1.0f;
+    float inPeak_ = 0.0f, outPeak_ = 0.0f;
 };
 
 } // namespace vgl

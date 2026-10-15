@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(VolumeGuardLimiter VERSION 1.0.0 LANGUAGES C CXX)
+project(VolumeGuardLimiter VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,15 +7,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Windows: link the C++ runtime statically, so the plugin does not need the Visual C++ Redistributable.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-# Plugins only, no custom UI: hosts show their own sliders for the parameters.
 set(DPF_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(DPF_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory(dpf)
 
 dpf_add_plugin(VolumeGuardLimiter
-  TARGETS vst3 clap
+  TARGETS vst3 clap ${VGL_EXTRA_TARGETS}
+  UI_TYPE opengl
   FILES_DSP
-    src/VolumeGuardLimiter.cpp)
+    src/VolumeGuardLimiter.cpp
+  FILES_UI
+    src/VolumeGuardLimiterUI.cpp)
 
 target_include_directories(VolumeGuardLimiter PUBLIC src)
 

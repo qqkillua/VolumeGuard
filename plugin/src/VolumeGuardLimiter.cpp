@@ -15,6 +15,8 @@ public:
         kRelease,
         kBypass,
         kGainReduction,   // output: meter
+        kInputLevel,      // output: meter
+        kOutputLevel,     // output: meter
         kParameterCount
     };
 
@@ -26,6 +28,8 @@ public:
         fValues[kRelease] = 100.0f;
         fValues[kBypass] = 0.0f;
         fValues[kGainReduction] = 0.0f;
+        fValues[kInputLevel] = -60.0f;
+        fValues[kOutputLevel] = -60.0f;
         prepare();
     }
 
@@ -38,7 +42,7 @@ protected:
     const char* getMaker() const override { return "qqkillua"; }
     const char* getHomePage() const override { return "https://github.com/qqkillua/VolumeGuard"; }
     const char* getLicense() const override { return "MIT"; }
-    uint32_t getVersion() const override { return d_version(1, 0, 0); }
+    uint32_t getVersion() const override { return d_version(1, 1, 0); }
     int64_t getUniqueId() const override { return d_cconst('V', 'G', 'L', 'm'); }
 
     void initAudioPort(bool input, uint32_t index, AudioPort& port) override
@@ -92,6 +96,17 @@ protected:
             p.ranges.max = 0.0f;
             p.ranges.def = 0.0f;
             break;
+        case kInputLevel:
+        case kOutputLevel:
+            p.hints = kParameterIsOutput;
+            p.name = index == kInputLevel ? "Input Level" : "Output Level";
+            p.shortName = index == kInputLevel ? "In" : "Out";
+            p.symbol = index == kInputLevel ? "input_level" : "output_level";
+            p.unit = "dB";
+            p.ranges.min = -60.0f;
+            p.ranges.max = 6.0f;
+            p.ranges.def = -60.0f;
+            break;
         }
     }
 
@@ -102,7 +117,7 @@ protected:
 
     void setParameterValue(uint32_t index, float value) override
     {
-        if (index >= kParameterCount || index == kGainReduction)
+        if (index >= kParameterCount || index >= kGainReduction)
             return;
         fValues[index] = value;
         switch (index)
@@ -118,7 +133,15 @@ protected:
     void run(const float** inputs, float** outputs, uint32_t frames) override
     {
         fLimiter.process(inputs, outputs, 2, (int)frames, fValues[kBypass] > 0.5f);
-        fValues[kGainReduction] = std::max(-40.0f, fLimiter.takeGainReductionDb());
+
+        // Meters: jump up at once, fall back at 20 dB per second so they are readable.
+        const float fall = 20.0f * (float)frames / (float)getSampleRate();
+        const float gr = std::max(-40.0f, fLimiter.takeGainReductionDb());
+        const float in = std::max(-60.0f, vgl::gainToDb(fLimiter.takeInputPeak()));
+        const float out = std::max(-60.0f, vgl::gainToDb(fLimiter.takeOutputPeak()));
+        fValues[kGainReduction] = std::min(gr, std::min(0.0f, fValues[kGainReduction] + fall));
+        fValues[kInputLevel] = std::min(6.0f, std::max(in, fValues[kInputLevel] - fall));
+        fValues[kOutputLevel] = std::min(6.0f, std::max(out, fValues[kOutputLevel] - fall));
     }
 
     void sampleRateChanged(double) override { prepare(); }
