@@ -10,9 +10,17 @@ START_NAMESPACE_DISTRHO
 namespace {
 
 // Parameter indices — keep in sync with VolumeGuardLimiter.cpp
-enum { kInputGain = 0, kCeiling, kRelease, kBypass, kGainReduction, kInputLevel, kOutputLevel, kCount };
+enum { kInputGain = 0, kCeiling, kRelease, kBypass, kGainReduction, kInputLevel, kOutputLevel, kMode, kAmount, kCount };
 
-constexpr uint kWidth = 520, kHeight = 352;
+constexpr uint kWidth = 520, kHeight = 440;
+constexpr int kSliderCount = 4;
+
+const char* const kModeNames[3] = { "LIMITER", "COMFORT", "TACTICAL" };
+const char* const kModeHints[3] = {
+    "only keeps the output below the ceiling",
+    "no sudden jumps: loud sounds pressed down gently",
+    "quieter shots and rumble, louder steps",
+};
 
 // Colours of the VolumeGuard app
 const Color kBg(24, 25, 28), kCard(35, 37, 42), kText(233, 234, 237), kSub(146, 150, 160), kTrack(58, 61, 68),
@@ -56,11 +64,14 @@ public:
         fValues[kGainReduction] = 0.0f;
         fValues[kInputLevel] = -60.0f;
         fValues[kOutputLevel] = -60.0f;
+        fValues[kMode] = 0.0f;
+        fValues[kAmount] = 50.0f;
 
         const float x = 132, w = 290;
-        fSliders[0] = { kInputGain, "Input Gain", -12.0f, 24.0f, 0.0f, false, x, 92, w };
-        fSliders[1] = { kCeiling, "Ceiling", -30.0f, 0.0f, -1.0f, false, x, 140, w };
-        fSliders[2] = { kRelease, "Release", 1.0f, 1000.0f, 100.0f, true, x, 188, w };
+        fSliders[0] = { kInputGain, "Input Gain", -12.0f, 24.0f, 0.0f, false, x, 172, w };
+        fSliders[1] = { kAmount, "Amount", 0.0f, 100.0f, 50.0f, false, x, 214, w };
+        fSliders[2] = { kCeiling, "Ceiling", -30.0f, 0.0f, -1.0f, false, x, 256, w };
+        fSliders[3] = { kRelease, "Release", 1.0f, 1000.0f, 100.0f, true, x, 298, w };
     }
 
 protected:
@@ -84,8 +95,9 @@ protected:
 
         // background and card
         rectFill(0, 0, kWidth, kHeight, kBg);
-        roundFill(12, 56, kWidth - 24, 172, 10, kCard);
-        roundFill(12, 238, kWidth - 24, 102, 10, kCard);
+        roundFill(12, 56, kWidth - 24, 66, 10, kCard);
+        roundFill(12, 132, kWidth - 24, 186, 10, kCard);
+        roundFill(12, 328, kWidth - 24, 104, 10, kCard);
 
         // header
         fontFace(NANOVG_DEJAVU_SANS_TTF);
@@ -99,7 +111,7 @@ protected:
         text(18 + titleWidth, 22, "Limiter", nullptr);
         fontSize(11.5f);
         fillColor(kSub);
-        text(18, 42, "lookahead brickwall limiter", nullptr);
+        text(18, 42, "lookahead limiter with a game mode", nullptr);
 
         // bypass switch (top right)
         drawSwitch(kWidth - 120, 16, !bypass, bypass ? "BYPASS" : "ACTIVE");
@@ -107,18 +119,37 @@ protected:
         // section titles
         fontSize(10.5f);
         fillColor(kSub);
-        text(26, 70, "SETTINGS", nullptr);
-        text(26, 252, "METERS", nullptr);
+        text(26, 70, "MODE", nullptr);
+        text(26, 146, "SETTINGS", nullptr);
+        text(26, 342, "METERS", nullptr);
+
+        // mode buttons
+        const int mode = modeIndex();
+        for (int i = 0; i < 3; ++i)
+        {
+            float bx, bw;
+            modeButton(i, bx, bw);
+            const bool on = i == mode;
+            roundFill(bx, 80, bw, 24, 6, on ? (bypass ? kOff : (i == 2 ? kRed : kAccent)) : kTrack);
+            fontSize(11.5f);
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            fillColor(on ? Color(255, 255, 255) : kSub);
+            text(bx + bw / 2, 92, kModeNames[i], nullptr);
+        }
+        fontSize(11);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(kSub);
+        text(90, 70, kModeHints[mode], nullptr);
 
         // sliders
         for (const Slider& s : fSliders)
-            drawSlider(s, bypass);
+            drawSlider(s, bypass || (s.param == kAmount && mode == 0));
 
         // meters
         const float ceiling = fValues[kCeiling];
-        drawMeter(274, "IN", fValues[kInputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
-        drawMeter(300, "OUT", fValues[kOutputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
-        drawReduction(326, bypass ? 0.0f : fValues[kGainReduction]);
+        drawMeter(364, "IN", fValues[kInputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
+        drawMeter(390, "OUT", fValues[kOutputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
+        drawReduction(416, bypass ? 0.0f : fValues[kGainReduction]);
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -151,10 +182,26 @@ protected:
             return true;
         }
 
-        for (int i = 0; i < 3; ++i)
+        // mode buttons
+        if (my >= 78 && my <= 106)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                float bx, bw;
+                modeButton(i, bx, bw);
+                if (mx < bx || mx > bx + bw || i == modeIndex()) continue;
+                editParameter(kMode, true);
+                setValue(kMode, (float)i);
+                editParameter(kMode, false);
+                return true;
+            }
+        }
+
+        for (int i = 0; i < kSliderCount; ++i)
         {
             const Slider& s = fSliders[i];
             if (my < s.y - 16 || my > s.y + 16 || mx < s.x - 12 || mx > s.x + s.w + 12) continue;
+            if (s.param == kAmount && modeIndex() == 0) return true;   // Amount only matters in a game mode
 
             // double click: back to default
             if (ev.time - fLastClickTime < 350 && fLastClickSlider == i)
@@ -190,6 +237,7 @@ protected:
         for (const Slider& s : fSliders)
         {
             if (my < s.y - 16 || my > s.y + 16 || mx < s.x - 12 || mx > s.x + s.w + 30) continue;
+            if (s.param == kAmount && modeIndex() == 0) return true;
             const float step = ev.delta.getY() > 0 ? 0.01f : -0.01f;
             editParameter((uint32_t)s.param, true);
             setValue(s.param, s.fromPos(s.toPos(fValues[s.param]) + step));
@@ -201,9 +249,18 @@ protected:
 
 private:
 
+    int modeIndex() const { return std::max(0, std::min(2, (int)std::lround(fValues[kMode]))); }
+
+    void modeButton(int i, float& x, float& w) const
+    {
+        const float left = 26, right = kWidth - 26, gap = 8;
+        w = (right - left - 2 * gap) / 3;
+        x = left + i * (w + gap);
+    }
+
     void setValue(int param, float v)
     {
-        if (param == kRelease) v = std::round(v);
+        if (param == kRelease || param == kAmount || param == kMode) v = std::round(v);
         else if (param != kBypass) v = std::round(v * 10.0f) / 10.0f;
         fValues[param] = v;
         repaint();
@@ -266,6 +323,7 @@ private:
 
         char buf[32];
         if (s.param == kRelease) std::snprintf(buf, sizeof buf, "%.0f ms", v);
+        else if (s.param == kAmount) std::snprintf(buf, sizeof buf, "%.0f %%", v);
         else if (std::fabs(v) < 0.05f) std::snprintf(buf, sizeof buf, "0.0 dB");
         else std::snprintf(buf, sizeof buf, "%+.1f dB", v);
         textAlign(ALIGN_RIGHT | ALIGN_MIDDLE);
@@ -321,7 +379,7 @@ private:
     }
 
     float fValues[kCount];
-    Slider fSliders[3];
+    Slider fSliders[kSliderCount];
     int fDragging = -1;
     int fLastClickSlider = -1;
     uint fLastClickTime = 0;

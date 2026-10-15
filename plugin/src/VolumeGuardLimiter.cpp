@@ -1,7 +1,8 @@
-// VolumeGuard Limiter — DPF plugin wrapper around LookaheadLimiter.
+// VolumeGuard Limiter — DPF plugin: input gain → Game mode (optional) → lookahead limiter.
 // Copyright (c) 2026 Nikita Bainov (qqkillua). MIT License.
 #include "DistrhoPlugin.hpp"
 #include "LimiterDsp.hpp"
+#include "GameDsp.hpp"
 
 START_NAMESPACE_DISTRHO
 
@@ -17,6 +18,8 @@ public:
         kGainReduction,   // output: meter
         kInputLevel,      // output: meter
         kOutputLevel,     // output: meter
+        kMode,            // 0 Limiter, 1 Comfort, 2 Tactical (added in 1.2.0, so it comes after the meters)
+        kAmount,          // Game mode strength, %
         kParameterCount
     };
 
@@ -30,6 +33,9 @@ public:
         fValues[kGainReduction] = 0.0f;
         fValues[kInputLevel] = -60.0f;
         fValues[kOutputLevel] = -60.0f;
+        fValues[kMode] = 0.0f;
+        fValues[kAmount] = 50.0f;
+        fLimiter.setInputGainDb(0.0f);   // input gain is applied before the Game mode, see run()
         prepare();
     }
 
@@ -37,12 +43,12 @@ protected:
     const char* getLabel() const override { return "VolumeGuardLimiter"; }
     const char* getDescription() const override
     {
-        return "Lookahead brickwall limiter: keeps the output below the ceiling without clipping.";
+        return "Lookahead brickwall limiter with a Game mode that tames gunshots and rumble and lifts quiet sounds.";
     }
     const char* getMaker() const override { return "qqkillua"; }
     const char* getHomePage() const override { return "https://github.com/qqkillua/VolumeGuard"; }
     const char* getLicense() const override { return "MIT"; }
-    uint32_t getVersion() const override { return d_version(1, 1, 1); }
+    uint32_t getVersion() const override { return d_version(1, 2, 0); }
     int64_t getUniqueId() const override { return d_cconst('V', 'G', 'L', 'm'); }
 
     void initAudioPort(bool input, uint32_t index, AudioPort& port) override
@@ -115,6 +121,29 @@ protected:
             p.ranges.max = 6.0f;
             p.ranges.def = -60.0f;
             break;
+        case kMode:
+            p.hints = kParameterIsAutomatable | kParameterIsInteger;
+            p.name = "Mode";
+            p.symbol = "mode";
+            p.ranges.min = 0.0f;
+            p.ranges.max = 2.0f;
+            p.ranges.def = 0.0f;
+            p.enumValues.count = 3;
+            p.enumValues.restrictedMode = true;
+            p.enumValues.values = new ParameterEnumerationValue[3];
+            p.enumValues.values[0] = ParameterEnumerationValue(0.0f, "Limiter");
+            p.enumValues.values[1] = ParameterEnumerationValue(1.0f, "Comfort");
+            p.enumValues.values[2] = ParameterEnumerationValue(2.0f, "Tactical");
+            break;
+        case kAmount:
+            p.hints = kParameterIsAutomatable;
+            p.name = "Amount";
+            p.symbol = "amount";
+            p.unit = "%";
+            p.ranges.min = 0.0f;
+            p.ranges.max = 100.0f;
+            p.ranges.def = 50.0f;
+            break;
         }
     }
 
@@ -125,30 +154,59 @@ protected:
 
     void setParameterValue(uint32_t index, float value) override
     {
-        if (index >= kParameterCount || index >= kGainReduction)
+        if (index >= kParameterCount || (index >= kGainReduction && index <= kOutputLevel))
             return;
         fValues[index] = value;
         switch (index)
         {
-        case kInputGain: fLimiter.setInputGainDb(value); break;
+        case kInputGain: fInputGain = vgl::dbToGain(value); break;
         case kCeiling:   fLimiter.setCeilingDb(value); break;
         case kRelease:   fLimiter.setReleaseMs(value); break;
+        case kMode:      fGame.setMode((int)std::lround(value)); break;
+        case kAmount:    fGame.setAmount(value / 100.0f); break;
         }
     }
 
-    void activate() override { fLimiter.reset(); }
+    void activate() override { fLimiter.reset(); fGame.reset(); }
 
     void run(const float** inputs, float** outputs, uint32_t frames) override
     {
         if (frames == 0 || inputs == nullptr || outputs == nullptr
             || inputs[0] == nullptr || inputs[1] == nullptr || outputs[0] == nullptr || outputs[1] == nullptr)
             return;
-        fLimiter.process(inputs, outputs, 2, (int)frames, fValues[kBypass] > 0.5f);
+        float inPeak = 0.0f;
+        float gameGrDb = 0.0f;
+        if (fValues[kBypass] > 0.5f)
+        {
+            // dry signal, same latency
+            fLimiter.process(inputs, outputs, 2, (int)frames, true);
+            inPeak = fLimiter.takeInputPeak();
+        }
+        else
+        {
+            // in chunks through a scratch buffer: input gain → Game mode → limiter
+            for (uint32_t pos = 0; pos < frames; pos += kChunk)
+            {
+                const uint32_t n = std::min<uint32_t>(kChunk, frames - pos);
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    fScratch[0][i] = inputs[0][pos + i] * fInputGain;
+                    fScratch[1][i] = inputs[1][pos + i] * fInputGain;
+                    inPeak = std::max(inPeak, std::max(std::fabs(fScratch[0][i]), std::fabs(fScratch[1][i])));
+                }
+                fGame.process(fScratch[0], fScratch[1], (int)n);
+                const float* in[2] = { fScratch[0], fScratch[1] };
+                float* out[2] = { outputs[0] + pos, outputs[1] + pos };
+                fLimiter.process(in, out, 2, (int)n);
+            }
+            fLimiter.takeInputPeak();
+            if (fGame.mode() != vgl::GameProcessor::kOff) gameGrDb = fGame.takeReductionDb();
+        }
 
         // Meters: jump up at once, fall back at 20 dB per second so they are readable.
         const float fall = 20.0f * (float)frames / (float)getSampleRate();
-        const float gr = std::max(-40.0f, fLimiter.takeGainReductionDb());
-        const float in = std::max(-60.0f, vgl::gainToDb(fLimiter.takeInputPeak()));
+        const float gr = std::max(-40.0f, fLimiter.takeGainReductionDb() + gameGrDb);
+        const float in = std::max(-60.0f, vgl::gainToDb(inPeak));
         const float out = std::max(-60.0f, vgl::gainToDb(fLimiter.takeOutputPeak()));
         fValues[kGainReduction] = std::min(gr, std::min(0.0f, fValues[kGainReduction] + fall));
         fValues[kInputLevel] = std::min(6.0f, std::max(in, fValues[kInputLevel] - fall));
@@ -161,13 +219,22 @@ private:
     void prepare()
     {
         fLimiter.prepare(getSampleRate(), 2, 5.0);
-        fLimiter.setInputGainDb(fValues[kInputGain]);
+        fLimiter.setInputGainDb(0.0f);
         fLimiter.setCeilingDb(fValues[kCeiling]);
+        fInputGain = vgl::dbToGain(fValues[kInputGain]);
+        fGame.prepare(getSampleRate());
+        fGame.setMode((int)std::lround(fValues[kMode]));
+        fGame.setAmount(fValues[kAmount] / 100.0f);
         fLimiter.setReleaseMs(fValues[kRelease]);
         setLatency((uint32_t)fLimiter.latencySamples());
     }
 
+    static constexpr uint32_t kChunk = 256;
+
     vgl::LookaheadLimiter fLimiter;
+    vgl::GameProcessor fGame;
+    float fInputGain = 1.0f;
+    float fScratch[2][kChunk];
     float fValues[kParameterCount];
 
     DISTRHO_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(VolumeGuardLimiter)
