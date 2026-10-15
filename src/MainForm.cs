@@ -56,7 +56,7 @@ namespace VolumeGuard
             ForeColor = Theme.Text;
             Font = Theme.Font(9f);
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(Theme.D(500), Theme.D(700));
+            ClientSize = new Size(Theme.D(500), Theme.D(770));
             MinimumSize = new Size(Theme.D(420), Theme.D(460));
             iconOn = MakeIcon(true);
             iconOff = MakeIcon(false);
@@ -96,6 +96,21 @@ namespace VolumeGuard
             deviceBox.SelectedIndexChanged += delegate { OnDeviceChosen(); };
             devRow.Controls.Add(deviceBox);
             devRow.Controls.Add(devLbl);
+
+            // how the limiter behaves: return speed and peak / loudness mode
+            var optRow = new Panel { Dock = DockStyle.Top, Height = Theme.D(76), BackColor = Theme.Bg };
+            var tips = new ToolTip { AutoPopDelay = 15000, InitialDelay = 300 };
+            AddSegments(optRow, tips, "Возврат громкости", 2,
+                new[] { "Быстро", "Средне", "Медленно" },
+                new[] { "Громкость возвращается примерно за 0,6 с после громкого звука",
+                        "Примерно за 1 с",
+                        "Примерно за 2 с — громкость меньше «качает», удобно для фильмов" },
+                () => s.ReturnSpeed, v => { s.ReturnSpeed = v; s.Dirty = true; });
+            AddSegments(optRow, tips, "Ограничивать", Theme.D(38) + 2,
+                new[] { "По пикам", "По громкости" },
+                new[] { "Ни один пик не громче лимита. Но после каждого выстрела или щелчка звук ненадолго проседает",
+                        "Средняя громкость (за 0,4 с) не выше лимита, а короткие пики могут быть до 6 дБ громче. Звук не проседает после одиночных выстрелов, а громкая реклама и взрывы всё равно приглушаются" },
+                () => s.LoudnessMode ? 1 : 0, v => { s.LoudnessMode = v == 1; s.Dirty = true; });
 
             // master card
             var masterWrap = new Panel { Dock = DockStyle.Top, Height = Theme.D(112), BackColor = Theme.Bg, Padding = new Padding(Theme.D(12), 0, Theme.D(12), 0) };
@@ -159,6 +174,7 @@ namespace VolumeGuard
             Controls.Add(footer);
             Controls.Add(section);
             Controls.Add(masterWrap);
+            Controls.Add(optRow);
             Controls.Add(devRow);
             Controls.Add(header);
 
@@ -405,6 +421,35 @@ namespace VolumeGuard
         }
 
         public void OpenProcessing() { ShowProcessing(); }
+
+        /// A label and a row of buttons of which one is selected.
+        static void AddSegments(Panel row, ToolTip tips, string label, int y, string[] names, string[] hints, Func<int> get, Action<int> set)
+        {
+            row.Controls.Add(new Label
+            {
+                Text = label, ForeColor = Theme.Sub, Location = new Point(Theme.D(16), y), Size = new Size(Theme.D(130), Theme.D(30)),
+                TextAlign = ContentAlignment.MiddleLeft
+            });
+            var buttons = new List<FlatButton>();
+            int x = Theme.D(150);
+            for (int i = 0; i < names.Length; i++)
+            {
+                int index = i;
+                var b = new FlatButton { Text = names[i], Font = Theme.Font(9f), Location = new Point(x, y), Height = Theme.D(30) };
+                b.FitWidth();
+                b.Width = Math.Max(b.Width, Theme.D(84));
+                b.Selected = get() == i;
+                b.Click += delegate
+                {
+                    set(index);
+                    foreach (var o in buttons) o.Selected = o == b;
+                };
+                tips.SetToolTip(b, hints[i]);
+                buttons.Add(b);
+                row.Controls.Add(b);
+                x += b.Width + Theme.D(6);
+            }
+        }
 
         void ShowProcessing()
         {
