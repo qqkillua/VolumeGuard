@@ -169,7 +169,6 @@ build.cmd
 
 **Новая версия.** GitHub Actions собирает exe при каждом пуше в `main`. Чтобы выпустить релиз, поменяйте номер
 в `VERSION` и в `src/AssemblyInfo.cs` и добавьте `[release]` в сообщение коммита — архив появится на странице Releases сам.
-Как подключена подпись релизов — в [`.signpath/README.md`](.signpath/README.md).
 
 | Файл | Что внутри |
 |---|---|
@@ -194,17 +193,12 @@ VolumeGuard не подключается к интернету и никуда 
 значение `VolumeGuard`), и только если вы включили «Запускать вместе с Windows». Чтобы удалить программу,
 выключите автозапуск, закройте её и удалите папку с exe и `%APPDATA%\VolumeGuard`.
 
-## Code signing policy
+## Цифровая подпись
 
-Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
-
-- Committers and reviewers: [@qqkillua](https://github.com/qqkillua)
-- Approvers: [@qqkillua](https://github.com/qqkillua)
-
-Signed releases are built from this repository by GitHub Actions; every signing request is approved manually.
-
-**Privacy policy:** This program will not transfer any information to other networked systems unless specifically
-requested by the user or the person installing or operating it.
+Релизы VolumeGuard **не подписаны** цифровой подписью: сертификата у проекта нет. Поэтому при первом запуске
+Windows может показать предупреждение SmartScreen — как его снять, написано в разделе «Установка».
+Каждый релиз собирается из этого репозитория на GitHub Actions, так что любой может проверить исходники
+или собрать программу сам.
 
 ## Лицензия
 
