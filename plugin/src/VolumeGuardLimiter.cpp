@@ -42,7 +42,7 @@ protected:
     const char* getMaker() const override { return "qqkillua"; }
     const char* getHomePage() const override { return "https://github.com/qqkillua/VolumeGuard"; }
     const char* getLicense() const override { return "MIT"; }
-    uint32_t getVersion() const override { return d_version(1, 1, 0); }
+    uint32_t getVersion() const override { return d_version(1, 1, 1); }
     int64_t getUniqueId() const override { return d_cconst('V', 'G', 'L', 'm'); }
 
     void initAudioPort(bool input, uint32_t index, AudioPort& port) override
@@ -84,7 +84,15 @@ protected:
             p.ranges.def = 100.0f;
             break;
         case kBypass:
-            p.initDesignation(kParameterDesignationBypass);
+            // A plain on/off parameter of the plugin. It is deliberately NOT the host's special VST3 bypass
+            // parameter: some hosts disable the plugin and close its window when the plugin itself flips that
+            // one, which crashed the host when the button in our window was clicked.
+            p.hints = kParameterIsAutomatable | kParameterIsBoolean | kParameterIsInteger;
+            p.name = "Bypass";
+            p.symbol = "bypass";
+            p.ranges.min = 0.0f;
+            p.ranges.max = 1.0f;
+            p.ranges.def = 0.0f;
             break;
         case kGainReduction:
             p.hints = kParameterIsOutput;
@@ -132,6 +140,9 @@ protected:
 
     void run(const float** inputs, float** outputs, uint32_t frames) override
     {
+        if (frames == 0 || inputs == nullptr || outputs == nullptr
+            || inputs[0] == nullptr || inputs[1] == nullptr || outputs[0] == nullptr || outputs[1] == nullptr)
+            return;
         fLimiter.process(inputs, outputs, 2, (int)frames, fValues[kBypass] > 0.5f);
 
         // Meters: jump up at once, fall back at 20 dB per second so they are readable.

@@ -206,8 +206,9 @@ private:
         if (param == kRelease) v = std::round(v);
         else if (param != kBypass) v = std::round(v * 10.0f) / 10.0f;
         fValues[param] = v;
-        setParameterValue((uint32_t)param, v);
         repaint();
+        // tell the host last: nothing in this window is touched after the host has reacted
+        setParameterValue((uint32_t)param, v);
     }
 
     // ---------------------------------------------------------------------------------------------------
