@@ -20,7 +20,7 @@ extern "C" {
 #define VG_API __declspec(dllimport)
 #endif
 
-#define VG_API_VERSION 1
+#define VG_API_VERSION 2
 
 /* results */
 #define VG_OK              0
@@ -57,6 +57,10 @@ typedef struct vg_status
     float latencyMs;        /* estimate of the whole path, source → output */
     float bufferMs;         /* audio waiting between the two devices */
     float correctionPpm;    /* clock-drift correction currently applied */
+    /* API 2: where the latency comes from (latencyMs = sourceMs + bufferMs + outputMs + lookaheadMs) */
+    float sourceMs;         /* packet size of the source device (how old the sound is when we get it) */
+    float outputMs;         /* audio queued in the output device */
+    float lookaheadMs;      /* limiter lookahead */
 } vg_status;
 
 VG_API int  vg_version(void);

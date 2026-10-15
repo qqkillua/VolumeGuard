@@ -39,7 +39,7 @@ int main()
     }
 
     CHECK(version() == VG_API_VERSION, "vg_version() = %d", version());
-    CHECK(sizeof(vg_status) == 44, "vg_status is %d bytes, VolumeGuard.exe expects 44", (int)sizeof(vg_status));
+    CHECK(sizeof(vg_status) == 56, "vg_status is %d bytes, VolumeGuard.exe expects 56", (int)sizeof(vg_status));
 
     // devices
     const int need = list(nullptr, 0);
@@ -88,8 +88,9 @@ int main()
             {
                 Sleep(500);
                 status(&st, sizeof st);
-                std::printf("  state %d, %d -> %d Hz, latency %.1f ms, buffer %.1f ms, drift %+.0f ppm, gaps %d\n", st.state,
-                            st.sourceRate, st.outputRate, st.latencyMs, st.bufferMs, st.correctionPpm, st.underruns);
+                std::printf("  state %d, %d -> %d Hz, latency %.1f ms (source %.1f + buffer %.1f + output %.1f + lookahead %.1f), drift %+.0f ppm, gaps %d\n",
+                            st.state, st.sourceRate, st.outputRate, st.latencyMs, st.sourceMs, st.bufferMs, st.outputMs, st.lookaheadMs,
+                            st.correctionPpm, st.underruns);
             }
             stop();
             status(&st, sizeof st);

@@ -157,7 +157,7 @@ public:
         }
 
         // far too much buffered (e.g. the output device stalled): drop the oldest audio
-        if ((double)fill > target_ * 4.0 + 2048.0)
+        if ((double)fill > target_ * 2.0 + 0.025 * inRate_)
         {
             const size_t drop = fill - (size_t)target_;
             ring.advance(drop);

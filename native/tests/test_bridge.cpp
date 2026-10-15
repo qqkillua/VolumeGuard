@@ -19,7 +19,8 @@ struct Result
 // Simulates `seconds` of a source device (nominal capRate, real clock off by driftPpm, sending packets of
 // ~10 ms with jitter) and an output device asking for `renderFrames` every period. The source plays a 1 kHz sine.
 static Result simulate(double capRate, double renRate, double driftPpm, double seconds, double targetMs,
-                       double gapFrom = -1, double gapTo = -1, unsigned seed = 1, double toneHz = 1000.0)
+                       double gapFrom = -1, double gapTo = -1, unsigned seed = 1, double toneHz = 1000.0,
+                       double capMs = 10.0, double renMs = 10.0)
 {
     vga::FrameRing ring;
     ring.init((size_t)(capRate * 0.5));
@@ -30,8 +31,8 @@ static Result simulate(double capRate, double renRate, double driftPpm, double s
     std::uniform_real_distribution<double> jitter(-0.003, 0.003);
 
     const double capReal = capRate * (1.0 + driftPpm * 1e-6);   // samples per real second
-    const int capChunk = (int)(capRate * 0.01);
-    const int renFrames = (int)(renRate * 0.01);
+    const int capChunk = (int)(capRate * capMs / 1000.0);
+    const int renFrames = (int)(renRate * renMs / 1000.0);
     // event times: an exact clock plus independent jitter per event (jitter does not accumulate)
     uint64_t capPackets = 0, renPackets = 0;
     double jitterCap = jitter(rng) * 0.3, jitterRen = jitter(rng) * 0.2;
@@ -156,6 +157,29 @@ int main()
         CHECK(r.maxFillMs < 45.0 && r.minFillMs > 3.0, "%s: buffer drifted to %.1f..%.1f ms", c.name, r.minFillMs, r.maxFillMs);
         CHECK(std::fabs(r.finalCorrection * 1e6 - c.ppm) < 150.0, "%s: correction %.0f ppm, drift is %.0f ppm", c.name, r.finalCorrection * 1e6, c.ppm);
         CHECK(r.snrDb > 80.0, "%s: SNR only %.1f dB", c.name, r.snrDb);
+    }
+
+    // Low-latency drivers (IAudioClient3): small packets on both sides, buffer = packet + period + 5 ms.
+    {
+        struct Small { const char* name; double cap, ren, ppm, capMs, renMs; };
+        const Small small[] = {
+            { "low latency 2.67 / 2.67 ms", 48000, 48000, 300, 128 / 48.0, 128 / 48.0 },
+            { "low latency 10 / 3 ms", 48000, 44100, -400, 10.0, 132 / 44.1 },
+            { "low latency 3 / 10 ms", 48000, 48000, 800, 144 / 48.0, 10.0 },
+        };
+        for (const Small& c : small)
+        {
+            const double start = c.capMs + c.renMs + 5.0;
+            Result r = simulate(c.cap, c.ren, c.ppm, 300.0, start, -1, -1, 7, 1000.0, c.capMs, c.renMs);
+            std::printf("%-28s start %.1f ms: underruns %llu, drops %llu, buffer %.1f..%.1f ms, correction %+.0f ppm, SNR %.1f dB\n",
+                        c.name, start, (unsigned long long)r.underrunsAfterWarmup, (unsigned long long)r.drops,
+                        r.minFillMs, r.maxFillMs, r.finalCorrection * 1e6, r.snrDb);
+            CHECK(r.underrunsAfterWarmup == 0, "%s: %llu underruns", c.name, (unsigned long long)r.underrunsAfterWarmup);
+            CHECK(r.drops == 0, "%s: dropped audio", c.name);
+            CHECK(r.maxFillMs < start + 12.0, "%s: buffer grew to %.1f ms", c.name, r.maxFillMs);
+            CHECK(std::fabs(r.finalCorrection * 1e6 - c.ppm) < 150.0, "%s: correction %.0f ppm", c.name, r.finalCorrection * 1e6);
+            CHECK(r.snrDb > 80.0, "%s: SNR %.1f dB", c.name, r.snrDb);
+        }
     }
 
     // High frequencies (10 kHz) through 44.1 → 48 kHz conversion with drift: the resampler's quality.

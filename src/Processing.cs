@@ -19,6 +19,7 @@ namespace VolumeGuard
     {
         public int State, SourceRate, OutputRate, Underruns, Restarts;
         public float InPeakDb, OutPeakDb, ReductionDb, LatencyMs, BufferMs, CorrectionPpm;
+        public float SourceMs, OutputMs, LookaheadMs;   // API 2: parts of LatencyMs
     }
 
     static class VgNative
@@ -92,7 +93,7 @@ namespace VolumeGuard
             }
             try
             {
-                if (VgNative.vg_version() != 1)
+                if (VgNative.vg_version() != 2)
                 {
                     UnavailableReason = "vgaudio.dll другой версии — скачайте полный архив релиза заново.";
                     return;
@@ -224,7 +225,7 @@ namespace VolumeGuard
                 bool shot = rnd.NextDouble() < 0.15;
                 st.State = s.ProcOn ? VgNative.StateRunning : VgNative.StateStopped;
                 st.SourceRate = 48000; st.OutputRate = 48000;
-                st.LatencyMs = 41.6f; st.BufferMs = 14.2f;
+                st.LatencyMs = 23.4f; st.SourceMs = 2.7f; st.BufferMs = 10.4f; st.OutputMs = 5.3f; st.LookaheadMs = 5f;
                 st.InPeakDb = shot ? -2f - (float)rnd.NextDouble() * 3f : -30f + (float)rnd.NextDouble() * 8f;
                 st.OutPeakDb = shot ? s.ProcCeiling - 0.2f : st.InPeakDb + 6f;
                 st.ReductionDb = shot ? -9f - (float)rnd.NextDouble() * 4f : -1f;
@@ -267,13 +268,21 @@ namespace VolumeGuard
             switch (st.State)
             {
                 case VgNative.StateRunning:
+                    // the parts, so it is clear where the delay comes from
                     return "Работает · задержка ≈ " + Math.Round(st.LatencyMs) + " мс · " +
-                           Khz(st.SourceRate) + " → " + Khz(st.OutputRate) + " кГц";
+                           Khz(st.SourceRate) + " → " + Khz(st.OutputRate) + " кГц\n" +
+                           "источник " + Ms(st.SourceMs) + " + буфер " + Ms(st.BufferMs) +
+                           " + вывод " + Ms(st.OutputMs) + " + лимитер " + Ms(st.LookaheadMs) + " мс";
                 case VgNative.StateBuffering: return "Ждём звук от источника…";
                 case VgNative.StateReconnecting: problem = true; return "Устройство пропало или сменило формат — переподключаемся…";
                 case VgNative.StateStarting: return "Запуск…";
                 default: return "Остановлено.";
             }
+        }
+
+        static string Ms(float ms)
+        {
+            return Math.Max(0f, ms).ToString("0", System.Globalization.CultureInfo.InvariantCulture);
         }
 
         static string Khz(int hz)

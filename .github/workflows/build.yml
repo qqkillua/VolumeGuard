@@ -88,7 +88,7 @@ jobs:
             [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int vg_start(string a, string b);
           }
           "@
-          if ([Vg]::vg_version() -ne 1) { throw "vg_version via P/Invoke" }
+          if ([Vg]::vg_version() -ne 2) { throw "vg_version via P/Invoke" }
           if ([Vg]::vg_start("same", "same") -ne -2) { throw "vg_start via P/Invoke" }
           "::notice title=vgaudio::DLL loads in .NET (64-bit), API version $([Vg]::vg_version()), $([Vg]::vg_list_devices($null, 0)) chars of device list"
 

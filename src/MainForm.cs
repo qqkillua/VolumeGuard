@@ -182,9 +182,9 @@ namespace VolumeGuard
             SyncMaster(true);
             RebuildCards();
 
-            // The limiter reacts every 10 ms; ask Windows for 1 ms timer precision so the timer can keep up.
+            // The limiter runs on its own thread (AudioThread.cs); this timer only drives the window.
             if (!demo) { try { Native.timeBeginPeriod(1); } catch { } }
-            timer.Interval = 10;
+            timer.Interval = demo ? 10 : 20;
             timer.Tick += delegate { OnTick(); };
             timer.Start();
         }
@@ -241,6 +241,7 @@ namespace VolumeGuard
 
             // the window itself only needs ~20 updates per second
             if (Visible && WindowState != FormWindowState.Minimized && now - lastUi >= 0.045)
+            lock (s.Sync)   // the limiter thread changes the same models
             {
                 lastUi = now;
                 SyncMaster(false);
@@ -276,6 +277,11 @@ namespace VolumeGuard
         // ---------- app cards ----------
 
         void RebuildCards()
+        {
+            lock (s.Sync) RebuildCardsLocked();
+        }
+
+        void RebuildCardsLocked()
         {
             var present = s.Apps.Values.Where(a => a.Present)
                 .OrderBy(a => a.Key == "#system" ? 1 : 0)
@@ -409,11 +415,12 @@ namespace VolumeGuard
             if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
             Activate();
             SyncMaster(true);
-            foreach (var a in s.Apps.Values)
-            {
-                ChannelCard c;
-                if (cards.TryGetValue(a.Key, out c)) c.Version = -1;
-            }
+            lock (s.Sync)
+                foreach (var a in s.Apps.Values)
+                {
+                    ChannelCard c;
+                    if (cards.TryGetValue(a.Key, out c)) c.Version = -1;
+                }
         }
 
         void ExitApp()
@@ -439,7 +446,13 @@ namespace VolumeGuard
             }
             timer.Stop();
             if (!demo) { try { Native.timeEndPeriod(1); } catch { } }
-            try { eng.Close(); } catch { }
+            try
+            {
+                var te = eng as ThreadedEngine;
+                if (te != null) te.Stop();   // puts the volumes back, then ends the limiter thread
+                else eng.Close();
+            }
+            catch { }
             processing.Shutdown();   // stop the audio threads before the DLL is unloaded
             if (!demo) s.Save();
             tray.Visible = false;
@@ -587,7 +600,7 @@ namespace VolumeGuard
 
             if (!demo) MainForm.MigrateAutostart();
             Settings s = demo ? DemoSettings() : Settings.Load();
-            IEngine eng = demo ? (IEngine)new FakeEngine(s) : new AudioEngine(s);
+            IEngine eng = demo ? (IEngine)new FakeEngine(s) : new ThreadedEngine(s);
             var form = new MainForm(s, eng, hidden && !demo, demo);
             if (demo && args.Contains("--processing")) form.Shown += delegate { form.OpenProcessing(); };
             if (showEvt != null)

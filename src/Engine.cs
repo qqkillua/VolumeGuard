@@ -8,6 +8,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 
 namespace VolumeGuard
 {
@@ -90,6 +91,8 @@ namespace VolumeGuard
         public float ProcAmount = 50f, ProcCeiling = -1f, ProcGain = 0f;
         public Dictionary<string, AppModel> Apps = new Dictionary<string, AppModel>(StringComparer.OrdinalIgnoreCase);
         public bool Dirty;
+        /// The audio thread and the window share the models: whoever enumerates Apps / Sessions holds this.
+        public readonly object Sync = new object();
 
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
 
@@ -186,24 +189,29 @@ namespace VolumeGuard
             {
                 Directory.CreateDirectory(Dir);
                 var sb = new StringBuilder();
-                sb.AppendLine("# VolumeGuard settings");
-                sb.AppendLine("opt|enabled|" + B(Enabled));
-                sb.AppendLine("opt|device|" + Clean(DeviceId));
-                sb.AppendLine("opt|tray|" + B(Tray));
-                sb.AppendLine("opt|trayhint|" + B(TrayHintShown));
-                sb.AppendLine("opt|sessionMeterAfterVolume|" + B(SessionMeterPost));
-                sb.AppendLine("opt|masterMeterPost|" + B(MasterMeterPost));
-                sb.AppendLine(string.Join("|", new[] { "proc", B(ProcOn), Clean(ProcSource), Clean(ProcOutput), ProcMode.ToString(IC), F(ProcAmount), F(ProcCeiling), F(ProcGain) }));
-                sb.AppendLine(string.Join("|", new[] { "master", F(Master.UserVol), B(Master.LimitOn), F(Master.LimitDb), B(Master.Pending) }));
-                foreach (var a in Apps.Values)
-                    sb.AppendLine(string.Join("|", new[] { "app", Clean(a.Key), Clean(a.Title), F(a.UserVol), B(a.LimitOn), F(a.LimitDb), B(a.Muted), B(a.Pending), F(a.Env) }));
+                Monitor.Enter(Sync);   // only while reading the models; the file is written after
+                try
+                {
+                    sb.AppendLine("# VolumeGuard settings");
+                    sb.AppendLine("opt|enabled|" + B(Enabled));
+                    sb.AppendLine("opt|device|" + Clean(DeviceId));
+                    sb.AppendLine("opt|tray|" + B(Tray));
+                    sb.AppendLine("opt|trayhint|" + B(TrayHintShown));
+                    sb.AppendLine("opt|sessionMeterAfterVolume|" + B(SessionMeterPost));
+                    sb.AppendLine("opt|masterMeterPost|" + B(MasterMeterPost));
+                    sb.AppendLine(string.Join("|", new[] { "proc", B(ProcOn), Clean(ProcSource), Clean(ProcOutput), ProcMode.ToString(IC), F(ProcAmount), F(ProcCeiling), F(ProcGain) }));
+                    sb.AppendLine(string.Join("|", new[] { "master", F(Master.UserVol), B(Master.LimitOn), F(Master.LimitDb), B(Master.Pending) }));
+                    foreach (var a in Apps.Values)
+                        sb.AppendLine(string.Join("|", new[] { "app", Clean(a.Key), Clean(a.Title), F(a.UserVol), B(a.LimitOn), F(a.LimitDb), B(a.Muted), B(a.Pending), F(a.Env) }));
+                    Dirty = false;
+                }
+                finally { Monitor.Exit(Sync); }
                 string tmp = FilePath + ".tmp";
                 File.WriteAllText(tmp, sb.ToString(), Encoding.UTF8);
                 File.Copy(tmp, FilePath, true);
                 File.Delete(tmp);
-                Dirty = false;
             }
-            catch { }
+            catch { Dirty = true; }   // try again later
         }
     }
 
@@ -615,22 +623,27 @@ namespace VolumeGuard
             return new[] { name.ToLowerInvariant(), title.Trim(), path };
         }
 
-        public void Tick(float dt)
+        public void Tick(float dt) { Tick(dt, true); }
+
+        /// full = false: the quick step the audio thread runs every 2 ms between full ones. It only reads the
+        /// meters and turns volumes DOWN (that is what has to be fast: a sudden loud sound). Checking for
+        /// volume changes made in Windows and bringing the volume back up happen in the full step (10 ms).
+        public void Tick(float dt, bool full)
         {
             if (epv == null) return;
             float decay = (float)Math.Exp(-dt / 1.5);
             float rel = 1f - (float)Math.Exp(-dt / 0.8);
-            try { TickMaster(decay, rel); }
+            try { TickMaster(decay, rel, full); }
             catch { Status = "Устройство вывода отключено"; Drop(); return; }
             foreach (var a in s.Apps.Values)
-                if (a.Present) TickApp(a, decay, rel);
+                if (a.Present) TickApp(a, decay, rel, full);
         }
 
-        void TickMaster(float decay, float rel)
+        void TickMaster(float decay, float rel, bool full)
         {
             var m = s.Master;
-            float scalar = epv.GetMasterVolumeLevelScalar();
-            if (lastScalar >= 0f && Math.Abs(scalar - lastScalar) > 0.01f)
+            float scalar = full ? epv.GetMasterVolumeLevelScalar() : lastScalar;
+            if (full && lastScalar >= 0f && Math.Abs(scalar - lastScalar) > 0.01f)
             {
                 // the user moved the Windows volume (keyboard, tray flyout…) — that is the new wish
                 m.UserVol = scalar;
@@ -652,7 +665,7 @@ namespace VolumeGuard
 
             float db = userDb + Db.FromLin(m.R);
             if (db < minDb) db = minDb;
-            if (float.IsNaN(lastSetDb) || Math.Abs(db - lastSetDb) > 0.1f)
+            if (float.IsNaN(lastSetDb) || (full ? Math.Abs(db - lastSetDb) > 0.1f : db < lastSetDb - 0.1f))
             {
                 epv.SetMasterVolumeLevel(db, ref ctx);
                 lastSetDb = db;
@@ -665,7 +678,7 @@ namespace VolumeGuard
             if (pend != m.Pending) { m.Pending = pend; s.Dirty = true; }
         }
 
-        void TickApp(AppModel a, float decay, float rel)
+        void TickApp(AppModel a, float decay, float rel, bool full)
         {
             float inPeak = 0f;
             foreach (var w in a.Sessions)
@@ -673,8 +686,8 @@ namespace VolumeGuard
                 if (w.Dead) continue;
                 try
                 {
-                    float cur = w.Vol.GetMasterVolume();
-                    if (w.LastSet >= 0f && Math.Abs(cur - w.LastSet) > 0.015f)
+                    float cur = full || w.LastSet < 0f ? w.Vol.GetMasterVolume() : w.LastSet;
+                    if (full && w.LastSet >= 0f && Math.Abs(cur - w.LastSet) > 0.015f)
                     {
                         // changed in the Windows volume mixer
                         a.UserVol = cur; a.Gain = cur; a.UiVersion++;
@@ -701,7 +714,7 @@ namespace VolumeGuard
 
             foreach (var w in a.Sessions)
             {
-                if (w.Dead || Math.Abs(w.LastSet - a.Gain) <= 0.002f) continue;
+                if (w.Dead || (full ? Math.Abs(w.LastSet - a.Gain) <= 0.002f : a.Gain >= w.LastSet - 0.002f)) continue;
                 try { w.Vol.SetMasterVolume(a.Gain, ref ctx); w.LastSet = a.Gain; }
                 catch { w.Dead = true; }
             }

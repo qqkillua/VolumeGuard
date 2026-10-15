@@ -27,7 +27,7 @@
 #include <string>
 #include <vector>
 
-static_assert(sizeof(vg_status) == 44, "VolumeGuard.exe (Processing.cs, VgStatus) expects this layout");
+static_assert(sizeof(vg_status) == 56, "VolumeGuard.exe (Processing.cs, VgStatus) expects this layout");
 
 namespace {
 
@@ -35,6 +35,7 @@ namespace {
 const CLSID kCLSID_MMDeviceEnumerator = { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
 const IID kIID_IMMDeviceEnumerator = { 0xA95664D2, 0x9614, 0x4F35, { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
 const IID kIID_IAudioClient = { 0x1CB9AD4C, 0xDBFA, 0x4C32, { 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2 } };
+const IID kIID_IAudioClient3 = { 0x7ED4EE07, 0x8E67, 0x4CD4, { 0x8C, 0x1A, 0x2B, 0x7A, 0x59, 0x87, 0xAD, 0x42 } };
 const IID kIID_IAudioRenderClient = { 0xF294ACFC, 0x3146, 0x4483, { 0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2 } };
 const IID kIID_IAudioCaptureClient = { 0xC8ADBD64, 0xE71E, 0x48A0, { 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17 } };
 const GUID kSubtypeFloat = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
@@ -162,6 +163,43 @@ bool parseFormat(const WAVEFORMATEX* wf, vga::SampleFormat& f)
     return f.bitsPerSample == 16 || f.bitsPerSample == 24 || f.bitsPerSample == 32;
 }
 
+/// Opens a shared-mode stream on dev. With lowLatency, asks for the smallest engine period the driver
+/// supports (IAudioClient3, Windows 10+): the device then works in packets of e.g. 2.7 ms instead of 10 ms,
+/// which shortens the whole path. Falls back to a normal stream if that is not possible.
+/// periodFrames: how often (in frames) the device engine runs for this stream.
+HRESULT openStream(IMMDevice* dev, DWORD flags, REFERENCE_TIME bufferHns, const WAVEFORMATEX* fmt, bool lowLatency,
+                   Com<IAudioClient>& client, UINT32& periodFrames, bool& gotLow)
+{
+    gotLow = false;
+    HRESULT hr;
+    if (lowLatency)
+    {
+        Com<IAudioClient3> c3;
+        if (SUCCEEDED(dev->Activate(kIID_IAudioClient3, CLSCTX_ALL, nullptr, c3.putVoid())))
+        {
+            UINT32 def = 0, fund = 0, minP = 0, maxP = 0;
+            if (SUCCEEDED(c3->GetSharedModeEnginePeriod(fmt, &def, &fund, &minP, &maxP)) && minP > 0 && minP < def
+                && SUCCEEDED(c3->InitializeSharedAudioStream(flags, minP, fmt, nullptr)))
+            {
+                UINT32 cur = minP;
+                WAVEFORMATEX* curFmt = nullptr;
+                if (SUCCEEDED(c3->GetCurrentSharedModeEnginePeriod(&curFmt, &cur)) && curFmt) CoTaskMemFree(curFmt);
+                periodFrames = cur ? cur : minP;
+                gotLow = true;
+                client.reset();
+                return c3->QueryInterface(kIID_IAudioClient, client.putVoid());
+            }
+        }
+    }
+    // a failed Initialize can leave a client unusable: always start from a fresh one
+    if (FAILED(hr = dev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, client.putVoid()))) return hr;
+    if (FAILED(hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, bufferHns, 0, fmt, nullptr))) return hr;
+    REFERENCE_TIME defP = 100000;
+    client->GetDevicePeriod(&defP, nullptr);
+    periodFrames = (UINT32)((double)defP * fmt->nSamplesPerSec / 1e7 + 0.5);
+    return S_OK;
+}
+
 std::string describe(const vga::SampleFormat& f, DWORD rate)
 {
     char b[96];
@@ -243,6 +281,9 @@ public:
         s.latencyMs = latencyMs_.load();
         s.bufferMs = bufferMs_.load();
         s.correctionPpm = correctionPpm_.load();
+        s.sourceMs = sourceMs_.load();
+        s.outputMs = outputMs_.load();
+        s.lookaheadMs = lookaheadMs_.load();
     }
 
     int lastError(wchar_t* buf, int cap)
@@ -339,20 +380,23 @@ private:
 
         // --- source: loopback capture + a silent stream that keeps it running
         Com<IAudioClient> capClient, keepClient, renClient;
-        if (FAILED(hr = srcDev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, capClient.putVoid())))
-        { code = VG_ERR_SOURCE; return report(first, "source: Activate", hr); }
         CoTaskFormat capFmt;
-        if (FAILED(hr = capClient->GetMixFormat(&capFmt.p))) { code = VG_ERR_SOURCE; return report(first, "source: GetMixFormat", hr); }
+        {
+            Com<IAudioClient> probe;
+            if (FAILED(hr = srcDev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, probe.putVoid())))
+            { code = VG_ERR_SOURCE; return report(first, "source: Activate", hr); }
+            if (FAILED(hr = probe->GetMixFormat(&capFmt.p))) { code = VG_ERR_SOURCE; return report(first, "source: GetMixFormat", hr); }
+        }
         if (!parseFormat(capFmt.p, capFormat_)) { code = VG_ERR_FORMAT; return report(first, "source: unsupported sample format", E_FAIL); }
-        if (FAILED(hr = capClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 2000000, 0, capFmt.p, nullptr)))
-        { code = VG_ERR_SOURCE; return report(first, "source: Initialize(loopback)", hr); }
-        if (FAILED(hr = capClient->GetService(kIID_IAudioCaptureClient, capture_.putVoid())))
-        { code = VG_ERR_SOURCE; return report(first, "source: GetService(capture)", hr); }
 
+        // The keep-alive stream goes first: opened with the smallest engine period, it makes the source device
+        // run in small packets, so the loopback below delivers the game's sound in small packets too.
         keepFrames_ = 0;
         keep_.reset();
-        if (SUCCEEDED(srcDev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, keepClient.putVoid()))
-            && SUCCEEDED(keepClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 1000000, 0, capFmt.p, nullptr))
+        keepClient_ = nullptr;
+        UINT32 srcPeriod = 0;
+        bool srcLow = false;
+        if (SUCCEEDED(openStream(srcDev.p, 0, 1000000, capFmt.p, true, keepClient, srcPeriod, srcLow))
             && SUCCEEDED(keepClient->GetBufferSize(&keepFrames_))
             && SUCCEEDED(keepClient->GetService(kIID_IAudioRenderClient, keep_.putVoid())))
             keepClient_ = keepClient.p;
@@ -360,18 +404,30 @@ private:
         {
             keepFrames_ = 0;
             keep_.reset();
-            keepClient_ = nullptr;
             logLine("note: could not open a keep-alive stream on the source device; quiet moments may cause short gaps");
         }
 
-        // --- output: event-driven playback
-        if (FAILED(hr = outDev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, renClient.putVoid())))
-        { code = VG_ERR_OUTPUT; return report(first, "output: Activate", hr); }
+        UINT32 capPeriod = 0;
+        bool capLow = false;
+        if (FAILED(hr = openStream(srcDev.p, AUDCLNT_STREAMFLAGS_LOOPBACK, 2000000, capFmt.p, false, capClient, capPeriod, capLow)))
+        { code = VG_ERR_SOURCE; return report(first, "source: Initialize(loopback)", hr); }
+        if (FAILED(hr = capClient->GetService(kIID_IAudioCaptureClient, capture_.putVoid())))
+        { code = VG_ERR_SOURCE; return report(first, "source: GetService(capture)", hr); }
+        if (keepClient_) capPeriod = std::min(capPeriod, srcPeriod);   // the engine runs at the smaller of the two
+
+        // --- output: event-driven playback, smallest engine period the driver allows
         CoTaskFormat renFmt;
-        if (FAILED(hr = renClient->GetMixFormat(&renFmt.p))) { code = VG_ERR_OUTPUT; return report(first, "output: GetMixFormat", hr); }
+        {
+            Com<IAudioClient> probe;
+            if (FAILED(hr = outDev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, probe.putVoid())))
+            { code = VG_ERR_OUTPUT; return report(first, "output: Activate", hr); }
+            if (FAILED(hr = probe->GetMixFormat(&renFmt.p))) { code = VG_ERR_OUTPUT; return report(first, "output: GetMixFormat", hr); }
+        }
         vga::SampleFormat outFormat;
         if (!parseFormat(renFmt.p, outFormat)) { code = VG_ERR_FORMAT; return report(first, "output: unsupported sample format", E_FAIL); }
-        if (FAILED(hr = renClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, renFmt.p, nullptr)))
+        UINT32 outPeriod = 0;
+        bool outLow = false;
+        if (FAILED(hr = openStream(outDev.p, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, renFmt.p, true, renClient, outPeriod, outLow)))
         { code = VG_ERR_OUTPUT; return report(first, "output: Initialize", hr); }
         HANDLE renEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!renEvent) { code = VG_ERR_SYSTEM; return report(first, "CreateEvent", E_FAIL); }
@@ -385,25 +441,35 @@ private:
         const DWORD srcRate = capFmt.p->nSamplesPerSec, outRate = renFmt.p->nSamplesPerSec;
         srcRate_.store((int)srcRate);
         outRate_.store((int)outRate);
-        logLine("start: source \"%s\" (%s) -> output \"%s\" (%s), output buffer %u frames%s",
-                narrow(deviceName(srcDev.p)).c_str(), describe(capFormat_, srcRate).c_str(),
-                narrow(deviceName(outDev.p)).c_str(), describe(outFormat, outRate).c_str(), renFrames,
-                keep_ ? "" : ", no keep-alive");
+        const double srcPeriodMs = 1000.0 * capPeriod / srcRate, outPeriodMs = 1000.0 * outPeriod / outRate;
+        // What the output keeps queued: one engine period (the device takes one per event) plus a small margin.
+        // The margin grows by itself if the output ever runs dry (our thread was late).
+        UINT32 margin = std::max<UINT32>(outPeriod / 4, (UINT32)(outRate * 0.002));
+        UINT32 wantPad = std::min(renFrames, outPeriod + margin);
+        logLine("start: source \"%s\" (%s, packets %.2f ms%s) -> output \"%s\" (%s, period %.2f ms%s, buffer %u, queue %u frames)%s",
+                narrow(deviceName(srcDev.p)).c_str(), describe(capFormat_, srcRate).c_str(), srcPeriodMs, srcLow ? ", low-latency" : "",
+                narrow(deviceName(outDev.p)).c_str(), describe(outFormat, outRate).c_str(), outPeriodMs, outLow ? ", low-latency" : "",
+                renFrames, wantPad, keep_ ? "" : ", no keep-alive");
 
         // --- bridge and processing
         ring_.init((size_t)srcRate);                       // 1 s of room
         vga::DriftResampler rs;
-        rs.prepare(srcRate, outRate, 25.0);
+        // Buffer between the devices: one source packet + one output period + a margin for timing jitter.
+        // 10 ms + 10 ms + 5 ms = 25 ms with ordinary drivers, ~13 ms when both run in small packets.
+        const double startMs = srcPeriodMs + outPeriodMs + 5.0;
+        rs.prepare(srcRate, outRate, startMs, std::max(4.0, startMs - 6.0), std::max(40.0, startMs * 3.0));
         vga::Processor proc;
         proc.prepare(outRate);
         vga::Params params = currentParams();
         proc.setParams(params);
         std::vector<float> l(renFrames), r(renFrames);
-        const float latencyExtraMs = 10.0f + 1000.0f * (float)proc.latencyFrames() / (float)outRate;   // loopback packet + lookahead
+        const float latencyExtraMs = (float)srcPeriodMs + 1000.0f * (float)proc.latencyFrames() / (float)outRate;   // loopback packet + lookahead
+        sourceMs_.store((float)srcPeriodMs);
+        lookaheadMs_.store(1000.0f * (float)proc.latencyFrames() / (float)outRate);
 
         // pre-fill the output with silence, then start everything
         BYTE* data = nullptr;
-        if (SUCCEEDED(render->GetBuffer(renFrames, &data))) render->ReleaseBuffer(renFrames, AUDCLNT_BUFFERFLAGS_SILENT);
+        if (SUCCEEDED(render->GetBuffer(wantPad, &data))) render->ReleaseBuffer(wantPad, AUDCLNT_BUFFERFLAGS_SILENT);
         captureHr_.store(S_OK);
         captureFailed_.store(false);
         sessionStop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -442,7 +508,14 @@ private:
 
             UINT32 padding = 0;
             if (FAILED(hr = renClient->GetCurrentPadding(&padding))) { logLine("output: GetCurrentPadding 0x%08lX", (unsigned long)hr); break; }
-            const UINT32 avail = renFrames - std::min(renFrames, padding);
+            if (padding == 0 && rs.running() && wantPad < renFrames && margin < outPeriod)
+            {
+                // the device found nothing queued: we were too late, keep a little more from now on
+                margin = std::min(outPeriod, margin + (UINT32)(outRate * 0.002));
+                wantPad = std::min(renFrames, outPeriod + margin);
+                logLine("output ran dry, queue now %.1f ms", 1000.0 * wantPad / outRate);
+            }
+            const UINT32 avail = wantPad > padding ? wantPad - padding : 0;
             if (avail == 0) continue;
 
             const vga::Params p = currentParams();
@@ -462,7 +535,9 @@ private:
             const float bufMs = (float)rs.fillMs();
             bufferMs_.store(bufMs);
             correctionPpm_.store((float)(rs.correction() * 1e6));
-            latencyMs_.store(bufMs + 1000.0f * (float)(padding + avail) / (float)outRate + latencyExtraMs);
+            const float outMs = 1000.0f * (float)(padding + avail) / (float)outRate;
+            outputMs_.store(outMs);
+            latencyMs_.store(bufMs + outMs + latencyExtraMs);
             state_.store(rs.running() ? VG_STATE_RUNNING : VG_STATE_BUFFERING);
             const uint64_t u = rs.underruns();
             if (u != lastUnderruns)
@@ -506,15 +581,15 @@ private:
         std::vector<float> lr(4096 * 2);
         const int blockAlign = capFormat_.blockAlign();
         HRESULT hr = S_OK;
-        while (WaitForSingleObject(sessionStop_, 2) == WAIT_TIMEOUT)
+        while (WaitForSingleObject(sessionStop_, 1) == WAIT_TIMEOUT)
         {
-            // keep-alive: keep half of its buffer filled with silence
+            // keep-alive: keep its buffer filled with silence (its delay does not matter, it is silent)
             if (keep_)
             {
                 UINT32 pad = 0;
-                if (SUCCEEDED(keepClient_->GetCurrentPadding(&pad)) && pad < keepFrames_ / 2)
+                if (SUCCEEDED(keepClient_->GetCurrentPadding(&pad)) && pad < keepFrames_)
                 {
-                    const UINT32 n = keepFrames_ / 2 - pad;
+                    const UINT32 n = keepFrames_ - pad;
                     BYTE* d = nullptr;
                     if (SUCCEEDED(keep_->GetBuffer(n, &d))) keep_->ReleaseBuffer(n, AUDCLNT_BUFFERFLAGS_SILENT);
                 }
@@ -607,6 +682,7 @@ private:
     std::atomic<uint64_t> underrunsTotal_{ 0 };
     std::atomic<float> inPeak_{ 0.0f }, outPeak_{ 0.0f }, reduction_{ 0.0f };
     std::atomic<float> latencyMs_{ 0.0f }, bufferMs_{ 0.0f }, correctionPpm_{ 0.0f };
+    std::atomic<float> sourceMs_{ 0.0f }, outputMs_{ 0.0f }, lookaheadMs_{ 0.0f };
 };
 
 Engine* gEngine = nullptr;
