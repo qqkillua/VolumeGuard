@@ -56,7 +56,7 @@ namespace VolumeGuard
             ForeColor = Theme.Text;
             Font = Theme.Font(9f);
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(Theme.D(500), Theme.D(770));
+            ClientSize = new Size(Theme.D(500), Theme.D(806));
             MinimumSize = new Size(Theme.D(420), Theme.D(460));
             iconOn = MakeIcon(true);
             iconOff = MakeIcon(false);
@@ -98,7 +98,7 @@ namespace VolumeGuard
             devRow.Controls.Add(devLbl);
 
             // how the limiter behaves: return speed and peak / loudness mode
-            var optRow = new Panel { Dock = DockStyle.Top, Height = Theme.D(76), BackColor = Theme.Bg };
+            var optRow = new Panel { Dock = DockStyle.Top, Height = Theme.D(112), BackColor = Theme.Bg };
             var tips = new ToolTip { AutoPopDelay = 15000, InitialDelay = 300 };
             AddSegments(optRow, tips, "Возврат громкости", 2,
                 new[] { "Быстро", "Средне", "Медленно" },
@@ -111,6 +111,12 @@ namespace VolumeGuard
                 new[] { "Ни один пик не громче лимита. Но после каждого выстрела или щелчка звук ненадолго проседает",
                         "Средняя громкость (за 0,4 с) не выше лимита, а короткие пики могут быть до 6 дБ громче. Звук не проседает после одиночных выстрелов, а громкая реклама и взрывы всё равно приглушаются" },
                 () => s.LoudnessMode ? 1 : 0, v => { s.LoudnessMode = v == 1; s.Dirty = true; });
+            AddSegments(optRow, tips, "Память громких", Theme.D(74) + 2,
+                new[] { "Выкл", "10 с", "30 с" },
+                new[] { "Громкость возвращается полностью — следующий внезапный громкий звук снова проскочит громче лимита",
+                        "Программа помнит громкие звуки ~10 с и не возвращает громкость настолько, чтобы такой же звук снова оказался громче лимита больше чем на 3 дБ. Меньше щелчков в перестрелке; тихие звуки в это время чуть тише",
+                        "То же, но помнит ~30 с" },
+                () => s.Memory, v => { s.Memory = v; s.Dirty = true; });
 
             // master card
             var masterWrap = new Panel { Dock = DockStyle.Top, Height = Theme.D(112), BackColor = Theme.Bg, Padding = new Padding(Theme.D(12), 0, Theme.D(12), 0) };
