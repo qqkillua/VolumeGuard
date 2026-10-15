@@ -1,0 +1,79 @@
+name: Limiter plugin
+
+on:
+  push:
+    branches: [main]
+    paths: ['plugin/**', '.github/workflows/plugin.yml']
+  pull_request:
+    paths: ['plugin/**', '.github/workflows/plugin.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S plugin -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: DSP tests
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      # Loads the plugin the way a DAW does and runs the standard plugin checks, including Steinberg's VST3 validator.
+      - name: Validate with pluginval
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip -OutFile pluginval.zip
+          Expand-Archive pluginval.zip -DestinationPath pluginval
+          $vst3 = Get-ChildItem -Recurse -Directory -Filter VolumeGuardLimiter.vst3 build | Select-Object -First 1
+          Write-Host "Validating $($vst3.FullName)"
+          $p = Start-Process pluginval/pluginval.exe -Wait -PassThru -NoNewWindow -ArgumentList @(
+            '--strictness-level', '10', '--validate-in-process', '--output-dir', 'pluginval-logs', '--validate', "`"$($vst3.FullName)`"")
+          Get-ChildItem pluginval-logs -Recurse -File | ForEach-Object { Get-Content $_.FullName }
+          if ($p.ExitCode -ne 0) { throw "pluginval failed with exit code $($p.ExitCode)" }
+
+      - name: Package
+        id: pkg
+        shell: pwsh
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          $ver = (Get-Content plugin/VERSION -Raw).Trim()
+          New-Item -ItemType Directory -Force out/VST3, out/CLAP | Out-Null
+          $vst3 = Get-ChildItem -Recurse -Directory -Filter VolumeGuardLimiter.vst3 build | Select-Object -First 1
+          $clap = Get-ChildItem -Recurse -File -Filter VolumeGuardLimiter.clap build | Select-Object -First 1
+          Copy-Item -Recurse $vst3.FullName out/VST3/
+          Copy-Item $clap.FullName out/CLAP/
+          Copy-Item plugin/README.md out/README.md
+          Copy-Item LICENSE out/LICENSE
+          Compress-Archive -Path out/* -DestinationPath VolumeGuardLimiter-Windows.zip -Force
+          $release = ("${{ github.event_name }}" -eq "push") -and "$env:COMMIT_MESSAGE".Contains('[limiter-release]')
+          "tag=limiter-v$ver" >> $env:GITHUB_OUTPUT
+          "release=$($release.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VolumeGuardLimiter-Windows
+          path: VolumeGuardLimiter-Windows.zip
+
+      # Commit message with [limiter-release] publishes plugin/VERSION as a release.
+      # It is not marked "latest", so the app download button keeps pointing at VolumeGuard itself.
+      - name: Publish release
+        if: steps.pkg.outputs.release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pkg.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: VolumeGuard Limiter ${{ steps.pkg.outputs.tag }}
+          body_path: plugin/release-notes.md
+          files: VolumeGuardLimiter-Windows.zip
+          make_latest: false

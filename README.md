@@ -57,6 +57,15 @@ VolumeGuard использует Windows Core Audio. У каждого прил�
 
 Формулы, пример с цифрами и разбор «взрыва в фильме» — в [docs/limiter.md](docs/limiter.md).
 
+## VolumeGuard Limiter — плагин VST3 / CLAP
+
+Для FL Studio, Ableton, Reaper и других программ с плагинами есть **VolumeGuard Limiter**. Он обрабатывает
+сам звук, заглядывает на 5 мс вперёд, и поэтому выход никогда не бывает громче потолка — ни одного сэмпла.
+Параметры: Input Gain, Ceiling, Release, Bypass и индикатор Gain Reduction.
+
+Скачать — релиз «VolumeGuard Limiter» на странице [Releases](https://github.com/qqkillua/VolumeGuard/releases),
+описание и установка — в [plugin/README.md](plugin/README.md).
+
 ## Сборка
 
 Исходники в [`src/`](src). Достаточно компилятора, который уже есть в Windows:
