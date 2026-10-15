@@ -201,6 +201,7 @@ namespace VolumeGuard
         }
 
         protected override void OnTextChanged(EventArgs e) { base.OnTextChanged(e); Invalidate(); }
+        protected override void OnEnabledChanged(EventArgs e) { base.OnEnabledChanged(e); Invalidate(); }
 
         protected override void OnClick(EventArgs e)
         {
@@ -225,7 +226,7 @@ namespace VolumeGuard
             if (!string.IsNullOrEmpty(Text))
             {
                 var r = new Rectangle((int)pw + Theme.D(10), 0, Width - (int)pw - Theme.D(10), Height);
-                TextRenderer.DrawText(g, Text, Font, r, ForeColor, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
+                TextRenderer.DrawText(g, Text, Font, r, Enabled ? ForeColor : Theme.Sub, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
             }
         }
     }

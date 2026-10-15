@@ -79,6 +79,8 @@ namespace VolumeGuard
         public bool Enabled = true;
         public string DeviceId = "";
         public bool Tray = true;
+        /// Catch the start of a sudden loud sound with the device volume (see AudioEngine.TickMaster).
+        public bool AntiClick = true;
         public bool TrayHintShown;
         // Whether peak meters report the level after the volume we set (see README).
         public bool SessionMeterPost = false;
@@ -144,6 +146,7 @@ namespace VolumeGuard
                             if (p[1] == "enabled") s.Enabled = p[2] == "1";
                             else if (p[1] == "device") s.DeviceId = p[2];
                             else if (p[1] == "tray") s.Tray = p[2] == "1";
+                            else if (p[1] == "anticlick") s.AntiClick = p[2] == "1";
                             else if (p[1] == "trayhint") s.TrayHintShown = p[2] == "1";
                             else if (p[1] == "sessionMeterAfterVolume") s.SessionMeterPost = p[2] == "1";
                             else if (p[1] == "masterMeterPost") s.MasterMeterPost = p[2] == "1";
@@ -196,6 +199,7 @@ namespace VolumeGuard
                     sb.AppendLine("opt|enabled|" + B(Enabled));
                     sb.AppendLine("opt|device|" + Clean(DeviceId));
                     sb.AppendLine("opt|tray|" + B(Tray));
+                    sb.AppendLine("opt|anticlick|" + B(AntiClick));
                     sb.AppendLine("opt|trayhint|" + B(TrayHintShown));
                     sb.AppendLine("opt|sessionMeterAfterVolume|" + B(SessionMeterPost));
                     sb.AppendLine("opt|masterMeterPost|" + B(MasterMeterPost));
@@ -224,6 +228,10 @@ namespace VolumeGuard
         /// so the first sound after start-up or after switching the limit on is not too loud.
         public const float StartEnv = 0.7f;
 
+        /// After a loud sound the remembered level falls by e in EnvSec, and the volume follows the target
+        /// with a ReturnSec lag: together the volume is back to ~90 % about 1.1 s after the loud sound ends.
+        public const double EnvSec = 0.6, ReturnSec = 0.3;
+
         /// One step of a feed-forward peak limiter that works by moving a volume knob.
         /// inPeak — level of the signal before our gain; instant attack, smooth release.
         /// The envelope only decays while there is sound: during silence the reduced volume is held,
@@ -249,6 +257,8 @@ namespace VolumeGuard
     {
         string Status { get; }
         bool IsOpen { get; }
+        /// The output device changes its volume in hardware (after the sound is mixed): needed for anti-click.
+        bool HardwareVolume { get; }
         string DeviceName { get; }
         List<KeyValuePair<string, string>> ListDevices();
         bool Open();
@@ -261,8 +271,31 @@ namespace VolumeGuard
         void OnEnabledChanged();
     }
 
+    /// limiter.log next to settings.txt: which device, hardware or software volume, anti-click activity.
+    static class Log
+    {
+        static readonly object gate = new object();
+
+        public static void Line(string text)
+        {
+            try
+            {
+                lock (gate)
+                {
+                    Directory.CreateDirectory(Settings.Dir);
+                    string path = Path.Combine(Settings.Dir, "limiter.log");
+                    var fi = new FileInfo(path);
+                    if (fi.Exists && fi.Length > 256 * 1024) fi.Delete();
+                    File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + text + "\r\n", Encoding.UTF8);
+                }
+            }
+            catch { }
+        }
+    }
+
     class AudioEngine : IEngine
     {
+        static readonly CultureInfo IC = CultureInfo.InvariantCulture;
         const int CLSCTX_ALL = 0x17;
         const int DEVICE_STATE_ACTIVE = 1;
 
@@ -278,6 +311,11 @@ namespace VolumeGuard
         readonly Dictionary<string, Icon> iconCache = new Dictionary<string, Icon>(StringComparer.OrdinalIgnoreCase);
         Guid ctx = Guid.NewGuid();
         int postMismatch;
+        // anti-click: how far the device volume is pulled down right now (dB, ≤ 0), until when it is held,
+        // and the strongest pull-down the apps asked for in this step
+        float duckDb, duckRequest;
+        double clock, duckHoldUntil, lastDuckLog = -10;
+        public bool HardwareVolume { get; private set; }
         float userDb, minDb = -65f, maxDb = 0f, lastSetDb = float.NaN, lastScalar = -1f;
 
         public string Status { get; private set; }
@@ -355,6 +393,12 @@ namespace VolumeGuard
 
                 float inc;
                 epv.GetVolumeRange(out minDb, out maxDb, out inc);
+                int hw = 0;
+                try { hw = epv.QueryHardwareSupport(); } catch { }
+                HardwareVolume = (hw & 1) != 0;   // ENDPOINT_HARDWARE_SUPPORT_VOLUME
+                duckDb = 0f;
+                Log.Line("device \"" + DeviceName + "\": volume " + (HardwareVolume ? "in hardware" : "in software") +
+                         " (support mask " + hw + "), range " + minDb.ToString("0.#", IC) + ".." + maxDb.ToString("0.#", IC) + " dB");
 
                 var m = s.Master;
                 if (m.Pending)
@@ -408,7 +452,8 @@ namespace VolumeGuard
                 if (a.Pending) { a.Pending = false; s.Dirty = true; }
             }
             var m = s.Master;
-            if (epv != null && m.R < 0.999f)
+            duckDb = 0f;
+            if (epv != null && (m.R < 0.999f || !float.IsNaN(lastSetDb) && Math.Abs(lastSetDb - userDb) > 0.1f))
             {
                 try
                 {
@@ -631,15 +676,18 @@ namespace VolumeGuard
         public void Tick(float dt, bool full)
         {
             if (epv == null) return;
-            float decay = (float)Math.Exp(-dt / 1.5);
-            float rel = 1f - (float)Math.Exp(-dt / 0.8);
-            try { TickMaster(decay, rel, full); }
-            catch { Status = "Устройство вывода отключено"; Drop(); return; }
+            clock += dt;
+            float decay = (float)Math.Exp(-dt / Limiter.EnvSec);
+            float rel = 1f - (float)Math.Exp(-dt / Limiter.ReturnSec);
+            // apps first: they tell the device step below whether a loud sound slipped past their volume
+            duckRequest = 0f;
             foreach (var a in s.Apps.Values)
                 if (a.Present) TickApp(a, decay, rel, full);
+            try { TickMaster(decay, rel, full, dt); }
+            catch { Status = "Устройство вывода отключено"; Drop(); }
         }
 
-        void TickMaster(float decay, float rel, bool full)
+        void TickMaster(float decay, float rel, bool full, float dt)
         {
             var m = s.Master;
             float scalar = full ? epv.GetMasterVolumeLevelScalar() : lastScalar;
@@ -656,14 +704,32 @@ namespace VolumeGuard
             }
             lastScalar = scalar;
 
+            // Anti-click. An app's volume works on sound Windows has not mixed yet; the packet that told us
+            // about a sudden loud sound is already mixed and plays as it is (~10 ms — the click). The device
+            // volume of most headsets and sound cards works in hardware, on sound that is already mixed and
+            // waiting to be played: pulling it down for a moment catches that packet. The app's own volume
+            // has gone down by then, so after 50 ms the device volume glides back (150 dB/s).
+            if (duckRequest < duckDb - 0.5f)
+            {
+                duckDb = duckRequest;
+                duckHoldUntil = clock + 0.05;
+                if (clock - lastDuckLog > 5.0)
+                {
+                    lastDuckLog = clock;
+                    Log.Line("anti-click: device volume pulled down by " + (-duckDb).ToString("0.0", IC) + " dB");
+                }
+            }
+            else if (duckDb < 0f && clock >= duckHoldUntil)
+                duckDb = Math.Min(0f, duckDb + 150f * dt);
+
             float userAmp = Db.ToLin(userDb);
             float p = epMeter.GetPeakValue();
-            float cur = userAmp * m.R;
+            float cur = userAmp * m.R * Db.ToLin(duckDb);
             float inLevel = s.MasterMeterPost ? (cur > 1e-4f ? p / cur : 0f) : p;
             float floor = Math.Min(1f, Db.ToLin(Math.Max(minDb - userDb, -60f)));
             Limiter.Step(ref m.R, ref m.Env, inLevel * userAmp, 1f, s.Enabled && m.LimitOn, m.LimitDb, floor, decay, rel);
 
-            float db = userDb + Db.FromLin(m.R);
+            float db = userDb + Db.FromLin(m.R) + duckDb;
             if (db < minDb) db = minDb;
             if (float.IsNaN(lastSetDb) || (full ? Math.Abs(db - lastSetDb) > 0.1f : db < lastSetDb - 0.1f))
             {
@@ -674,7 +740,7 @@ namespace VolumeGuard
             m.OutLevel = inLevel * userAmp * m.R;
             if (m.OutLevel > m.DisplayPeak) m.DisplayPeak = m.OutLevel;
             m.Limiting = m.R < 0.97f;
-            bool pend = m.R < 0.99f;
+            bool pend = m.R < 0.99f || duckDb < -0.1f;
             if (pend != m.Pending) { m.Pending = pend; s.Dirty = true; }
         }
 
@@ -708,6 +774,19 @@ namespace VolumeGuard
             }
             else if (postMismatch > 0) postMismatch--;
             if (inPeak > 4f) inPeak = 4f;
+
+            // anti-click: how much louder than its limit this app is coming out right now, with the volume
+            // that is actually set (the sessions' own volume only acts on the next packet)
+            if (s.Enabled && a.LimitOn && s.AntiClick && HardwareVolume && inPeak >= Limiter.Gate)
+            {
+                float applied = -1f;
+                foreach (var w in a.Sessions)
+                    if (!w.Dead && w.LastSet > applied) applied = w.LastSet;
+                if (applied < 0f) applied = a.Gain;
+                float lim = Db.ToLin(a.LimitDb), outLvl = inPeak * applied;
+                if (outLvl > lim * 1.26f)   // more than 2 dB over: small overshoots are not worth moving the device
+                    duckRequest = Math.Min(duckRequest, Math.Max(-30f, Db.FromLin(lim / outLvl)));
+            }
 
             Limiter.Step(ref a.Gain, ref a.Env, inPeak, a.UserVol, s.Enabled && a.LimitOn, a.LimitDb,
                          Math.Min(a.UserVol, 0.02f), decay, rel);
@@ -786,6 +865,7 @@ namespace VolumeGuard
 
         public string Status { get { return null; } }
         public bool IsOpen { get { return true; } }
+        public bool HardwareVolume { get { return true; } }
         public string DeviceName { get { return "Динамики (Realtek High Definition Audio)"; } }
         public List<KeyValuePair<string, string>> ListDevices()
         {
@@ -806,7 +886,7 @@ namespace VolumeGuard
         public void Tick(float dt)
         {
             t += dt;
-            float decay = (float)Math.Exp(-dt / 1.5), rel = 1f - (float)Math.Exp(-dt / 0.8);
+            float decay = (float)Math.Exp(-dt / Limiter.EnvSec), rel = 1f - (float)Math.Exp(-dt / Limiter.ReturnSec);
             float sum = 0f;
             int i = 0;
             foreach (var a in s.Apps.Values)

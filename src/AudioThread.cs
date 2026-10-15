@@ -24,6 +24,7 @@ namespace VolumeGuard
         volatile string status;
         volatile bool isOpen;
         volatile string deviceName;
+        volatile bool hardwareVolume;
 
         /// Fast step: meters + turning down. Full step (volume back up, changes made in Windows): every 10 ms.
         const int FastMs = 2, FullMs = 10;
@@ -40,6 +41,7 @@ namespace VolumeGuard
         public string Status { get { return status; } }
         public bool IsOpen { get { return isOpen; } }
         public string DeviceName { get { return deviceName; } }
+        public bool HardwareVolume { get { return hardwareVolume; } }
 
         public List<KeyValuePair<string, string>> ListDevices()
         {
@@ -154,6 +156,7 @@ namespace VolumeGuard
             status = inner.Status;
             isOpen = inner.IsOpen;
             deviceName = inner.DeviceName;
+            hardwareVolume = inner.HardwareVolume;
         }
 
         [DllImport("avrt.dll", CharSet = CharSet.Unicode, EntryPoint = "AvSetMmThreadCharacteristicsW")]

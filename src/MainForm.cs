@@ -27,6 +27,7 @@ namespace VolumeGuard
         readonly Label statusLabel = new Label();
         readonly ToggleSwitch autostartSw = new ToggleSwitch();
         readonly ToggleSwitch traySw = new ToggleSwitch();
+        readonly ToggleSwitch antiClickSw = new ToggleSwitch();
         readonly Dictionary<string, ChannelCard> cards = new Dictionary<string, ChannelCard>();
         readonly NotifyIcon tray = new NotifyIcon();
         readonly ToolStripMenuItem trayEnabled = new ToolStripMenuItem("Лимитер включён");
@@ -111,11 +112,12 @@ namespace VolumeGuard
             };
 
             // footer
-            var footer = new Panel { Dock = DockStyle.Bottom, Height = Theme.D(78), BackColor = Theme.Card };
+            var footer = new Panel { Dock = DockStyle.Bottom, Height = Theme.D(104), BackColor = Theme.Card };
             autostartSw.Text = "Запускать вместе с Windows";
             traySw.Text = "Сворачивать в трей при закрытии";
+            antiClickSw.Text = "Без щелчка в начале громкого звука";
             int fy = Theme.D(10);
-            foreach (var sw in new[] { autostartSw, traySw })
+            foreach (var sw in new[] { antiClickSw, autostartSw, traySw })
             {
                 sw.BackColor = Theme.Card;
                 sw.Font = Theme.Font(9f);
@@ -127,13 +129,15 @@ namespace VolumeGuard
             autostartSw.Checked = AutostartOn();
             autostartSw.CheckedChanged += delegate { SetAutostart(autostartSw.Checked); };
             traySw.Checked = s.Tray;
+            antiClickSw.Checked = s.AntiClick;
+            antiClickSw.CheckedChanged += delegate { s.AntiClick = antiClickSw.Checked; s.Dirty = true; };
             traySw.CheckedChanged += delegate { s.Tray = traySw.Checked; s.Dirty = true; };
             statusLabel.ForeColor = Theme.Warn;
             statusLabel.BackColor = Theme.Card;
             statusLabel.AutoSize = false;
             statusLabel.TextAlign = ContentAlignment.MiddleRight;
             statusLabel.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
-            statusLabel.SetBounds(footer.Width - Theme.D(220), Theme.D(46), Theme.D(206), Theme.D(24));
+            statusLabel.SetBounds(footer.Width - Theme.D(220), Theme.D(72), Theme.D(206), Theme.D(24));
             footer.Controls.Add(statusLabel);
 
             // app list
@@ -235,6 +239,12 @@ namespace VolumeGuard
 
             bool procOn = s.ProcOn && processing.Available;
             if (procBtn.Selected != procOn) procBtn.Selected = procOn;
+
+            // anti-click needs a device that changes its volume in hardware
+            bool hw = eng.IsOpen && eng.HardwareVolume;
+            string acText = hw || !eng.IsOpen ? "Без щелчка в начале громкого звука" : "Без щелчка — устройство не поддерживает";
+            if (antiClickSw.Text != acText) { antiClickSw.Text = acText; antiClickSw.FitWidth(); }
+            if (antiClickSw.Enabled != (hw || !eng.IsOpen)) antiClickSw.Enabled = hw || !eng.IsOpen;
 
             string st = eng.Status ?? "";
             if (statusLabel.Text != st) statusLabel.Text = st;
