@@ -83,6 +83,11 @@ namespace VolumeGuard
         public bool SessionMeterPost = false;
         public bool MasterMeterPost = false;
         public MasterModel Master = new MasterModel();
+        // Sound processing (2.0): the game plays into ProcSource, VolumeGuard plays the result on ProcOutput.
+        public bool ProcOn;
+        public string ProcSource = "", ProcOutput = "";
+        public int ProcMode = 1;
+        public float ProcAmount = 50f, ProcCeiling = -1f, ProcGain = 0f;
         public Dictionary<string, AppModel> Apps = new Dictionary<string, AppModel>(StringComparer.OrdinalIgnoreCase);
         public bool Dirty;
 
@@ -140,6 +145,16 @@ namespace VolumeGuard
                             else if (p[1] == "sessionMeterAfterVolume") s.SessionMeterPost = p[2] == "1";
                             else if (p[1] == "masterMeterPost") s.MasterMeterPost = p[2] == "1";
                             break;
+                        case "proc":
+                            if (p.Length < 8) break;
+                            s.ProcOn = p[1] == "1";
+                            s.ProcSource = p[2];
+                            s.ProcOutput = p[3];
+                            s.ProcMode = Math.Max(0, Math.Min(2, (int)PF(p[4], 1f)));
+                            s.ProcAmount = Math.Max(0f, Math.Min(100f, PF(p[5], 50f)));
+                            s.ProcCeiling = Math.Max(-24f, Math.Min(0f, PF(p[6], -1f)));
+                            s.ProcGain = Math.Max(-12f, Math.Min(12f, PF(p[7], 0f)));
+                            break;
                         case "master":
                             if (p.Length < 5) break;
                             s.Master.UserVol = Db.Clamp(PF(p[1], 0.5f));
@@ -178,6 +193,7 @@ namespace VolumeGuard
                 sb.AppendLine("opt|trayhint|" + B(TrayHintShown));
                 sb.AppendLine("opt|sessionMeterAfterVolume|" + B(SessionMeterPost));
                 sb.AppendLine("opt|masterMeterPost|" + B(MasterMeterPost));
+                sb.AppendLine(string.Join("|", new[] { "proc", B(ProcOn), Clean(ProcSource), Clean(ProcOutput), ProcMode.ToString(IC), F(ProcAmount), F(ProcCeiling), F(ProcGain) }));
                 sb.AppendLine(string.Join("|", new[] { "master", F(Master.UserVol), B(Master.LimitOn), F(Master.LimitDb), B(Master.Pending) }));
                 foreach (var a in Apps.Values)
                     sb.AppendLine(string.Join("|", new[] { "app", Clean(a.Key), Clean(a.Title), F(a.UserVol), B(a.LimitOn), F(a.LimitDb), B(a.Muted), B(a.Pending), F(a.Env) }));
@@ -448,6 +464,11 @@ namespace VolumeGuard
                         if (!w.Dead) { w.Seen = true; w.Active = state == 1; }
                         continue;
                     }
+                    // VolumeGuard's own stream (the sound processing plays the game into the headphones):
+                    // it is not an app to limit, and limiting it would act on the game twice
+                    int spid = 0;
+                    try { spid = c.GetProcessId(); } catch { }
+                    if (spid == OwnPid) continue;
                     try
                     {
                         w = new SessionWrap { Id = id, Ctl = c, Vol = (ISimpleAudioVolume)c, Meter = (IAudioMeterInformation)c, Seen = true, Active = state == 1 };
@@ -537,6 +558,8 @@ namespace VolumeGuard
             w.LastSet = app.Gain;
             app.Sessions.Add(w);
         }
+
+        static readonly int OwnPid = Process.GetCurrentProcess().Id;
 
         void Identify(IAudioSessionControl2 c, out string key, out string title, out Icon icon)
         {

@@ -12,10 +12,51 @@ permissions:
   actions: read
 
 jobs:
+  # The sound-processing engine (vgaudio.dll): offline tests, then a MinGW-w64 cross-build.
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mingw-w64
+
+      - name: Engine tests (clock drift, sample rates, gaps, formats, processing chain)
+        run: |
+          cd native
+          g++ -O2 -std=c++17 -Wall -Wextra -Werror -Isrc tests/test_bridge.cpp -o test_bridge
+          g++ -O2 -std=c++17 -Wall -Wextra -Werror -Isrc -I../plugin/src tests/test_processor.cpp -o test_processor
+          ./test_bridge | tee bridge.txt
+          ./test_processor
+          echo "::notice title=Engine tests::$(grep -c 'underruns 0' bridge.txt) drift scenarios without gaps; all bridge and processor checks passed"
+
+      - name: Build vgaudio.dll
+        run: |
+          native/build.sh 2>&1 | tee native.log
+          test ${PIPESTATUS[0]} -eq 0 || { grep -E ': (fatal )?error' native.log | head -15 | sed 's/^/::error title=vgaudio::/'; exit 1; }
+          if grep -q 'warning:' native.log; then grep 'warning:' native.log | head -10 | sed 's/^/::warning title=vgaudio::/'; fi
+          # only system DLLs
+          x86_64-w64-mingw32-objdump -p native/build/vgaudio.dll | grep "DLL Name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vgaudio
+          path: |
+            native/build/vgaudio.dll
+            native/build/vgaudio-smoke.exe
+
   build:
+    needs: native
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vgaudio
+          path: native-bin
 
       - name: Build with the .NET Framework C# compiler
         shell: cmd
@@ -24,7 +65,32 @@ jobs:
           "%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /platform:anycpu /optimize+
           /win32icon:assets\app.ico /out:out\VolumeGuard.exe
           /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll src\*.cs &&
-          copy LICENSE out\LICENSE
+          copy LICENSE out\LICENSE &&
+          copy native-bin\vgaudio.dll out\vgaudio.dll
+
+      - name: Smoke test vgaudio.dll
+        shell: pwsh
+        run: |
+          Copy-Item native-bin/vgaudio-smoke.exe out/
+          Push-Location out
+          ./vgaudio-smoke.exe
+          $code = $LASTEXITCODE
+          Remove-Item vgaudio-smoke.exe
+          Pop-Location
+          if ($code -ne 0) { throw "vgaudio smoke test failed" }
+          # the same calls through .NET P/Invoke, as VolumeGuard.exe makes them (64-bit PowerShell)
+          $dll = (Resolve-Path out/vgaudio.dll).Path
+          Add-Type -TypeDefinition @"
+          using System; using System.Runtime.InteropServices; using System.Text;
+          public static class Vg {
+            [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl)] public static extern int vg_version();
+            [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int vg_list_devices(StringBuilder b, int c);
+            [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int vg_start(string a, string b);
+          }
+          "@
+          if ([Vg]::vg_version() -ne 1) { throw "vg_version via P/Invoke" }
+          if ([Vg]::vg_start("same", "same") -ne -2) { throw "vg_start via P/Invoke" }
+          "::notice title=vgaudio::DLL loads in .NET (64-bit), API version $([Vg]::vg_version()), $([Vg]::vg_list_devices($null, 0)) chars of device list"
 
       # Product name and version are part of the signing policy: make sure the exe carries the right ones.
       - name: Check product name and version
@@ -74,6 +140,8 @@ jobs:
           Write-Host "Packaging from: $src"
           New-Item -ItemType Directory -Force VolumeGuard | Out-Null
           Copy-Item "$src/VolumeGuard.exe", "$src/LICENSE" VolumeGuard/
+          $dll = if (Test-Path signed/vgaudio.dll) { 'signed/vgaudio.dll' } else { 'out/vgaudio.dll' }
+          Copy-Item $dll VolumeGuard/
           Compress-Archive -Path VolumeGuard -DestinationPath VolumeGuard.zip -Force
 
       - uses: actions/upload-artifact@v4

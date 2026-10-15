@@ -30,6 +30,9 @@ namespace VolumeGuard
         readonly Dictionary<string, ChannelCard> cards = new Dictionary<string, ChannelCard>();
         readonly NotifyIcon tray = new NotifyIcon();
         readonly ToolStripMenuItem trayEnabled = new ToolStripMenuItem("Лимитер включён");
+        readonly Processing processing;
+        readonly FlatButton procBtn = new FlatButton();
+        ProcessingForm procForm;
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         readonly Stopwatch clock = Stopwatch.StartNew();
         List<KeyValuePair<string, string>> devices = new List<KeyValuePair<string, string>>();
@@ -70,7 +73,16 @@ namespace VolumeGuard
             enabledSw.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             enabledSw.Location = new Point(header.Width - enabledSw.Width - Theme.D(16), Theme.D(18));
             enabledSw.CheckedChanged += delegate { SetEnabled(enabledSw.Checked); };
-            header.Controls.AddRange(new Control[] { title, sub, enabledSw });
+            // sound processing (2.0): opens its own window
+            processing = new Processing(s, demo);
+            procBtn.Text = "Обработка звука";
+            procBtn.Font = Theme.Font(9f);
+            procBtn.FitWidth();
+            procBtn.Height = Theme.D(26);   // stays above the subtitle line
+            procBtn.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            procBtn.Location = new Point(enabledSw.Left - procBtn.Width - Theme.D(14), Theme.D(19));
+            procBtn.Click += delegate { ShowProcessing(); };
+            header.Controls.AddRange(new Control[] { title, sub, procBtn, enabledSw });
 
             // device row
             var devRow = new Panel { Dock = DockStyle.Top, Height = Theme.D(44), BackColor = Theme.Bg, Padding = new Padding(Theme.D(16), Theme.D(6), Theme.D(16), Theme.D(8)) };
@@ -151,6 +163,7 @@ namespace VolumeGuard
             menu.Items.Add("Открыть", null, delegate { ShowFromTray(); });
             trayEnabled.Click += delegate { SetEnabled(!s.Enabled); };
             menu.Items.Add(trayEnabled);
+            menu.Items.Add("Обработка звука…", null, delegate { ShowFromTray(); ShowProcessing(); });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Выход", null, delegate { ExitApp(); });
             tray.ContextMenuStrip = menu;
@@ -160,6 +173,9 @@ namespace VolumeGuard
 
             enabledSw.Checked = s.Enabled;
             UpdateEnabledUi();
+
+            if (!demo && s.ProcOn) processing.Apply();
+            procBtn.Selected = s.ProcOn && processing.Available;
 
             eng.Open();
             FillDevices();
@@ -216,6 +232,9 @@ namespace VolumeGuard
                 lastSave = now;
                 s.Save();
             }
+
+            bool procOn = s.ProcOn && processing.Available;
+            if (procBtn.Selected != procOn) procBtn.Selected = procOn;
 
             string st = eng.Status ?? "";
             if (statusLabel.Text != st) statusLabel.Text = st;
@@ -369,6 +388,15 @@ namespace VolumeGuard
             tray.Text = s.Enabled ? "VolumeGuard — лимитер включён" : "VolumeGuard — лимитер выключен";
         }
 
+        public void OpenProcessing() { ShowProcessing(); }
+
+        void ShowProcessing()
+        {
+            if (procForm == null || procForm.IsDisposed) procForm = new ProcessingForm(s, processing, iconOn);
+            if (!procForm.Visible) procForm.Show(this);
+            procForm.Activate();
+        }
+
         void ToggleWindow()
         {
             if (Visible && WindowState != FormWindowState.Minimized) { Hide(); Native.TrimMemory(); }
@@ -412,6 +440,7 @@ namespace VolumeGuard
             timer.Stop();
             if (!demo) { try { Native.timeEndPeriod(1); } catch { } }
             try { eng.Close(); } catch { }
+            processing.Shutdown();   // stop the audio threads before the DLL is unloaded
             if (!demo) s.Save();
             tray.Visible = false;
             base.OnFormClosing(e);
@@ -560,6 +589,7 @@ namespace VolumeGuard
             Settings s = demo ? DemoSettings() : Settings.Load();
             IEngine eng = demo ? (IEngine)new FakeEngine(s) : new AudioEngine(s);
             var form = new MainForm(s, eng, hidden && !demo, demo);
+            if (demo && args.Contains("--processing")) form.Shown += delegate { form.OpenProcessing(); };
             if (showEvt != null)
             {
                 ThreadPool.RegisterWaitForSingleObject(showEvt, delegate
@@ -574,6 +604,7 @@ namespace VolumeGuard
         static Settings DemoSettings()
         {
             var s = new Settings();
+            s.ProcOn = true; s.ProcMode = 2; s.ProcAmount = 60f; s.ProcCeiling = -3f;
             s.Master.UserVol = 0.62f; s.Master.LimitOn = true; s.Master.LimitDb = -8f;
             Action<string, string, float, bool, float, bool> add = (k, t, v, lo, ld, mu) =>
                 s.Apps[k] = new AppModel { Key = k, Title = t, UserVol = v, LimitOn = lo, LimitDb = ld, Muted = mu };
