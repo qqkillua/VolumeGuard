@@ -10,12 +10,6 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: AssemblyTitle("VolumeGuard")]
-[assembly: AssemblyProduct("VolumeGuard")]
-[assembly: AssemblyDescription("Громкость и лимитер для каждого приложения")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
-
 namespace VolumeGuard
 {
     class MainForm : Form

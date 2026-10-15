@@ -73,7 +73,8 @@ build.cmd
 с ненастоящими данными — удобно для проверки вёрстки без звука.
 
 **Новая версия.** GitHub Actions собирает exe при каждом пуше в `main`. Чтобы выпустить релиз, поменяйте номер
-в файле `VERSION` и добавьте `[release]` в сообщение коммита — архив появится на странице Releases сам.
+в `VERSION` и в `src/AssemblyInfo.cs` и добавьте `[release]` в сообщение коммита — архив появится на странице Releases сам.
+Как подключена подпись релизов — в [`.signpath/README.md`](.signpath/README.md).
 
 | Файл | Что внутри |
 |---|---|
@@ -81,15 +82,35 @@ build.cmd
 | `src/Engine.cs` | Настройки, лимитер, работа с аудиосессиями |
 | `src/Controls.cs` | Ползунки, переключатели, карточки приложений |
 | `src/MainForm.cs` | Главное окно, трей, автозапуск |
+| `src/AssemblyInfo.cs` | Название и версия программы |
 
 ## Настройки
 
 Хранятся в `%APPDATA%\VolumeGuard\settings.txt` — обычный текстовый файл.
 Если программа упала, подробности будут в `%APPDATA%\VolumeGuard\crash.log`.
 
+## Конфиденциальность и изменения в системе
+
+VolumeGuard не подключается к интернету и никуда не передаёт данные. Программа меняет только громкость
+приложений и устройства, а в реестре — одну запись автозапуска (`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`,
+значение `VolumeGuard`), и только если вы включили «Запускать вместе с Windows». Чтобы удалить программу,
+выключите автозапуск, закройте её и удалите папку с exe и `%APPDATA%\VolumeGuard`.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+- Committers and reviewers: [@qqkillua](https://github.com/qqkillua)
+- Approvers: [@qqkillua](https://github.com/qqkillua)
+
+Signed releases are built from this repository by GitHub Actions; every signing request is approved manually.
+
+**Privacy policy:** This program will not transfer any information to other networked systems unless specifically
+requested by the user or the person installing or operating it.
+
 ## Лицензия
 
-[MIT](LICENSE) © 2026 Nikita ([@qqkillua](https://github.com/qqkillua))
+[MIT](LICENSE) © 2026 Nikita Bainov ([@qqkillua](https://github.com/qqkillua))
 
 ---
 

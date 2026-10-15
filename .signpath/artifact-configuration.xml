@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for VolumeGuard.
+  The GitHub Actions build uploads a ZIP whose root holds VolumeGuard.exe and LICENSE;
+  SignPath signs the exe inside it (Authenticode) and returns the same ZIP.
+  Paste this into SignPath: Project → Artifact configurations → Edit.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="VolumeGuard.exe" product-name="VolumeGuard">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

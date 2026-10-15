@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   build:
@@ -19,15 +20,60 @@ jobs:
       - name: Build with the .NET Framework C# compiler
         shell: cmd
         run: >
+          mkdir out &&
           "%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /platform:anycpu /optimize+
-          /win32icon:assets\app.ico /out:VolumeGuard.exe
-          /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll src\*.cs
+          /win32icon:assets\app.ico /out:out\VolumeGuard.exe
+          /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll src\*.cs &&
+          copy LICENSE out\LICENSE
+
+      # Product name and version are part of the signing policy: make sure the exe carries the right ones.
+      - name: Check product name and version
+        id: ver
+        shell: pwsh
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          $want = (Get-Content VERSION -Raw).Trim()
+          $info = (Get-Item out/VolumeGuard.exe).VersionInfo
+          if ($info.ProductName -ne 'VolumeGuard') { throw "ProductName is '$($info.ProductName)', expected 'VolumeGuard'" }
+          if ($info.ProductVersion -ne $want) { throw "ProductVersion is '$($info.ProductVersion)', VERSION file says '$want' (update src/AssemblyInfo.cs)" }
+          if (-not $info.FileVersion.StartsWith($want)) { throw "FileVersion is '$($info.FileVersion)', VERSION file says '$want'" }
+          if ("${{ github.ref }}" -like "refs/tags/v*") { $tag = "${{ github.ref_name }}" } else { $tag = "v$want" }
+          $release = ("${{ github.ref }}" -like "refs/tags/v*") -or
+                     ("${{ github.event_name }}" -eq "push" -and "$env:COMMIT_MESSAGE".Contains('[release]'))
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "release=$($release.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          Write-Host "VolumeGuard $want, release: $release"
+
+      - name: Upload unsigned build
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: VolumeGuard-unsigned
+          path: out/
+
+      # Runs only for releases, and only once SignPath is set up (see .signpath/README.md).
+      # SignPath waits for a manual approval of every release before it signs.
+      - name: Sign with SignPath
+        if: steps.ver.outputs.release == 'true' && vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
 
       - name: Package
         shell: pwsh
         run: |
+          $src = if (Test-Path signed/VolumeGuard.exe) { 'signed' } else { 'out' }
+          Write-Host "Packaging from: $src"
           New-Item -ItemType Directory -Force VolumeGuard | Out-Null
-          Copy-Item VolumeGuard.exe, LICENSE VolumeGuard/
+          Copy-Item "$src/VolumeGuard.exe", "$src/LICENSE" VolumeGuard/
           Compress-Archive -Path VolumeGuard -DestinationPath VolumeGuard.zip -Force
 
       - uses: actions/upload-artifact@v4
@@ -37,16 +83,8 @@ jobs:
 
       # A release is published for a pushed v* tag, or for a push to main whose
       # commit message contains [release] (the version is taken from the VERSION file).
-      - name: Read version
-        id: ver
-        shell: pwsh
-        run: |
-          if ("${{ github.ref }}" -like "refs/tags/v*") { $v = "${{ github.ref_name }}" }
-          else { $v = "v" + (Get-Content VERSION -Raw).Trim() }
-          "tag=$v" >> $env:GITHUB_OUTPUT
-
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'push' && contains(github.event.head_commit.message, '[release]'))
+        if: steps.ver.outputs.release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
