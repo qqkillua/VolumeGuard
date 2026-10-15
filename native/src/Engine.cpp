@@ -450,7 +450,7 @@ private:
         rs.prepare(srcRate, outRate, 20.0);
         vga::OutputPacer pacer;
         const double packetOut = srcPeriodMs * outRate / 1000.0;
-        pacer.prepare(outRate, outPeriod, packetOut, 2.0 + std::min(srcPeriodMs, 4.0));
+        pacer.prepare(outRate, outPeriod, packetOut, 2.0);
         vga::Processor proc;
         proc.prepare(outRate);
         vga::Params params = currentParams();
@@ -463,7 +463,7 @@ private:
 
         // prime the output with the margin in silence, then start everything
         BYTE* data = nullptr;
-        UINT32 prime = std::min(renFrames, (UINT32)pacer.marginFrames() + outPeriod);
+        UINT32 prime = std::min(renFrames, (UINT32)pacer.targetFrames() + outPeriod / 2);
         if (SUCCEEDED(render->GetBuffer(prime, &data))) render->ReleaseBuffer(prime, AUDCLNT_BUFFERFLAGS_SILENT);
         if (keepClient_) keepClient_->Start();
         if (FAILED(hr = capClient->Start())) { cleanupCapture(); code = VG_ERR_SOURCE; return report(first, "source: Start", hr); }
@@ -475,12 +475,17 @@ private:
         if (first) { firstResult_ = VG_OK; SetEvent(readyEvent_); }
 
         const double t0 = nowSec();
-        double lastPoll = t0, lastData = t0, quietUntil = t0 + 1.0, lastLateLog = -1e9, waitSmooth = 0.0;
+        double lastPoll = t0, lastData = t0, quietUntil = t0 + 1.0, lastGlitchLog = -1e9, waitSmooth = 0.0;
         bool produced = false;
-        uint64_t lates = 0;
+        uint64_t lastDips = 0;
         hr = S_OK;
-        while (WaitForSingleObject(stopEvent_, 1) == WAIT_TIMEOUT)
+        // wake up every ~1 ms, and right when the output device has taken its period (its event)
+        HANDLE waits[2] = { stopEvent_, renEvent };
+        for (;;)
         {
+            const DWORD w = WaitForMultipleObjects(2, waits, FALSE, 1);
+            if (w == WAIT_OBJECT_0) break;
+            const bool pulled = w == WAIT_OBJECT_0 + 1;
             const double now = nowSec();
             const double dt = std::max(0.0, std::min(0.1, now - lastPoll));
             lastPoll = now;
@@ -524,17 +529,20 @@ private:
             UINT32 padding = 0;
             if (FAILED(hr = renClient->GetCurrentPadding(&padding))) { logLine("output: GetCurrentPadding 0x%08lX", (unsigned long)hr); break; }
 
-            // The output ran dry although audio was already waiting for us: we were late. Keep a bit more.
-            if (padding == 0 && produced && now > quietUntil && rs.pendingInput(ring_) >= 1.0)
+            const bool stalled = now - lastData > 3.0 * srcPeriodMs / 1000.0 + 0.003;
+
+            // Right after the device took its period the queue is at its lowest: the safety check.
+            if (pulled)
             {
-                pacer.onLate();
-                ++lates;
-                underrunsTotal_.fetch_add(1);
-                if (now - lastLateLog > 10.0)
+                const bool glitch = pacer.onPull((double)padding, produced && !stalled && now > quietUntil);
+                if (glitch) underrunsTotal_.fetch_add(1);
+                if ((glitch || pacer.dips() != lastDips) && now - lastGlitchLog > 5.0)
                 {
-                    lastLateLog = now;
-                    logLine("output ran dry (%llu times), margin now %.1f ms", (unsigned long long)lates, pacer.marginMs());
+                    lastGlitchLog = now;
+                    logLine("output queue ran low (%llu empty, %llu low), now keeping %.1f ms on average",
+                            (unsigned long long)pacer.glitches(), (unsigned long long)pacer.dips(), pacer.targetMs());
                 }
+                lastDips = pacer.dips();
             }
             const double corr = pacer.update((double)padding, dt);
 
@@ -550,12 +558,11 @@ private:
             if (p != params) { params = p; proc.setParams(p); }
             const UINT32 room = renFrames - std::min(renFrames, padding);
             int n = rs.produce(ring_, l.data(), r.data(), (int)std::min<UINT32>(room, (UINT32)l.size()), corr);
-            const bool stalled = now - lastData > 3.0 * srcPeriodMs / 1000.0 + 0.003;
             if (n == 0 && produced && stalled)
             {
                 // the source sends nothing (no keep-alive and the game is quiet): keep the output fed with
                 // silence, and do not judge our own timing until sound flows again for a moment
-                const UINT32 want = std::min(renFrames, (UINT32)pacer.marginFrames() + outPeriod);
+                const UINT32 want = std::min(renFrames, (UINT32)pacer.floorFrames() + outPeriod);
                 if (padding < want)
                 {
                     n = (int)std::min<UINT32>(want - padding, (UINT32)l.size());

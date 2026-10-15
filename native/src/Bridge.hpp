@@ -336,20 +336,25 @@ private:
 // ---------------------------------------------------------------------------------------------------------
 /// Push mode pacing. Every sound packet from the source is converted and queued in the output device at once,
 /// so there is only ONE buffer (the device queue) instead of a ring + a device queue. The device takes a whole
-/// period (e.g. 10 ms) at a time and packets arrive whole, so the queue is a saw-tooth between `margin` (just
-/// after the device took its period) and margin + period + packet. The pacer keeps its time-average at
-/// margin + (period + packet) / 2 by reading the input a tiny bit faster or slower (clock drift), and grows
-/// the margin by 1 ms whenever the queue ran dry although audio was there (our thread was late).
+/// period (e.g. 10 ms) at a time and packets arrive whole, so the queue is a saw-tooth. Two loops:
+///  - fast and smooth: the time-average of the queue is held at `target` by reading the input a tiny bit
+///    faster or slower (clock drift), like before;
+///  - safety: right after each pull of the device (its event) the queue is at its lowest. That low point must
+///    stay above `floor`. If it dips below, or the queue is found empty (a glitch: the device got less than a
+///    period), the target goes up; if for 20 s it never came near the floor, the target comes down by 0.5 ms.
+///    So the margin fits however unevenly the packets really arrive.
 class OutputPacer
 {
 public:
-    void prepare(double outRate, double periodFrames, double packetFrames, double marginMs, double maxMarginMs = 30.0)
+    void prepare(double outRate, double periodFrames, double packetFrames, double floorMs, double maxTargetMs = 60.0)
     {
         rate_ = outRate;
         period_ = std::max(1.0, periodFrames);
         packet_ = std::max(0.0, packetFrames);
-        margin_ = marginMs * outRate / 1000.0;
-        maxMargin_ = maxMarginMs * outRate / 1000.0;
+        floor_ = floorMs * outRate / 1000.0;
+        target_ = floor_ + 0.5 * (period_ + packet_) + 0.001 * outRate;
+        minTarget_ = floor_ + 0.5 * period_;
+        maxTarget_ = maxTargetMs * outRate / 1000.0;
         window_ = 0.1;
         reset();
     }
@@ -358,71 +363,94 @@ public:
     {
         integ_ = corr_ = 0.0;
         sumQ_ = sumT_ = 0.0;
-        smooth_ = target();
+        smooth_ = target_;
         primed_ = false;
-        lowest_ = 1e18;
-        lowestSec_ = 0.0;
+        lowSince_ = 1e18;
+        lowSec_ = 0.0;
+        lastRaise_ = -1e9;
+        clock_ = 0.0;
+        glitches_ = dips_ = 0;
     }
 
-    /// queueFrames: the device queue BEFORE new audio is added. dt: seconds since the previous call.
+    /// Every poll: queueFrames = the device queue BEFORE new audio is added; dt = seconds since the last poll.
     /// Returns the correction for DriftResampler::produce.
     double update(double queueFrames, double dt)
     {
+        clock_ += dt;
         sumQ_ += queueFrames * dt;
         sumT_ += dt;
-        lowest_ = std::min(lowest_, queueFrames);
         if (sumT_ >= window_)
         {
             const double d = sumT_, avg = sumQ_ / sumT_;
             sumQ_ = sumT_ = 0.0;
             if (!primed_) { primed_ = true; smooth_ = avg; }
             smooth_ += (avg - smooth_) * std::min(1.0, d / 2.0);
-            const double err = (smooth_ - target()) / rate_;       // seconds of output too much (+) / too little (-)
+            const double err = (smooth_ - target_) / rate_;       // seconds of output too much (+) / too little (-)
             const double unclamped = kP * err + kI * (integ_ + err * d);
             if (std::fabs(unclamped) < kMax)
                 integ_ = std::max(-kMax / kI, std::min(kMax / kI, integ_ + err * d));
             corr_ = std::max(-kMax, std::min(kMax, kP * err + kI * integ_));
 
-            // Give back latency only when the margin was clearly never needed: over 30 s the queue never got
-            // closer than 2 ms to empty (beyond the margin) — then lower the margin by 0.5 ms.
-            lowestSec_ += d;
-            if (lowestSec_ > 30.0)
+            lowSec_ += d;
+            if (lowSec_ > 20.0)
             {
-                if (lowest_ > margin_ + 0.002 * rate_ && margin_ > minMargin())
-                    margin_ = std::max(minMargin(), margin_ - 0.0005 * rate_);
-                lowest_ = 1e18;
-                lowestSec_ = 0.0;
+                if (lowSince_ > floor_ + 0.002 * rate_ && target_ > minTarget_)
+                    target_ = std::max(minTarget_, target_ - 0.0005 * rate_);
+                lowSince_ = 1e18;
+                lowSec_ = 0.0;
             }
         }
         return corr_;
     }
 
-    /// The device found its queue empty although audio was waiting: we were late. Keep 1 ms more from now on.
-    void onLate()
+    /// Right after the device took its period (its event): the queue is at its low point. judge = false while
+    /// the source is silent or just started (then a low queue is not our fault).
+    /// Returns true if this was a glitch (the device found the queue empty).
+    bool onPull(double queueFrames, bool judge)
     {
-        margin_ = std::min(maxMargin_, margin_ + 0.001 * rate_);
-        lowest_ = 1e18;
-        lowestSec_ = 0.0;
+        if (!judge || !primed_) return false;
+        lowSince_ = std::min(lowSince_, queueFrames);
+        if (queueFrames <= 0.0)
+        {
+            ++glitches_;
+            raise(0.002);
+            return true;
+        }
+        if (queueFrames < floor_ && clock_ - lastRaise_ > 0.5)
+        {
+            ++dips_;
+            raise(0.0005);
+        }
+        return false;
     }
 
     /// How far the average queue is above what it should be (frames).
-    double excess() const { return primed_ ? smooth_ - target() : 0.0; }
-    double marginFrames() const { return margin_; }
-    double marginMs() const { return margin_ * 1000.0 / rate_; }
-    double targetFrames() const { return target(); }
+    double excess() const { return primed_ ? smooth_ - target_ : 0.0; }
+    double targetFrames() const { return target_; }
+    double targetMs() const { return target_ * 1000.0 / rate_; }
+    double floorFrames() const { return floor_; }
     double correction() const { return corr_; }
+    uint64_t glitches() const { return glitches_; }
+    uint64_t dips() const { return dips_; }
     void settle(double removedFrames) { smooth_ -= removedFrames; integ_ = 0.0; }
 
     static constexpr double kMax = 0.005;
     static constexpr double kP = 0.54, kI = 0.09;
 
 private:
-    double target() const { return margin_ + 0.5 * (period_ + packet_); }
-    double minMargin() const { return 0.0015 * rate_; }
+    void raise(double sec)
+    {
+        target_ = std::min(maxTarget_, target_ + sec * rate_);
+        lastRaise_ = clock_;
+        lowSince_ = 1e18;
+        lowSec_ = 0.0;
+    }
 
-    double rate_ = 48000, period_ = 480, packet_ = 128, margin_ = 192, maxMargin_ = 1440, window_ = 0.1;
-    double integ_ = 0, corr_ = 0, sumQ_ = 0, sumT_ = 0, smooth_ = 0, lowest_ = 1e18, lowestSec_ = 0;
+    double rate_ = 48000, period_ = 480, packet_ = 128, floor_ = 96, target_ = 500, minTarget_ = 336, maxTarget_ = 2880;
+    double window_ = 0.1, integ_ = 0, corr_ = 0, sumQ_ = 0, sumT_ = 0, smooth_ = 0;
+    double lowSince_ = 1e18, lowSec_ = 0, lastRaise_ = -1e9, clock_ = 0;
     bool primed_ = false;
+    uint64_t glitches_ = 0, dips_ = 0;
 };
 
 // ---------------------------------------------------------------------------------------------------------

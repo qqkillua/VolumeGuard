@@ -58,10 +58,10 @@ static double snrOf(const std::vector<float>& out)
     return 10 * std::log10(sig / (noise + 1e-30));
 }
 
-// capMs: source packet; perMs: device period; ppm: source clock vs device clock; lateProb: chance that a poll
-// wakes up lateMs late (a busy system).
+// capMs: source packet; perMs: device period; ppm: source clock vs device clock; lateProb: chance that our
+// thread wakes up lateMs late (a busy system); burst: the source delivers this many packets at once.
 static Res run(double capMs, double perMs, double ppm, double seconds, unsigned seed, double lateProb = 0.002, double lateMs = 4.0,
-               double stallFrom = -1, double stallTo = -1)
+               double stallFrom = -1, double stallTo = -1, int burst = 1)
 {
     const double rate = 48000;
     std::mt19937 rng(seed);
@@ -71,40 +71,47 @@ static Res run(double capMs, double perMs, double ppm, double seconds, unsigned 
     vga::OutputPacer pacer;
     const int period = (int)std::lround(rate * perMs / 1000);
     const int capFrames = (int)std::lround(rate * capMs / 1000);
-    pacer.prepare(rate, period, capFrames, 2.0 + std::min(capMs, 4.0));
+    pacer.prepare(rate, period, capFrames * burst, 2.0);
+
     const double capReal = rate * (1 + ppm * 1e-6);
     std::deque<float> queue;                    // the device queue (left channel only, for the measurement)
-    for (int i = 0; i < (int)pacer.marginFrames(); ++i) queue.push_back(0.0f);
+    for (int i = 0; i < (int)pacer.targetFrames(); ++i) queue.push_back(0.0f);
     std::vector<float> lr((size_t)capFrames * 2), l(4096), r(4096), out;
-    uint64_t capN = 0, pulls = 0, polls = 0, sample = 0;
-    double tCap = capFrames / capReal, tPull = 0.0013 + period / rate, tPoll = 0.001;
-    double lastPoll = 0, lastData = 0, waitSum = 0;
+    uint64_t capN = 0, pulls = 0, sample = 0;
+    double tCap = burst * capFrames / capReal, tPull = 0.0013 + period / rate, tPoll = 0.001;
+    double lastPoll = 0, lastData = 0, waitSum = 0, quietUntil = 0;
     long waitN = 0;
     Res res;
-    bool produced = false;
-    double quietUntil = 0;
+    bool produced = false, eventPending = false;
+    auto wake = [&](double base) {
+        const double late = u(rng) < lateProb ? lateMs / 1000.0 : u(rng) * 0.0004;
+        return base + late;
+    };
     while (tPull < seconds)
     {
         const double t = std::min(tCap, std::min(tPull, tPoll));
         if (t == tCap)
         {
-            if (!(t >= stallFrom && t < stallTo))
+            for (int b = 0; b < burst; ++b)
             {
-                for (int i = 0; i < capFrames; ++i, ++sample)
+                if (!(t >= stallFrom && t < stallTo))
                 {
-                    const float s = 0.5f * (float)std::sin(2 * kPi * 1000.0 * (double)sample / rate);
-                    lr[2 * i] = s; lr[2 * i + 1] = s;
+                    for (int i = 0; i < capFrames; ++i, ++sample)
+                    {
+                        const float s = 0.5f * (float)std::sin(2 * kPi * 1000.0 * (double)sample / rate);
+                        lr[2 * i] = s; lr[2 * i + 1] = s;
+                    }
+                    ring.write(lr.data(), (size_t)capFrames, t);
+                    lastData = t;
                 }
-                ring.write(lr.data(), (size_t)capFrames, t);
-                lastData = t;
             }
-            ++capN;
-            tCap = (capN + 1) * capFrames / capReal + (u(rng) - 0.5) * 0.001;   // ±0.5 ms jitter
+            capN += burst;
+            tCap = (capN + burst) * capFrames / capReal + (u(rng) - 0.5) * 0.001;   // ±0.5 ms jitter
         }
         else if (t == tPull)
         {
-            const bool warm = t > 3.0;
-            if ((int)queue.size() < period && warm && !(t >= stallFrom && t < stallTo + 0.5)) ++res.glitches;
+            const bool warm = t > 3.0 && !(t >= stallFrom && t < stallTo + 0.5);
+            if ((int)queue.size() < period && warm) ++res.glitches;
             for (int i = 0; i < period; ++i)
             {
                 float v = 0.0f;
@@ -113,30 +120,32 @@ static Res run(double capMs, double perMs, double ppm, double seconds, unsigned 
             }
             ++pulls;
             tPull = 0.0013 + (pulls + 1) * period / rate + (u(rng) - 0.5) * 0.0002;
+            // the device signals its event: our thread wakes up (usually within a fraction of a millisecond)
+            eventPending = true;
+            tPoll = std::min(tPoll, wake(t + 0.00005));
         }
         else
         {
             // our thread: what the engine does every poll
             const double q = (double)queue.size();
-            const bool stalled = t - lastData > 3.0 * capMs / 1000.0 + 0.002;
-            // late = the device ran dry while audio was already waiting for us (not: the source sent nothing)
-            if (q == 0 && produced && t - quietUntil > 0 && rs.pendingInput(ring) >= 1.0) { pacer.onLate(); ++res.lates; if (getenv("VGDBG")) std::printf("  late at %.3f q=%g pend=%.1f lastData=%.3f\n", t, q, rs.pendingInput(ring), lastData); }
+            const bool stalled = t - lastData > 3.0 * burst * capMs / 1000.0 + 0.003;
+            if (eventPending)
+            {
+                eventPending = false;
+                if (pacer.onPull(q, produced && !stalled && t > quietUntil)) ++res.lates;
+            }
             const double corr = pacer.update(q, t - lastPoll);
             lastPoll = t;
             if (pacer.excess() > 0.020 * rate)
             {
-                // far too much queued (after a stall): drop input we have not queued yet
                 const double drop = std::min(rs.pendingInput(ring), pacer.excess());
                 if (drop > 0) { rs.skipInput(ring, (size_t)drop); pacer.settle(drop); }
             }
-            const int room = 4096;
-            const int n = rs.produce(ring, l.data(), r.data(), room, corr);
+            const int n = rs.produce(ring, l.data(), r.data(), 4096, corr);
             for (int i = 0; i < n; ++i) queue.push_back(l[i]);
             if (stalled && produced)
             {
-                // the source is silent: keep the device fed with silence (a full period + margin), and do not
-                // judge our own timing until audio flows again for a moment
-                while (queue.size() < pacer.marginFrames() + period) queue.push_back(0.0f);
+                while (queue.size() < pacer.floorFrames() + period) queue.push_back(0.0f);
                 quietUntil = t + 0.3;
             }
             if (n > 0 && !produced) quietUntil = t + 1.0;   // start-up
@@ -147,13 +156,11 @@ static Res run(double capMs, double perMs, double ppm, double seconds, unsigned 
                 waitSum += w; ++waitN;
                 res.maxWaitMs = std::max(res.maxWaitMs, w);
             }
-            ++polls;
-            const double late = u(rng) < lateProb ? lateMs / 1000.0 : u(rng) * 0.0004;
-            tPoll = t + 0.001 + late;
+            tPoll = wake(t + 0.001);
         }
     }
     res.avgWaitMs = waitSum / std::max(1L, waitN);
-    res.marginMs = pacer.marginMs();
+    res.marginMs = pacer.targetMs();
     res.corrPpm = pacer.correction() * 1e6;
     res.snr = snrOf(out);
     return res;
@@ -175,13 +182,20 @@ int main()
         Res r = run(c.cap, c.per, c.ppm, 300.0, 11);
         // latency of the path: source packet + wait in the device queue + 5 ms lookahead
         const double total = c.cap + r.avgWaitMs + 5.0;
-        std::printf("%-28s glitches %d (late %d), queue wait avg %.1f / max %.1f ms, margin %.1f ms, corr %+.0f ppm, SNR %.1f dB -> path ~%.0f ms\n",
+        std::printf("%-28s glitches %d (seen %d), queue wait avg %.1f / max %.1f ms, target %.1f ms, corr %+.0f ppm, SNR %.1f dB -> path ~%.0f ms\n",
                     c.name, r.glitches, r.lates, r.avgWaitMs, r.maxWaitMs, r.marginMs, r.corrPpm, r.snr, total);
         CHECK(r.glitches <= 3, "%s: %d glitches", c.name, r.glitches);
         CHECK(std::fabs(r.corrPpm - c.ppm) < 150, "%s: correction %.0f ppm for %.0f ppm drift", c.name, r.corrPpm, c.ppm);
         CHECK(r.snr > 80, "%s: SNR %.1f dB", c.name, r.snr);
         CHECK(r.avgWaitMs < 0.5 * (c.per + c.cap) + 12.0, "%s: queue on average %.1f ms", c.name, r.avgWaitMs);
-        CHECK(r.marginMs <= 8.0, "%s: margin grew to %.1f ms", c.name, r.marginMs);
+
+    }
+    // the source delivers its 2.67 ms packets in bursts of four (every ~10.7 ms): the margin must adapt
+    {
+        Res r = run(128 / 48.0, 10.0, 150, 120.0, 4, 0.002, 4.0, -1, -1, 4);
+        std::printf("%-28s glitches %d (seen %d), queue wait avg %.1f ms, target %.1f ms, SNR %.1f dB\n", "bursts of 4 packets", r.glitches, r.lates, r.avgWaitMs, r.marginMs, r.snr);
+        CHECK(r.glitches <= 4, "bursts: %d glitches", r.glitches);
+        CHECK(r.snr > 80, "bursts: SNR %.1f", r.snr);
     }
     // a busy system: 2 % of polls wake 6 ms late
     {
