@@ -88,7 +88,7 @@ namespace VolumeGuard
         /// How fast the volume comes back after a loud sound: 0 fast (~0.6 s), 1 medium (~1.1 s), 2 slow (~2 s).
         public int ReturnSpeed = 1;
         /// How to limit: 0 every peak (fast, may click), 1 loudness over ~0.4 s (peaks up to 6 dB over, 20 ms
-        /// fade down), 2 smooth like Sound Lock (loudness over ~3 s, 150 ms fade down, never a sudden cut).
+        /// fade down), 2 smooth (loudness over ~3 s, 150 ms fade down, never a sudden cut).
         public int LimitMode;
         /// Memory of loud sounds: 0 off, 1 ~10 s, 2 ~30 s. While it lasts the volume does not come back so far
         /// that the same loud sound would again be more than 3 dB over the limit.
@@ -300,7 +300,7 @@ namespace VolumeGuard
                 float level = (float)Math.Sqrt(ms);
                 if (mode == 2)
                 {
-                    // smooth: only the average over ~3 s counts, like Sound Lock — single loud sounds pass
+                    // smooth: only the average over ~3 s counts — single loud sounds pass
                     if (level > 1e-4f) target = Math.Min(target, Db.ToLin(limitDb) / level);
                 }
                 else if (mode == 1)
