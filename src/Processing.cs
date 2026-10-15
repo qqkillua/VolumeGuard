@@ -186,6 +186,36 @@ namespace VolumeGuard
             });
         }
 
+        /// VB-CABLE (VB-Audio, donationware) ships in the VBCABLE folder next to the exe. Its setup, or null.
+        public static string BundledCableSetup()
+        {
+            try
+            {
+                string dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "VBCABLE");
+                string arch = (Environment.GetEnvironmentVariable("PROCESSOR_ARCHITEW6432") ??
+                               Environment.GetEnvironmentVariable("PROCESSOR_ARCHITECTURE") ?? "").ToUpperInvariant();
+                var names = arch == "ARM64"
+                    ? new[] { "VBCABLE_Setup_arm64.exe", "VBCABLE_Setup_ARM64.exe", "VBCABLE_Setup_x64.exe" }
+                    : Environment.Is64BitOperatingSystem ? new[] { "VBCABLE_Setup_x64.exe" } : new[] { "VBCABLE_Setup.exe" };
+                foreach (var n in names)
+                {
+                    string f = Path.Combine(dir, n);
+                    if (File.Exists(f)) return f;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        public static bool CableInstalled(List<AudioDevice> devices)
+        {
+            foreach (var d in devices)
+                if (d.Name.IndexOf("VB-Audio Virtual Cable", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    d.Name.IndexOf("CABLE Input", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            return false;
+        }
+
         public VgStatus Status()
         {
             var st = new VgStatus();
@@ -433,6 +463,22 @@ namespace VolumeGuard
 
             y = AddDeviceRow("Игра играет в", srcBox, x, y, w);
             y = AddDeviceRow("Слушать в", outBox, x, y, w);
+            // no virtual cable yet: offer the one that ships in the archive
+            string cableSetup = Processing.BundledCableSetup();
+            if (proc.Available && cableSetup != null && !Processing.CableInstalled(proc.ListDevices()))
+            {
+                var cableBtn = new FlatButton { Text = "Установить VB-CABLE", Font = Theme.Font(9f), Location = new Point(x + Theme.D(92), y) };
+                cableBtn.FitWidth();
+                cableBtn.Click += delegate { InstallCable(cableSetup); };
+                Controls.Add(cableBtn);
+                var cableInfo = new Label
+                {
+                    Text = "Виртуальный кабель для игры, в комплекте. VB-Audio, donationware — vb-cable.com",
+                    ForeColor = Theme.Sub, Font = Theme.Font(8f), Location = new Point(cableBtn.Right + Theme.D(10), y)
+                };
+                int bottom = Para(cableInfo, w - Theme.D(92) - cableBtn.Width - Theme.D(10));
+                y = Math.Max(bottom, cableBtn.Bottom) + Theme.D(10);
+            }
             srcBox.SelectedIndexChanged += delegate { OnDeviceChosen(srcBox, true); };
             outBox.SelectedIndexChanged += delegate { OnDeviceChosen(outBox, false); };
 
@@ -619,6 +665,31 @@ namespace VolumeGuard
             else { if (id == s.ProcOutput) return; s.ProcOutput = id; }
             s.Dirty = true;
             proc.Apply();
+        }
+
+        void InstallCable(string setup)
+        {
+            var answer = MessageBox.Show(this,
+                "VB-CABLE — бесплатный виртуальный аудиокабель от VB-Audio Software (donationware, www.vb-cable.com). " +
+                "Он лежит в архиве VolumeGuard без изменений.\r\n\r\n" +
+                "Сейчас откроется его установщик (нужны права администратора): нажмите «Install Driver». " +
+                "После установки перезагрузите компьютер — появится устройство «CABLE Input».\r\n\r\nПродолжить?",
+                "Установка VB-CABLE", MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
+            if (answer != DialogResult.OK) return;
+            try
+            {
+                Process.Start(new ProcessStartInfo(setup)
+                {
+                    UseShellExecute = true,
+                    Verb = "runas",
+                    WorkingDirectory = Path.GetDirectoryName(setup)
+                });
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                if (ex.NativeErrorCode != 1223)   // 1223: the user said "No" in the administrator prompt
+                    MessageBox.Show(this, "Не удалось запустить установщик: " + ex.Message, "VolumeGuard", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
 
         static void OpenAppVolumeSettings()

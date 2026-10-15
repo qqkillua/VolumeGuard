@@ -133,6 +133,30 @@ jobs:
           wait-for-completion-timeout-in-seconds: 3600
           output-artifact-directory: signed
 
+      # VB-CABLE by VB-Audio (donationware) ships in the archive, unchanged, as its licence allows:
+      # https://vb-audio.com/Services/licensing.htm. The download is pinned by SHA-256 and the
+      # installers must carry a valid Authenticode signature.
+      - name: Bundle VB-CABLE
+        shell: pwsh
+        run: |
+          $url = 'https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip'
+          $want = if (Test-Path .github/vbcable.sha256) { (Get-Content .github/vbcable.sha256 -Raw).Trim().ToUpper() } else { '' }
+          Invoke-WebRequest $url -OutFile vbcable.zip -UseBasicParsing
+          $hash = (Get-FileHash vbcable.zip -Algorithm SHA256).Hash
+          if ($want -eq '') {
+            if ('${{ steps.ver.outputs.release }}' -eq 'true') { throw "pin the VB-CABLE hash in .github/vbcable.sha256 before releasing ($hash)" }
+            "::warning title=VB-CABLE::not pinned yet, SHA-256 $hash"
+          } elseif ($hash -ne $want) { throw "VB-CABLE download changed: $hash, pinned $want" }
+          Expand-Archive vbcable.zip vbcable -Force
+          $files = (Get-ChildItem vbcable -Recurse -File | ForEach-Object { $_.FullName.Substring((Resolve-Path vbcable).Path.Length + 1) }) -join ', '
+          "::notice title=VB-CABLE files::$files"
+          foreach ($exe in Get-ChildItem vbcable -Recurse -Filter *.exe) {
+            $sig = Get-AuthenticodeSignature $exe.FullName
+            "::notice title=VB-CABLE signature::$($exe.Name): $($sig.Status), $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "$($exe.Name) is not validly signed" }
+          }
+          if (-not (Get-ChildItem vbcable -Recurse -Filter VBCABLE_Setup_x64.exe)) { throw "VBCABLE_Setup_x64.exe not in the pack" }
+
       - name: Package
         shell: pwsh
         run: |
@@ -142,6 +166,11 @@ jobs:
           Copy-Item "$src/VolumeGuard.exe", "$src/LICENSE" VolumeGuard/
           $dll = if (Test-Path signed/vgaudio.dll) { 'signed/vgaudio.dll' } else { 'out/vgaudio.dll' }
           Copy-Item $dll VolumeGuard/
+          # the setups must sit directly in VBCABLE/ (that is where the app looks)
+          $root = (Get-ChildItem vbcable -Recurse -Filter VBCABLE_Setup_x64.exe | Select-Object -First 1).DirectoryName
+          New-Item -ItemType Directory -Force VolumeGuard/VBCABLE | Out-Null
+          Copy-Item "$root/*" VolumeGuard/VBCABLE/ -Recurse
+          Copy-Item assets/ABOUT-VBCABLE.txt VolumeGuard/VBCABLE/
           Compress-Archive -Path VolumeGuard -DestinationPath VolumeGuard.zip -Force
 
       - uses: actions/upload-artifact@v4

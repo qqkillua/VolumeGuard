@@ -1,0 +1,14 @@
+VB-CABLE Virtual Audio Device
+by VB-Audio Software (Vincent Burel) — https://vb-audio.com/Cable/ — www.vb-cable.com
+
+VB-CABLE is a donationware, all participations are welcome.
+VB-CABLE распространяется на пожертвования (donationware): если он вам пригодился,
+поддержите автора на www.vb-cable.com.
+
+Эта папка — официальный пакет драйвера VB-CABLE (VBCABLE_Driver_Pack45) без изменений.
+VolumeGuard не является частью VB-Audio и не связан с компанией; кабель лежит в комплекте
+для удобства, по условиям распространения VB-Audio (https://vb-audio.com/Services/licensing.htm).
+
+Установка: кнопка «Установить VB-CABLE» в окне «Обработка» VolumeGuard,
+или вручную — запустите VBCABLE_Setup_x64.exe от имени администратора → «Install Driver»,
+затем перезагрузите компьютер. Удаление — тот же установщик → «Remove Driver».
