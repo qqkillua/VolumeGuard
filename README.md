@@ -36,7 +36,8 @@
 2. **До распаковки** щёлкните по архиву правой кнопкой → «Свойства» → отметьте «Разблокировать» → «ОК».
 3. Распакуйте и запустите `VolumeGuard.exe`. Установка не нужна.
 
-Нужен .NET Framework 4.x — он уже есть в Windows 10 и 11.
+Нужен .NET Framework 4.x — он уже есть в Windows 10 и 11. Держите `vgaudio.dll` в одной папке с exe —
+без него не будет работать только обработка звука.
 
 > **Почему Windows предупреждает?** Программа не подписана платным сертификатом, а архив помечен как скачанный
 > из интернета. Шаг 2 снимает эту пометку. Можно и не снимать: в окне SmartScreen нажмите «Подробнее» →
@@ -57,6 +58,59 @@ VolumeGuard использует Windows Core Audio. У каждого прил�
 
 Формулы, пример с цифрами и разбор «взрыва в фильме» — в [docs/limiter.md](docs/limiter.md).
 
+## Обработка звука (2.0, бета)
+
+Лимитер на ползунке громкости не успевает за первым выстрелом: он видит звук, когда тот уже звучит.
+Для игр в 2.0 появился второй способ — **VolumeGuard сам пропускает звук игры через себя**:
+
+```
+игра ──► устройство-источник ──► VolumeGuard: усиление → Comfort / Tactical → лимитер 5 мс ──► наушники
+         (виртуальный кабель                                                 
+          или свободный выход)                                                
+```
+
+Лимитер «заглядывает» на 5 мс вперёд, поэтому ни один сэмпл не громче потолка — даже самый первый выстрел.
+Режимы те же, что в [плагине](plugin/README.md):
+
+- **Только лимитер** — громкие звуки упираются в потолок, остальное без изменений.
+- **Comfort** — мягко выравнивает: взрывы тише, тихие звуки чуть громче.
+- **Tactical** — сильное выравнивание для шутеров: шаги и перезарядка слышнее, выстрелы и взрывы не оглушают.
+  Звук делится на низкие (до 150 Гц: моторы, взрывы) и остальные частоты, каждая полоса сжимается отдельно,
+  стерео-картина не меняется — направление на шаги остаётся.
+
+<p align="center">
+  <img src="assets/processing.png" alt="Окно «Обработка звука»" width="420">
+</p>
+
+**Как включить**
+
+1. Нужно устройство, куда игра будет выводить звук, но которое вы не слушаете. Проще всего поставить бесплатный
+   [VB-CABLE](https://vb-audio.com/Cable/) — появится «CABLE Input». Подойдёт и неиспользуемый выход, например
+   HDMI монитора без динамиков.
+2. Направьте игру на это устройство: «Параметры Windows» → «Система» → «Звук» → «Громкость приложений» →
+   у игры в «Вывод» выберите CABLE Input. Игра должна быть запущена, чтобы появиться в списке.
+   Или выберите устройство в настройках звука самой игры, если там это есть.
+3. В VolumeGuard нажмите кнопку «Обработка» вверху окна: «Игра играет в» — CABLE Input, «Слушать в» — ваши наушники.
+   Включите и выберите режим.
+
+Громкость устройства-источника держите на 100 % — Windows отдаёт его звук уже после этой громкости.
+Остальные программы (Discord, браузер) продолжают играть в наушники напрямую, без задержки.
+
+**Честно о задержке.** Путь через второе устройство добавляет примерно **40–60 мс**: Windows отдаёт звук
+пакетами по 10 мс, плюс запас против пропусков, буфер вывода и 5 мс лимитера. Для шутеров это заметно
+меньше, чем Bluetooth-наушники (150–250 мс), но больше, чем прямой вывод. Если важна каждая миллисекунда —
+выключите обработку одним переключателем, игра снова пойдёт напрямую. Задержка показана в окне.
+
+**Как это устроено.** Звук берётся через WASAPI loopback, выводится в общем режиме WASAPI, потоки работают с
+приоритетом MMCSS «Pro Audio». У двух устройств свои кварцевые генераторы, и их частоты всегда немного
+расходятся (обычно на 0,01–0,1 %), поэтому между ними стоит ресемплер с плавной подстройкой скорости
+(не больше ±0,5 %, на слух незаметно). Он же переводит 44,1 ↔ 48 кГц. Буфер подстраивается сам: растёт,
+если были пропуски, и медленно уменьшается, если запас не нужен. Если устройство отключили или поменяли его
+формат, VolumeGuard переподключается сам. Подробности — в [native/README.md](native/README.md).
+Журнал работы: `%APPDATA%\VolumeGuard\audio.log`.
+
+Обработка работает в 64-битной Windows и требует файл `vgaudio.dll` рядом с `VolumeGuard.exe` — он есть в архиве.
+
 ## VolumeGuard Limiter — плагин VST3 / CLAP
 
 Для FL Studio, Ableton, Reaper и других программ с плагинами есть **VolumeGuard Limiter**. Он обрабатывает
@@ -68,7 +122,7 @@ VolumeGuard использует Windows Core Audio. У каждого прил�
 
 ## Сборка
 
-Исходники в [`src/`](src). Достаточно компилятора, который уже есть в Windows:
+Исходники в [`src/`](src). Для `VolumeGuard.exe` достаточно компилятора, который уже есть в Windows:
 
 ```bat
 build.cmd
@@ -80,6 +134,8 @@ build.cmd
 %WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:assets\app.ico /out:VolumeGuard.exe ^
   /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll src\*.cs
 ```
+
+`vgaudio.dll` собирается MinGW-w64 (на Linux или в MSYS2): `native/build.sh`.
 
 На Linux/macOS собирается через Mono (`mcs` с теми же ссылками). `VolumeGuard.exe --demo` открывает интерфейс
 с ненастоящими данными — удобно для проверки вёрстки без звука.
@@ -94,12 +150,15 @@ build.cmd
 | `src/Engine.cs` | Настройки, лимитер, работа с аудиосессиями |
 | `src/Controls.cs` | Ползунки, переключатели, карточки приложений |
 | `src/MainForm.cs` | Главное окно, трей, автозапуск |
+| `src/Processing.cs` | Окно «Обработка звука» и связь с `vgaudio.dll` |
 | `src/AssemblyInfo.cs` | Название и версия программы |
+| `native/` | Звуковой движок `vgaudio.dll` (C++, WASAPI) и его тесты |
 
 ## Настройки
 
 Хранятся в `%APPDATA%\VolumeGuard\settings.txt` — обычный текстовый файл.
-Если программа упала, подробности будут в `%APPDATA%\VolumeGuard\crash.log`.
+Если программа упала, подробности будут в `%APPDATA%\VolumeGuard\crash.log`, журнал обработки звука —
+в `audio.log` там же.
 
 ## Конфиденциальность и изменения в системе
 
@@ -132,7 +191,10 @@ requested by the user or the person installing or operating it.
 **VolumeGuard** is a per-app volume limiter for Windows 10/11. Every app that plays sound gets its own volume
 slider and an optional ceiling; when an app gets louder than its ceiling, VolumeGuard smoothly turns that app
 down and brings it back afterwards. There is also a device-wide limiter, a tray icon, autostart and crash-safe
-volume restore. Download `VolumeGuard.zip` from [Releases](https://github.com/qqkillua/VolumeGuard/releases/latest),
+volume restore. Version 2.0 adds **sound processing (beta)**: route a game to a spare output or a virtual cable,
+and VolumeGuard plays it to your headphones through a 5 ms lookahead limiter with Comfort / Tactical
+dynamics modes (same DSP as the VST3 plugin), with clock-drift compensation between the two devices
+(~40–60 ms added latency). Download `VolumeGuard.zip` from [Releases](https://github.com/qqkillua/VolumeGuard/releases/latest),
 unblock it in file Properties before extracting, and run `VolumeGuard.exe` (requires .NET Framework 4.x, built into
 Windows 10/11). Build from source with `build.cmd`. MIT licensed.
 

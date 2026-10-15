@@ -75,7 +75,7 @@ namespace VolumeGuard
             enabledSw.CheckedChanged += delegate { SetEnabled(enabledSw.Checked); };
             // sound processing (2.0): opens its own window
             processing = new Processing(s, demo);
-            procBtn.Text = "Обработка звука";
+            procBtn.Text = "Обработка";   // short: must not cover the subtitle
             procBtn.Font = Theme.Font(9f);
             procBtn.FitWidth();
             procBtn.Height = Theme.D(26);   // stays above the subtitle line
