@@ -23,7 +23,16 @@ jobs:
         run: cmake -S plugin -B build -A x64
 
       - name: Build
-        run: cmake --build build --config Release --parallel
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) {
+            # show compiler errors as annotations on the run
+            Select-String -Path build.log -Pattern ': (fatal )?error ' | Select-Object -First 15 | ForEach-Object {
+              Write-Host "::error title=Build::$($_.Line.Trim())"
+            }
+            throw "build failed"
+          }
 
       - name: DSP tests
         shell: pwsh

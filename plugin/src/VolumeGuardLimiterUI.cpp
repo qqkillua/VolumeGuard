@@ -94,7 +94,7 @@ protected:
         fillColor(kText);
         text(18, 22, "VolumeGuard", nullptr);
         fillColor(kAccent);
-        Rectangle<float> b;
+        DGL_NAMESPACE::Rectangle<float> b;
         const float titleWidth = textBounds(18, 22, "VolumeGuard ", nullptr, b);   // returns the advance
         text(18 + titleWidth, 22, "Limiter", nullptr);
         fontSize(11.5f);
