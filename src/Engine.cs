@@ -41,7 +41,7 @@ namespace VolumeGuard
         public bool Adopted;
         public float Gain = 1f;         // volume actually applied (<= UserVol)
         public float Env;               // peak envelope of the input signal
-        public float Ms;                // mean square of the level over ~0.4 s (loudness mode)
+        public float Ms;                // mean square of the level (loudness / smooth mode)
         public float Hold;              // memory of loud peaks (decays over 10 / 30 s)
         public float OutLevel;          // estimated output peak, linear
         public float DisplayPeak;       // highest OutLevel since the window last drew it
@@ -87,8 +87,9 @@ namespace VolumeGuard
         public bool AntiClick = true;
         /// How fast the volume comes back after a loud sound: 0 fast (~0.6 s), 1 medium (~1.1 s), 2 slow (~2 s).
         public int ReturnSpeed = 1;
-        /// Limit by the average loudness over ~0.4 s instead of every peak (short peaks may go up to 6 dB over).
-        public bool LoudnessMode;
+        /// How to limit: 0 every peak (fast, may click), 1 loudness over ~0.4 s (peaks up to 6 dB over, 20 ms
+        /// fade down), 2 smooth like Sound Lock (loudness over ~3 s, 150 ms fade down, never a sudden cut).
+        public int LimitMode;
         /// Memory of loud sounds: 0 off, 1 ~10 s, 2 ~30 s. While it lasts the volume does not come back so far
         /// that the same loud sound would again be more than 3 dB over the limit.
         public int Memory = 1;
@@ -159,7 +160,8 @@ namespace VolumeGuard
                             else if (p[1] == "tray") s.Tray = p[2] == "1";
                             else if (p[1] == "anticlick") s.AntiClick = p[2] == "1";
                             else if (p[1] == "return") s.ReturnSpeed = Math.Max(0, Math.Min(2, (int)PF(p[2], 1f)));
-                            else if (p[1] == "loudness") s.LoudnessMode = p[2] == "1";
+                            else if (p[1] == "loudness") s.LimitMode = p[2] == "1" ? 1 : 0;   // 2.2–2.3
+                            else if (p[1] == "limitmode") s.LimitMode = Math.Max(0, Math.Min(2, (int)PF(p[2], 0f)));
                             else if (p[1] == "memory") s.Memory = Math.Max(0, Math.Min(2, (int)PF(p[2], 1f)));
                             else if (p[1] == "trayhint") s.TrayHintShown = p[2] == "1";
                             else if (p[1] == "sessionMeterAfterVolume") s.SessionMeterPost = p[2] == "1";
@@ -215,7 +217,7 @@ namespace VolumeGuard
                     sb.AppendLine("opt|tray|" + B(Tray));
                     sb.AppendLine("opt|anticlick|" + B(AntiClick));
                     sb.AppendLine("opt|return|" + ReturnSpeed.ToString(IC));
-                    sb.AppendLine("opt|loudness|" + B(LoudnessMode));
+                    sb.AppendLine("opt|limitmode|" + LimitMode.ToString(IC));
                     sb.AppendLine("opt|memory|" + Memory.ToString(IC));
                     sb.AppendLine("opt|trayhint|" + B(TrayHintShown));
                     sb.AppendLine("opt|sessionMeterAfterVolume|" + B(SessionMeterPost));
@@ -263,7 +265,14 @@ namespace VolumeGuard
         public const float MemoryAllowanceDb = 3f;
 
         /// The peak ceiling the anti-click and the limiter use for a limit, in the current mode.
-        public static float PeakLimitDb(float limitDb, bool loudness) { return loudness ? limitDb + PeakAllowanceDb : limitDb; }
+        public static float PeakLimitDb(float limitDb, int mode) { return mode == 1 ? limitDb + PeakAllowanceDb : limitDb; }
+
+        /// Smooth mode: the level is averaged over this long (an exponential average ≈ a 3 s moving average)…
+        public const double SmoothSec = 1.5;
+        /// …and the volume goes down with these time constants per mode (0 = at once).
+        static readonly double[] AttackSecs = { 0, 0.02, 0.15 };
+        public static double AttackSec(int mode) { return AttackSecs[Math.Max(0, Math.Min(2, mode))]; }
+        public static double LevelSec(int mode) { return mode == 2 ? SmoothSec : LoudnessSec; }
 
         /// One step of a feed-forward peak limiter that works by moving a volume knob.
         /// inPeak — level of the signal before our gain; instant attack, smooth release.
@@ -275,28 +284,39 @@ namespace VolumeGuard
         /// lower than that memory − MemoryAllowanceDb, so the volume does not come all the way back between
         /// shots and the next one is at most ~3 dB over (a volume knob cannot catch a sound before it starts).
         public static void Step(ref float gain, ref float env, ref float ms, ref float hold, float inPeak, float user, bool on,
-                                float limitDb, float floor, float decay, float rel, float msCoef, bool loud, float holdDecay)
+                                float limitDb, float floor, float decay, float rel, float msCoef, int mode, float holdDecay,
+                                float attackCoef = 1f)
         {
             bool sound = inPeak >= Gate;
             env = sound ? Math.Max(inPeak, env * decay) : Math.Max(inPeak, env);
             if (ms <= 0f) ms = env * env;                    // start from what we know
             if (sound) ms += (inPeak * inPeak - ms) * msCoef; // silence: hold, like the envelope
-            if (holdDecay < 1f) hold = sound ? Math.Max(inPeak, hold * holdDecay) : Math.Max(inPeak, hold);
+            if (holdDecay < 1f && mode != 2) hold = sound ? Math.Max(inPeak, hold * holdDecay) : Math.Max(inPeak, hold);
             else hold = 0f;
             float peak = Math.Max(env, hold * Db.ToLin(-MemoryAllowanceDb));
             float target = user;
             if (on)
             {
-                if (loud)
+                float level = (float)Math.Sqrt(ms);
+                if (mode == 2)
                 {
-                    float level = (float)Math.Sqrt(ms);
+                    // smooth: only the average over ~3 s counts, like Sound Lock — single loud sounds pass
+                    if (level > 1e-4f) target = Math.Min(target, Db.ToLin(limitDb) / level);
+                }
+                else if (mode == 1)
+                {
                     if (level > 1e-4f) target = Math.Min(target, Db.ToLin(limitDb) / level);
                     if (peak > 1e-4f) target = Math.Min(target, Db.ToLin(limitDb + PeakAllowanceDb) / peak);
                 }
                 else if (peak > 1e-4f) target = Math.Min(target, Db.ToLin(limitDb) / peak);
             }
             if (target < floor) target = floor;
-            if (target < gain) gain = target;
+            if (target < gain)
+            {
+                // down: at once, or as a quick fade (a sudden cut right after a loud sound began is heard as a click)
+                gain += (target - gain) * attackCoef;
+                if (gain - target < 0.002f) gain = target;
+            }
             else
             {
                 gain += (target - gain) * rel;
@@ -348,6 +368,7 @@ namespace VolumeGuard
 
     class AudioEngine : IEngine
     {
+        // (attack, level and memory coefficients are recomputed every step from dt and the settings)
         static readonly CultureInfo IC = CultureInfo.InvariantCulture;
         const int CLSCTX_ALL = 0x17;
         const int DEVICE_STATE_ACTIVE = 1;
@@ -366,7 +387,7 @@ namespace VolumeGuard
         int postMismatch;
         // anti-click: how far the device volume is pulled down right now (dB, ≤ 0), until when it is held,
         // and the strongest pull-down the apps asked for in this step
-        float duckDb, duckRequest, msCoef, holdDecay = 1f;
+        float duckDb, duckRequest, msCoef, holdDecay = 1f, attackCoef = 1f;
         double clock, duckHoldUntil, lastDuckLog = -10;
         public bool HardwareVolume { get; private set; }
         float userDb, minDb = -65f, maxDb = 0f, lastSetDb = float.NaN, lastScalar = -1f;
@@ -732,7 +753,9 @@ namespace VolumeGuard
             clock += dt;
             float decay = (float)Math.Exp(-dt / Limiter.EnvSec(s.ReturnSpeed));
             float rel = 1f - (float)Math.Exp(-dt / Limiter.ReturnSec(s.ReturnSpeed));
-            msCoef = 1f - (float)Math.Exp(-dt / Limiter.LoudnessSec);
+            msCoef = 1f - (float)Math.Exp(-dt / Limiter.LevelSec(s.LimitMode));
+            double att = Limiter.AttackSec(s.LimitMode);
+            attackCoef = att > 0 ? 1f - (float)Math.Exp(-dt / att) : 1f;
             double memSec = Limiter.MemorySec(s.Memory);
             holdDecay = memSec > 0 ? (float)Math.Exp(-dt / memSec) : 1f;
             // apps first: they tell the device step below whether a loud sound slipped past their volume
@@ -786,7 +809,7 @@ namespace VolumeGuard
             float inLevel = s.MasterMeterPost ? (cur > 1e-4f ? p / cur : 0f) : p;
             float floor = Math.Min(1f, Db.ToLin(Math.Max(minDb - userDb, -60f)));
             Limiter.Step(ref m.R, ref m.Env, ref m.Ms, ref m.Hold, inLevel * userAmp, 1f, s.Enabled && m.LimitOn, m.LimitDb, floor,
-                         decay, rel, msCoef, s.LoudnessMode, holdDecay);
+                         decay, rel, msCoef, s.LimitMode, holdDecay, attackCoef);
 
             float db = userDb + Db.FromLin(m.R) + duckDb;
             if (db < minDb) db = minDb;
@@ -836,19 +859,20 @@ namespace VolumeGuard
 
             // anti-click: how much louder than its limit this app is coming out right now, with the volume
             // that is actually set (the sessions' own volume only acts on the next packet)
-            if (s.Enabled && a.LimitOn && s.AntiClick && HardwareVolume && inPeak >= Limiter.Gate)
+            // (only when limiting every peak: the other modes let short peaks through on purpose)
+            if (s.Enabled && a.LimitOn && s.AntiClick && HardwareVolume && s.LimitMode == 0 && inPeak >= Limiter.Gate)
             {
                 float applied = -1f;
                 foreach (var w in a.Sessions)
                     if (!w.Dead && w.LastSet > applied) applied = w.LastSet;
                 if (applied < 0f) applied = a.Gain;
-                float lim = Db.ToLin(Limiter.PeakLimitDb(a.LimitDb, s.LoudnessMode)), outLvl = inPeak * applied;
+                float lim = Db.ToLin(Limiter.PeakLimitDb(a.LimitDb, s.LimitMode)), outLvl = inPeak * applied;
                 if (outLvl > lim * 1.26f)   // more than 2 dB over: small overshoots are not worth moving the device
                     duckRequest = Math.Min(duckRequest, Math.Max(-30f, Db.FromLin(lim / outLvl)));
             }
 
             Limiter.Step(ref a.Gain, ref a.Env, ref a.Ms, ref a.Hold, inPeak, a.UserVol, s.Enabled && a.LimitOn, a.LimitDb,
-                         Math.Min(a.UserVol, 0.02f), decay, rel, msCoef, s.LoudnessMode, holdDecay);
+                         Math.Min(a.UserVol, 0.02f), decay, rel, msCoef, s.LimitMode, holdDecay, attackCoef);
 
             foreach (var w in a.Sessions)
             {
@@ -948,9 +972,11 @@ namespace VolumeGuard
         {
             t += dt;
             float decay = (float)Math.Exp(-dt / Limiter.EnvSec(s.ReturnSpeed)), rel = 1f - (float)Math.Exp(-dt / Limiter.ReturnSec(s.ReturnSpeed));
-            float msCoef = 1f - (float)Math.Exp(-dt / Limiter.LoudnessSec);
+            float msCoef = 1f - (float)Math.Exp(-dt / Limiter.LevelSec(s.LimitMode));
             double memSec = Limiter.MemorySec(s.Memory);
             float holdDecay = memSec > 0 ? (float)Math.Exp(-dt / memSec) : 1f;
+            double att = Limiter.AttackSec(s.LimitMode);
+            float attackCoef = att > 0 ? 1f - (float)Math.Exp(-dt / att) : 1f;
             float sum = 0f;
             int i = 0;
             foreach (var a in s.Apps.Values)
@@ -958,14 +984,14 @@ namespace VolumeGuard
                 i++;
                 float burst = (float)Math.Max(0, Math.Sin(t * (0.7 + i * 0.3) + i));
                 float inPeak = a.Active ? (0.15f + 0.85f * burst * burst) * (0.6f + 0.4f * (float)rnd.NextDouble()) : 0f;
-                Limiter.Step(ref a.Gain, ref a.Env, ref a.Ms, ref a.Hold, inPeak, a.UserVol, s.Enabled && a.LimitOn, a.LimitDb, 0.02f, decay, rel, msCoef, s.LoudnessMode, holdDecay);
+                Limiter.Step(ref a.Gain, ref a.Env, ref a.Ms, ref a.Hold, inPeak, a.UserVol, s.Enabled && a.LimitOn, a.LimitDb, 0.02f, decay, rel, msCoef, s.LimitMode, holdDecay, attackCoef);
                 a.OutLevel = a.Muted ? 0f : inPeak * a.Gain;
                 a.DisplayPeak = Math.Max(a.DisplayPeak, a.OutLevel);
                 a.Limiting = a.Gain < a.UserVol * 0.97f;
                 sum = Math.Max(sum, a.OutLevel);
             }
             var m = s.Master;
-            Limiter.Step(ref m.R, ref m.Env, ref m.Ms, ref m.Hold, sum * m.UserVol, 1f, s.Enabled && m.LimitOn, m.LimitDb, 0.01f, decay, rel, msCoef, s.LoudnessMode, holdDecay);
+            Limiter.Step(ref m.R, ref m.Env, ref m.Ms, ref m.Hold, sum * m.UserVol, 1f, s.Enabled && m.LimitOn, m.LimitDb, 0.01f, decay, rel, msCoef, s.LimitMode, holdDecay, attackCoef);
             m.OutLevel = sum * m.UserVol * m.R;
             m.DisplayPeak = Math.Max(m.DisplayPeak, m.OutLevel);
             m.Limiting = m.R < 0.97f;
