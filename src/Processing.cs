@@ -544,7 +544,7 @@ namespace VolumeGuard
 
             status.AutoSize = false;
             status.Location = new Point(x, y);
-            status.Text = "Не открылось устройство для наушников. Оно подключено и включено?";
+            status.Text = "Работает · задержка ≈ 20 мс · 48 → 48 кГц\nисточник 3 + буфер 0 + вывод 12 + лимитер 5 мс\n· пропусков: 0";   // room for three lines
             y = Para(status, w) + Theme.D(8);   // two lines of room
             status.Text = "";
 

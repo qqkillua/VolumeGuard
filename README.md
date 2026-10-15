@@ -100,15 +100,20 @@ VolumeGuard использует Windows Core Audio. У каждого прил�
 Громкость устройства-источника держите на 100 % — Windows отдаёт его звук уже после этой громкости.
 Остальные программы (Discord, браузер) продолжают играть в наушники напрямую, без задержки.
 
-**Честно о задержке.** Путь через второе устройство добавляет задержку, и она зависит от драйверов:
+**Честно о задержке.** С версии 2.1 каждый пакет звука игры сразу обрабатывается и ставится в очередь
+наушников — промежуточного буфера между устройствами больше нет. Остаётся очередь самих наушников: они
+забирают звук порциями (обычно по 10 мс), и программа держит в ней ровно столько, чтобы хватило на
+следующую порцию плюс небольшой запас. Задержка зависит от драйверов (расчёт на симуляции):
 
-| | источник | буфер | вывод | лимитер | итого |
-|---|---|---|---|---|---|
-| драйверы с малыми пакетами (Windows 10/11) | ~3 мс | ~11 мс | ~5 мс | 5 мс | **~25 мс** |
-| обычные драйверы, пакеты 10 мс | 10 мс | ~25 мс | ~12 мс | 5 мс | **~50 мс** |
+| источник → наушники | пакет источника | очередь наушников | лимитер | итого |
+|---|---|---|---|---|
+| VB-CABLE (пакеты 2,7 мс) → гарнитура с порциями 10 мс | ~3 мс | ~13 мс | 5 мс | **~20 мс** |
+| оба устройства по 10 мс | 10 мс | ~20 мс | 5 мс | **~35 мс** |
+| оба с малыми пакетами (2,7 мс) | ~3 мс | ~9 мс | 5 мс | **~17 мс** |
 
-Режим малых пакетов VolumeGuard включает сам, если драйвер его поддерживает (встроенные звуковые карты
-с драйвером Microsoft «High Definition Audio» — да; многие USB-гарнитуры и VB-CABLE — нет). Из чего сложилась задержка, видно внизу окна.
+Режим малых пакетов VolumeGuard включает сам, если драйвер его поддерживает (VB-CABLE и встроенные звуковые
+карты с драйвером Microsoft «High Definition Audio» — да; многие USB-гарнитуры — нет). Из чего сложилась
+задержка, видно внизу окна. Если поток программы хоть раз не успел, запас сам вырастет на 1 мс.
 Беспроводные наушники добавляют своё: Bluetooth 150–250 мс, радио-донгл 15–30 мс — это не изменить программой.
 Если важна каждая миллисекунда — выключите обработку одним переключателем, игра снова пойдёт напрямую.
 
@@ -210,7 +215,7 @@ down and brings it back afterwards. There is also a device-wide limiter, a tray 
 volume restore. Version 2.0 adds **sound processing (beta)**: route a game to a spare output or a virtual cable,
 and VolumeGuard plays it to your headphones through a 5 ms lookahead limiter with Comfort / Tactical
 dynamics modes (same DSP as the VST3 plugin), with clock-drift compensation between the two devices
-(~25 ms added latency with low-latency drivers, ~50 ms with ordinary 10 ms ones). Download `VolumeGuard.zip` from [Releases](https://github.com/qqkillua/VolumeGuard/releases/latest),
+(~17–20 ms added latency with low-latency drivers, ~35 ms with ordinary 10 ms ones). Download `VolumeGuard.zip` from [Releases](https://github.com/qqkillua/VolumeGuard/releases/latest),
 unblock it in file Properties before extracting, and run `VolumeGuard.exe` (requires .NET Framework 4.x, built into
 Windows 10/11). Build from source with `build.cmd`. MIT licensed.
 

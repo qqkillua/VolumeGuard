@@ -214,6 +214,47 @@ public:
         return i;
     }
 
+    /// Push mode (with OutputPacer): turns everything that has arrived into output frames, at most maxFrames,
+    /// reading the input `corr` faster (+) or slower (-) than nominal. Keeps no buffer of its own beyond the
+    /// kHalf frames the interpolation needs. Returns the number of frames written.
+    int produce(FrameRing& ring, float* l, float* r, int maxFrames, double corr)
+    {
+        corr_ = std::max(-kMaxCorrection, std::min(kMaxCorrection, corr));
+        const double step = nominal_ * (1.0 + corr_);
+        const uint64_t base = ring.readPos();
+        const uint64_t avail = ring.writePos();
+        int i = 0;
+        for (; i < maxFrames; ++i)
+        {
+            const uint64_t i0 = base + (uint64_t)frac_;
+            if (i0 + kHalf >= avail) break;
+            interpolate(ring, i0, frac_ - std::floor(frac_), l[i], r[i]);
+            frac_ += step;
+        }
+        const double whole = std::floor(frac_) - (double)kHalf;
+        if (whole > 0)
+        {
+            ring.advance((size_t)whole);
+            frac_ -= whole;
+        }
+        return i;
+    }
+
+    /// Input frames that produce() could still turn into output right now.
+    double pendingInput(const FrameRing& ring) const
+    {
+        return std::max(0.0, (double)(ring.writePos() - ring.readPos()) - frac_ - kHalf);
+    }
+
+    /// Push mode: throw away input that has piled up (after a stall of the output).
+    void skipInput(FrameRing& ring, size_t frames)
+    {
+        const size_t keep = (size_t)kHalf * 2;
+        const size_t have = ring.fill();
+        if (have <= keep) return;
+        ring.advance(std::min(frames, have - keep));
+    }
+
     double correction() const { return corr_; }
     double targetMs() const { return targetMs_; }
     double fillMs() const { return fillSmooth_ * 1000.0 / inRate_; }
@@ -290,6 +331,98 @@ private:
     double minMs_ = 10, maxMs_ = 80, silentSec_ = 0, stableSec_ = 0, minFill_ = 1e18;
     bool running_ = false, afterUnderrun_ = false;
     uint64_t underruns_ = 0, drops_ = 0;
+};
+
+// ---------------------------------------------------------------------------------------------------------
+/// Push mode pacing. Every sound packet from the source is converted and queued in the output device at once,
+/// so there is only ONE buffer (the device queue) instead of a ring + a device queue. The device takes a whole
+/// period (e.g. 10 ms) at a time and packets arrive whole, so the queue is a saw-tooth between `margin` (just
+/// after the device took its period) and margin + period + packet. The pacer keeps its time-average at
+/// margin + (period + packet) / 2 by reading the input a tiny bit faster or slower (clock drift), and grows
+/// the margin by 1 ms whenever the queue ran dry although audio was there (our thread was late).
+class OutputPacer
+{
+public:
+    void prepare(double outRate, double periodFrames, double packetFrames, double marginMs, double maxMarginMs = 30.0)
+    {
+        rate_ = outRate;
+        period_ = std::max(1.0, periodFrames);
+        packet_ = std::max(0.0, packetFrames);
+        margin_ = marginMs * outRate / 1000.0;
+        maxMargin_ = maxMarginMs * outRate / 1000.0;
+        window_ = 0.1;
+        reset();
+    }
+
+    void reset()
+    {
+        integ_ = corr_ = 0.0;
+        sumQ_ = sumT_ = 0.0;
+        smooth_ = target();
+        primed_ = false;
+        lowest_ = 1e18;
+        lowestSec_ = 0.0;
+    }
+
+    /// queueFrames: the device queue BEFORE new audio is added. dt: seconds since the previous call.
+    /// Returns the correction for DriftResampler::produce.
+    double update(double queueFrames, double dt)
+    {
+        sumQ_ += queueFrames * dt;
+        sumT_ += dt;
+        lowest_ = std::min(lowest_, queueFrames);
+        if (sumT_ >= window_)
+        {
+            const double d = sumT_, avg = sumQ_ / sumT_;
+            sumQ_ = sumT_ = 0.0;
+            if (!primed_) { primed_ = true; smooth_ = avg; }
+            smooth_ += (avg - smooth_) * std::min(1.0, d / 2.0);
+            const double err = (smooth_ - target()) / rate_;       // seconds of output too much (+) / too little (-)
+            const double unclamped = kP * err + kI * (integ_ + err * d);
+            if (std::fabs(unclamped) < kMax)
+                integ_ = std::max(-kMax / kI, std::min(kMax / kI, integ_ + err * d));
+            corr_ = std::max(-kMax, std::min(kMax, kP * err + kI * integ_));
+
+            // Give back latency only when the margin was clearly never needed: over 30 s the queue never got
+            // closer than 2 ms to empty (beyond the margin) — then lower the margin by 0.5 ms.
+            lowestSec_ += d;
+            if (lowestSec_ > 30.0)
+            {
+                if (lowest_ > margin_ + 0.002 * rate_ && margin_ > minMargin())
+                    margin_ = std::max(minMargin(), margin_ - 0.0005 * rate_);
+                lowest_ = 1e18;
+                lowestSec_ = 0.0;
+            }
+        }
+        return corr_;
+    }
+
+    /// The device found its queue empty although audio was waiting: we were late. Keep 1 ms more from now on.
+    void onLate()
+    {
+        margin_ = std::min(maxMargin_, margin_ + 0.001 * rate_);
+        lowest_ = 1e18;
+        lowestSec_ = 0.0;
+    }
+
+    /// How far the average queue is above what it should be (frames).
+    double excess() const { return primed_ ? smooth_ - target() : 0.0; }
+    double marginFrames() const { return margin_; }
+    double marginMs() const { return margin_ * 1000.0 / rate_; }
+    double targetFrames() const { return target(); }
+    double correction() const { return corr_; }
+    void settle(double removedFrames) { smooth_ -= removedFrames; integ_ = 0.0; }
+
+    static constexpr double kMax = 0.005;
+    static constexpr double kP = 0.54, kI = 0.09;
+
+private:
+    double target() const { return margin_ + 0.5 * (period_ + packet_); }
+    double minMargin() const { return 0.0015 * rate_; }
+
+    double rate_ = 48000, period_ = 480, packet_ = 128, margin_ = 192, maxMargin_ = 1440, window_ = 0.1;
+    double integ_ = 0, corr_ = 0, sumQ_ = 0, sumT_ = 0, smooth_ = 0, lowest_ = 1e18, lowestSec_ = 0;
+    bool primed_ = false;
 };
 
 // ---------------------------------------------------------------------------------------------------------

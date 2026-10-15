@@ -1,12 +1,13 @@
 // VolumeGuard audio engine (vgaudio.dll): WASAPI loopback of the source device → processing → output device.
 // Copyright (c) 2026 Nikita Bainov (qqkillua). MIT License.
 //
-// Threads:
-//   engine thread  — opens both devices, renders to the output (event-driven), restarts after device errors
-//   capture thread — every 2 ms takes what the source device played (loopback) and puts it into the ring;
-//                    also plays silence into the source device, so Windows keeps delivering packets
-//                    (and the clocks keep running) even while the game is quiet
-// Both run with MMCSS "Pro Audio" priority.
+// One audio thread (MMCSS "Pro Audio"), waking every ~1 ms ("push mode"):
+//   1. takes every packet the source device played (loopback; 2.7 ms packets when the driver allows it),
+//   2. converts it (clock drift, sample rate), processes it and queues it in the output device at once,
+//   3. keeps the output queue just above what the device takes per period (OutputPacer, Bridge.hpp).
+// So there is one buffer, not two (a ring between the devices + the output queue), which roughly halves the
+// delay. It also plays silence into the source device, so Windows keeps delivering packets while the game
+// is quiet. The engine thread restarts everything after device errors.
 #define VGAUDIO_BUILD
 #include "vgaudio.h"
 
@@ -334,11 +335,6 @@ private:
         return 0;
     }
 
-    static DWORD WINAPI captureThread(LPVOID self)
-    {
-        static_cast<Engine*>(self)->captureMain();
-        return 0;
-    }
 
     void engineMain()
     {
@@ -442,120 +438,161 @@ private:
         srcRate_.store((int)srcRate);
         outRate_.store((int)outRate);
         const double srcPeriodMs = 1000.0 * capPeriod / srcRate, outPeriodMs = 1000.0 * outPeriod / outRate;
-        // What the output keeps queued: one engine period (the device takes one per event) plus a small margin.
-        // The margin grows by itself if the output ever runs dry (our thread was late).
-        UINT32 margin = std::max<UINT32>(outPeriod / 4, (UINT32)(outRate * 0.002));
-        UINT32 wantPad = std::min(renFrames, outPeriod + margin);
-        logLine("start: source \"%s\" (%s, packets %.2f ms%s) -> output \"%s\" (%s, period %.2f ms%s, buffer %u, queue %u frames)%s",
+        logLine("start: source \"%s\" (%s, packets %.2f ms%s) -> output \"%s\" (%s, period %.2f ms%s, buffer %u frames)%s",
                 narrow(deviceName(srcDev.p)).c_str(), describe(capFormat_, srcRate).c_str(), srcPeriodMs, srcLow ? ", low-latency" : "",
                 narrow(deviceName(outDev.p)).c_str(), describe(outFormat, outRate).c_str(), outPeriodMs, outLow ? ", low-latency" : "",
-                renFrames, wantPad, keep_ ? "" : ", no keep-alive");
+                renFrames, keep_ ? "" : ", no keep-alive");
 
-        // --- bridge and processing
-        ring_.init((size_t)srcRate);                       // 1 s of room
+        // --- push mode: one thread takes each source packet, processes it and queues it in the output at once.
+        // The only buffer is the output device's queue; OutputPacer keeps it just big enough (see Bridge.hpp).
+        ring_.init((size_t)srcRate);                       // 1 s of room (normally holds less than a packet)
         vga::DriftResampler rs;
-        // Buffer between the devices: one source packet + one output period + a margin for timing jitter.
-        // 10 ms + 10 ms + 5 ms = 25 ms with ordinary drivers, ~13 ms when both run in small packets.
-        const double startMs = srcPeriodMs + outPeriodMs + 5.0;
-        rs.prepare(srcRate, outRate, startMs, std::max(4.0, startMs - 6.0), std::max(40.0, startMs * 3.0));
+        rs.prepare(srcRate, outRate, 20.0);
+        vga::OutputPacer pacer;
+        const double packetOut = srcPeriodMs * outRate / 1000.0;
+        pacer.prepare(outRate, outPeriod, packetOut, 2.0 + std::min(srcPeriodMs, 4.0));
         vga::Processor proc;
         proc.prepare(outRate);
         vga::Params params = currentParams();
         proc.setParams(params);
-        std::vector<float> l(renFrames), r(renFrames);
-        const float latencyExtraMs = (float)srcPeriodMs + 1000.0f * (float)proc.latencyFrames() / (float)outRate;   // loopback packet + lookahead
+        std::vector<float> l(renFrames), r(renFrames), lr(4096 * 2);
+        const float lookMs = 1000.0f * (float)proc.latencyFrames() / (float)outRate;
         sourceMs_.store((float)srcPeriodMs);
-        lookaheadMs_.store(1000.0f * (float)proc.latencyFrames() / (float)outRate);
+        lookaheadMs_.store(lookMs);
+        const int blockAlign = capFormat_.blockAlign();
 
-        // pre-fill the output with silence, then start everything
+        // prime the output with the margin in silence, then start everything
         BYTE* data = nullptr;
-        if (SUCCEEDED(render->GetBuffer(wantPad, &data))) render->ReleaseBuffer(wantPad, AUDCLNT_BUFFERFLAGS_SILENT);
-        captureHr_.store(S_OK);
-        captureFailed_.store(false);
-        sessionStop_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        UINT32 prime = std::min(renFrames, (UINT32)pacer.marginFrames() + outPeriod);
+        if (SUCCEEDED(render->GetBuffer(prime, &data))) render->ReleaseBuffer(prime, AUDCLNT_BUFFERFLAGS_SILENT);
         if (keepClient_) keepClient_->Start();
         if (FAILED(hr = capClient->Start())) { cleanupCapture(); code = VG_ERR_SOURCE; return report(first, "source: Start", hr); }
         if (FAILED(hr = renClient->Start())) { capClient->Stop(); cleanupCapture(); code = VG_ERR_OUTPUT; return report(first, "output: Start", hr); }
-        HANDLE capThread = CreateThread(nullptr, 0, &Engine::captureThread, this, 0, nullptr);
-        if (!capThread)
-        {
-            capClient->Stop(); renClient->Stop(); cleanupCapture();
-            code = VG_ERR_SYSTEM;
-            return report(first, "could not create the capture thread", E_FAIL);
-        }
 
         DWORD taskIndex = 0;
         HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
         state_.store(VG_STATE_BUFFERING);
         if (first) { firstResult_ = VG_OK; SetEvent(readyEvent_); }
 
-        uint64_t lastUnderruns = 0;
-        double lastUnderrunLog = -1e9, lastEvent = nowSec();
-        HANDLE waits[2] = { renEvent, stopEvent_ };
+        const double t0 = nowSec();
+        double lastPoll = t0, lastData = t0, quietUntil = t0 + 1.0, lastLateLog = -1e9, waitSmooth = 0.0;
+        bool produced = false;
+        uint64_t lates = 0;
         hr = S_OK;
-        for (;;)
+        while (WaitForSingleObject(stopEvent_, 1) == WAIT_TIMEOUT)
         {
-            const DWORD w = WaitForMultipleObjects(2, waits, FALSE, 200);
-            if (w == WAIT_OBJECT_0 + 1) break;
-            if (captureFailed_.load()) { hr = captureHr_.load(); logLine("source failed: 0x%08lX", (unsigned long)hr); break; }
             const double now = nowSec();
-            if (w == WAIT_TIMEOUT)
-            {
-                if (now - lastEvent > 2.0) { hr = AUDCLNT_E_DEVICE_INVALIDATED; logLine("output stopped asking for audio"); break; }
-                continue;
-            }
-            lastEvent = now;
+            const double dt = std::max(0.0, std::min(0.1, now - lastPoll));
+            lastPoll = now;
 
+            // keep-alive: keep its buffer full of silence (its delay does not matter, it is silent)
+            if (keep_)
+            {
+                UINT32 pad = 0;
+                if (SUCCEEDED(keepClient_->GetCurrentPadding(&pad)) && pad < keepFrames_)
+                {
+                    const UINT32 n = keepFrames_ - pad;
+                    BYTE* d = nullptr;
+                    if (SUCCEEDED(keep_->GetBuffer(n, &d))) keep_->ReleaseBuffer(n, AUDCLNT_BUFFERFLAGS_SILENT);
+                }
+            }
+
+            // 1. everything the source played since the last poll
+            for (;;)
+            {
+                UINT32 next = 0;
+                if (FAILED(hr = capture_->GetNextPacketSize(&next)) || next == 0) break;
+                BYTE* cdata = nullptr;
+                UINT32 frames = 0;
+                DWORD flags = 0;
+                if (FAILED(hr = capture_->GetBuffer(&cdata, &frames, &flags, nullptr, nullptr))) break;
+                if (frames > 0)
+                {
+                    if (lr.size() < (size_t)frames * 2) lr.resize((size_t)frames * 2);
+                    if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) || !cdata || blockAlign <= 0)
+                        std::fill(lr.begin(), lr.begin() + (size_t)frames * 2, 0.0f);
+                    else
+                        vga::toStereo(cdata, frames, capFormat_, lr.data());
+                    ring_.write(lr.data(), frames, now);
+                    lastData = now;
+                }
+                if (FAILED(hr = capture_->ReleaseBuffer(frames))) break;
+            }
+            if (FAILED(hr)) { logLine("source failed: 0x%08lX", (unsigned long)hr); break; }
+
+            // 2. how much the output still has queued
             UINT32 padding = 0;
             if (FAILED(hr = renClient->GetCurrentPadding(&padding))) { logLine("output: GetCurrentPadding 0x%08lX", (unsigned long)hr); break; }
-            if (padding == 0 && rs.running() && wantPad < renFrames && margin < outPeriod)
-            {
-                // the device found nothing queued: we were too late, keep a little more from now on
-                margin = std::min(outPeriod, margin + (UINT32)(outRate * 0.002));
-                wantPad = std::min(renFrames, outPeriod + margin);
-                logLine("output ran dry, queue now %.1f ms", 1000.0 * wantPad / outRate);
-            }
-            const UINT32 avail = wantPad > padding ? wantPad - padding : 0;
-            if (avail == 0) continue;
 
+            // The output ran dry although audio was already waiting for us: we were late. Keep a bit more.
+            if (padding == 0 && produced && now > quietUntil && rs.pendingInput(ring_) >= 1.0)
+            {
+                pacer.onLate();
+                ++lates;
+                underrunsTotal_.fetch_add(1);
+                if (now - lastLateLog > 10.0)
+                {
+                    lastLateLog = now;
+                    logLine("output ran dry (%llu times), margin now %.1f ms", (unsigned long long)lates, pacer.marginMs());
+                }
+            }
+            const double corr = pacer.update((double)padding, dt);
+
+            // far too much queued (e.g. after the system hung for a moment): drop input not queued yet
+            if (pacer.excess() > 0.020 * outRate)
+            {
+                const double drop = std::min(rs.pendingInput(ring_), pacer.excess());
+                if (drop > 0) { rs.skipInput(ring_, (size_t)drop); pacer.settle(drop); }
+            }
+
+            // 3. turn everything that arrived into output, process, queue
             const vga::Params p = currentParams();
             if (p != params) { params = p; proc.setParams(p); }
-
-            rs.read(ring_, l.data(), r.data(), (int)avail, now);
-            proc.process(l.data(), r.data(), (int)avail);
-
-            if (FAILED(hr = render->GetBuffer(avail, &data))) { logLine("output: GetBuffer 0x%08lX", (unsigned long)hr); break; }
-            vga::fromStereo(l.data(), r.data(), avail, outFormat, data);
-            if (FAILED(hr = render->ReleaseBuffer(avail, 0))) { logLine("output: ReleaseBuffer 0x%08lX", (unsigned long)hr); break; }
+            const UINT32 room = renFrames - std::min(renFrames, padding);
+            int n = rs.produce(ring_, l.data(), r.data(), (int)std::min<UINT32>(room, (UINT32)l.size()), corr);
+            const bool stalled = now - lastData > 3.0 * srcPeriodMs / 1000.0 + 0.003;
+            if (n == 0 && produced && stalled)
+            {
+                // the source sends nothing (no keep-alive and the game is quiet): keep the output fed with
+                // silence, and do not judge our own timing until sound flows again for a moment
+                const UINT32 want = std::min(renFrames, (UINT32)pacer.marginFrames() + outPeriod);
+                if (padding < want)
+                {
+                    n = (int)std::min<UINT32>(want - padding, (UINT32)l.size());
+                    std::fill(l.begin(), l.begin() + n, 0.0f);
+                    std::fill(r.begin(), r.begin() + n, 0.0f);
+                }
+                quietUntil = now + 0.3;
+                state_.store(VG_STATE_BUFFERING);
+            }
+            else if (n > 0)
+            {
+                if (!produced) { produced = true; quietUntil = now + 1.0; }
+                state_.store(VG_STATE_RUNNING);
+            }
+            if (n > 0)
+            {
+                proc.process(l.data(), r.data(), n);
+                if (FAILED(hr = render->GetBuffer((UINT32)n, &data))) { logLine("output: GetBuffer 0x%08lX", (unsigned long)hr); break; }
+                vga::fromStereo(l.data(), r.data(), (size_t)n, outFormat, data);
+                if (FAILED(hr = render->ReleaseBuffer((UINT32)n, 0))) { logLine("output: ReleaseBuffer 0x%08lX", (unsigned long)hr); break; }
+                // the newest sample waits behind everything queued
+                const double waitMs = 1000.0 * (double)(padding + (UINT32)n) / outRate;
+                waitSmooth += (waitMs - waitSmooth) * 0.02;
+            }
 
             // status for the UI
             raiseMax(inPeak_, proc.takeInputPeak());
             raiseMax(outPeak_, proc.takeOutputPeak());
             lowerMin(reduction_, proc.takeReductionDb());
-            const float bufMs = (float)rs.fillMs();
+            const float bufMs = (float)(1000.0 * (double)ring_.fill() / srcRate);
             bufferMs_.store(bufMs);
-            correctionPpm_.store((float)(rs.correction() * 1e6));
-            const float outMs = 1000.0f * (float)(padding + avail) / (float)outRate;
-            outputMs_.store(outMs);
-            latencyMs_.store(bufMs + outMs + latencyExtraMs);
-            state_.store(rs.running() ? VG_STATE_RUNNING : VG_STATE_BUFFERING);
-            const uint64_t u = rs.underruns();
-            if (u != lastUnderruns)
-            {
-                underrunsTotal_.fetch_add(u - lastUnderruns);
-                lastUnderruns = u;
-                if (now - lastUnderrunLog > 10.0)
-                {
-                    lastUnderrunLog = now;
-                    logLine("gap in the sound (total %llu in this session), buffer target now %.0f ms",
-                            (unsigned long long)u, rs.targetMs());
-                }
-            }
+            correctionPpm_.store((float)(corr * 1e6));
+            outputMs_.store((float)waitSmooth);
+            latencyMs_.store((float)srcPeriodMs + bufMs + (float)waitSmooth + lookMs);
         }
+        if (hr == S_OK && WaitForSingleObject(stopEvent_, 0) != WAIT_OBJECT_0) hr = E_FAIL;
 
-        SetEvent(sessionStop_);
-        WaitForSingleObject(capThread, INFINITE);
-        CloseHandle(capThread);
         if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
         renClient->Stop();
         capClient->Stop();
@@ -570,59 +607,6 @@ private:
         keepClient_ = nullptr;   // owned by runSession's Com<>
         keep_.reset();
         capture_.reset();
-        if (sessionStop_) { CloseHandle(sessionStop_); sessionStop_ = nullptr; }
-    }
-
-    void captureMain()
-    {
-        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        DWORD taskIndex = 0;
-        HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
-        std::vector<float> lr(4096 * 2);
-        const int blockAlign = capFormat_.blockAlign();
-        HRESULT hr = S_OK;
-        while (WaitForSingleObject(sessionStop_, 1) == WAIT_TIMEOUT)
-        {
-            // keep-alive: keep its buffer filled with silence (its delay does not matter, it is silent)
-            if (keep_)
-            {
-                UINT32 pad = 0;
-                if (SUCCEEDED(keepClient_->GetCurrentPadding(&pad)) && pad < keepFrames_)
-                {
-                    const UINT32 n = keepFrames_ - pad;
-                    BYTE* d = nullptr;
-                    if (SUCCEEDED(keep_->GetBuffer(n, &d))) keep_->ReleaseBuffer(n, AUDCLNT_BUFFERFLAGS_SILENT);
-                }
-            }
-            for (;;)
-            {
-                UINT32 next = 0;
-                if (FAILED(hr = capture_->GetNextPacketSize(&next))) break;
-                if (next == 0) break;
-                BYTE* data = nullptr;
-                UINT32 frames = 0;
-                DWORD flags = 0;
-                if (FAILED(hr = capture_->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
-                if (frames > 0)
-                {
-                    if (lr.size() < (size_t)frames * 2) lr.resize((size_t)frames * 2);
-                    if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) || !data || blockAlign <= 0)
-                        std::fill(lr.begin(), lr.begin() + (size_t)frames * 2, 0.0f);
-                    else
-                        vga::toStereo(data, frames, capFormat_, lr.data());
-                    ring_.write(lr.data(), frames, nowSec());
-                }
-                if (FAILED(hr = capture_->ReleaseBuffer(frames))) break;
-            }
-            if (FAILED(hr))
-            {
-                captureHr_.store(hr);
-                captureFailed_.store(true);
-                break;
-            }
-        }
-        if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
-        if (SUCCEEDED(co)) CoUninitialize();
     }
 
     bool report(bool first, const char* what, HRESULT hr)
@@ -658,19 +642,17 @@ private:
     }
 
     CRITICAL_SECTION lock_;
-    HANDLE thread_ = nullptr, stopEvent_ = nullptr, readyEvent_ = nullptr, sessionStop_ = nullptr;
+    HANDLE thread_ = nullptr, stopEvent_ = nullptr, readyEvent_ = nullptr;
     std::wstring sourceId_, outputId_, error_;
     int firstResult_ = VG_OK;
 
-    // session objects shared with the capture thread
+    // session objects
     vga::FrameRing ring_;
     vga::SampleFormat capFormat_;
     Com<IAudioCaptureClient> capture_;
     Com<IAudioRenderClient> keep_;
     IAudioClient* keepClient_ = nullptr;
     UINT32 keepFrames_ = 0;
-    std::atomic<bool> captureFailed_{ false };
-    std::atomic<HRESULT> captureHr_{ S_OK };
 
     // parameters (written by vg_set_params)
     std::atomic<int> pMode_{ 1 };
