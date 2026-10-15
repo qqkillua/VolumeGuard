@@ -50,11 +50,16 @@ FL Studio, Ableton Live, Reaper, Bitwig, Studio One, Cubase и другие.
 
 ## Сборка
 
+Под Windows плагин собирается компилятором MinGW-w64 (DPF рассчитан на него). Проще всего — из Linux или WSL:
+
 ```
 git submodule update --init --recursive
-cmake -S plugin -B build
-cmake --build build --config Release
-ctest --test-dir build -C Release
+cmake -S plugin -B build-win -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+      -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
+cmake --build build-win
 ```
+
+Тесты лимитера (на Linux): `cmake -S plugin -B build && cmake --build build && ctest --test-dir build`.
+GitHub Actions делает и то и другое, а затем проверяет плагин в pluginval на Windows.
 
 Плагин построен на [DPF](https://github.com/DISTRHO/DPF) (лицензия ISC). VST3 is a trademark of Steinberg Media Technologies GmbH.

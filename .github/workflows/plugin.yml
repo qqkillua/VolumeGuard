@@ -12,86 +12,99 @@ permissions:
   contents: write
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  # Linux: DSP tests, then cross-compile the Windows plugin with MinGW-w64 (the toolchain DPF supports on Windows).
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.ver.outputs.release }}
+      tag: ${{ steps.ver.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Configure
-        run: cmake -S plugin -B build -A x64
-
-      - name: Build
-        shell: pwsh
+      - name: Install tools
         run: |
-          cmake --build build --config Release --parallel 2>&1 | Tee-Object -FilePath build.log
-          if ($LASTEXITCODE -ne 0) {
-            # show compiler errors as annotations on the run
-            Select-String -Path build.log -Pattern ': (fatal )?error ' | Select-Object -First 15 | ForEach-Object {
-              Write-Host "::error title=Build::$($_.Line.Trim())"
-            }
-            throw "build failed"
-          }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mingw-w64 libgl1-mesa-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libdbus-1-dev
 
       - name: DSP tests
-        shell: pwsh
         run: |
-          ctest --test-dir build -C Release --output-on-failure
-          if ($LASTEXITCODE -ne 0) { throw "DSP tests failed" }
-          Write-Host "::notice title=DSP tests::all limiter checks passed (44.1/48/96 kHz, with and without the safety clamp)"
+          cmake -S plugin -B build-linux -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux --target test_limiter test_limiter_noclamp --parallel
+          ctest --test-dir build-linux --output-on-failure
+          echo "::notice title=DSP tests::all limiter checks passed (44.1/48/96 kHz, with and without the safety clamp)"
 
-      # Loads the plugin the way a DAW does and runs the standard plugin checks, including Steinberg's VST3 validator.
-      - name: Validate with pluginval
-        shell: pwsh
+      - name: Build for Windows
         run: |
-          Invoke-WebRequest https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip -OutFile pluginval.zip
-          Expand-Archive pluginval.zip -DestinationPath pluginval
-          $vst3 = Get-ChildItem -Recurse -Directory -Filter VolumeGuardLimiter.vst3 build | Select-Object -First 1
-          Write-Host "Validating $($vst3.FullName)"
-          $p = Start-Process pluginval/pluginval.exe -Wait -PassThru -NoNewWindow -ArgumentList @(
-            '--strictness-level', '10', '--validate-in-process', '--output-dir', 'pluginval-logs', '--validate', "`"$($vst3.FullName)`"")
-          $log = (Get-ChildItem pluginval-logs -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
-          Write-Host $log
-          if ($p.ExitCode -ne 0) { throw "pluginval failed with exit code $($p.ExitCode)" }
-          # make sure the tests really ran, not just that pluginval exited
-          if ($log -notmatch 'SUCCESS' -or $log -notmatch 'vst3 validator') { throw "pluginval log has no SUCCESS / vst3 validator result" }
-          $tests = ([regex]::Matches($log, 'Completed tests in')).Count
-          Write-Host "::notice title=pluginval::SUCCESS at strictness 10, $tests test groups passed (incl. Steinberg vst3 validator)"
+          cmake -S plugin -B build-win -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+                -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake
+          cmake --build build-win --parallel 2>&1 | tee build.log
+          test ${PIPESTATUS[0]} -eq 0 || { grep -E ': (fatal )?error' build.log | head -15 | sed 's/^/::error title=Build::/'; exit 1; }
+          x86_64-w64-mingw32-strip --strip-unneeded build-win/bin/VolumeGuardLimiter.vst3/Contents/x86_64-win/VolumeGuardLimiter.vst3 build-win/bin/VolumeGuardLimiter.clap
+          # the plugin must only need system DLLs
+          x86_64-w64-mingw32-objdump -p build-win/bin/VolumeGuardLimiter.vst3/Contents/x86_64-win/VolumeGuardLimiter.vst3 | grep "DLL Name"
 
       - name: Package
-        id: pkg
-        shell: pwsh
+        id: ver
         env:
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
-          $ver = (Get-Content plugin/VERSION -Raw).Trim()
-          New-Item -ItemType Directory -Force out/VST3, out/CLAP | Out-Null
-          $vst3 = Get-ChildItem -Recurse -Directory -Filter VolumeGuardLimiter.vst3 build | Select-Object -First 1
-          $clap = Get-ChildItem -Recurse -File -Filter VolumeGuardLimiter.clap build | Select-Object -First 1
-          Copy-Item -Recurse $vst3.FullName out/VST3/
-          Copy-Item $clap.FullName out/CLAP/
-          Copy-Item plugin/README.md out/README.md
-          Copy-Item LICENSE out/LICENSE
-          Compress-Archive -Path out/* -DestinationPath VolumeGuardLimiter-Windows.zip -Force
-          $release = ("${{ github.event_name }}" -eq "push") -and "$env:COMMIT_MESSAGE".Contains('[limiter-release]')
-          "tag=limiter-v$ver" >> $env:GITHUB_OUTPUT
-          "release=$($release.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          ver=$(tr -d '[:space:]' < plugin/VERSION)
+          mkdir -p out/VST3 out/CLAP
+          cp -r build-win/bin/VolumeGuardLimiter.vst3 out/VST3/
+          cp build-win/bin/VolumeGuardLimiter.clap out/CLAP/
+          cp plugin/README.md out/README.md
+          cp LICENSE out/LICENSE
+          (cd out && zip -qr ../VolumeGuardLimiter-Windows.zip .)
+          release=false
+          if [ "${{ github.event_name }}" = "push" ] && [[ "$COMMIT_MESSAGE" == *"[limiter-release]"* ]]; then release=true; fi
+          echo "tag=limiter-v$ver" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
           name: VolumeGuardLimiter-Windows
           path: VolumeGuardLimiter-Windows.zip
 
+  # Windows: load the plugin the way a DAW does (pluginval, incl. Steinberg's VST3 validator), then publish.
+  validate:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: VolumeGuardLimiter-Windows
+
+      - name: Validate with pluginval
+        shell: pwsh
+        run: |
+          Expand-Archive VolumeGuardLimiter-Windows.zip -DestinationPath pkg
+          Invoke-WebRequest https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_Windows.zip -OutFile pluginval.zip
+          Expand-Archive pluginval.zip -DestinationPath pluginval
+          $vst3 = (Resolve-Path pkg/VST3/VolumeGuardLimiter.vst3).Path
+          Write-Host "Validating $vst3"
+          $p = Start-Process pluginval/pluginval.exe -Wait -PassThru -NoNewWindow -ArgumentList @(
+            '--strictness-level', '10', '--validate-in-process', '--output-dir', 'pluginval-logs', '--validate', "`"$vst3`"")
+          $log = (Get-ChildItem pluginval-logs -Recurse -File | ForEach-Object { Get-Content $_.FullName -Raw }) -join "`n"
+          Write-Host $log
+          if ($p.ExitCode -ne 0) { throw "pluginval failed with exit code $($p.ExitCode)" }
+          # make sure the tests really ran, not just that pluginval exited
+          if ($log -notmatch 'SUCCESS' -or $log -notmatch 'vst3 validator' -or $log -notmatch 'Editor') { throw "pluginval log is incomplete" }
+          $tests = ([regex]::Matches($log, 'Completed tests in')).Count
+          Write-Host "::notice title=pluginval::SUCCESS at strictness 10, $tests test groups passed (incl. editor and Steinberg vst3 validator)"
+
       # Commit message with [limiter-release] publishes plugin/VERSION as a release.
       # It is not marked "latest", so the app download button keeps pointing at VolumeGuard itself.
       - name: Publish release
-        if: steps.pkg.outputs.release == 'true'
+        if: needs.build.outputs.release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.pkg.outputs.tag }}
+          tag_name: ${{ needs.build.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: VolumeGuard Limiter ${{ steps.pkg.outputs.tag }}
+          name: VolumeGuard Limiter ${{ needs.build.outputs.tag }}
           body_path: plugin/release-notes.md
           files: VolumeGuardLimiter-Windows.zip
           make_latest: false
