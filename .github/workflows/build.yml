@@ -1,0 +1,44 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with the .NET Framework C# compiler
+        shell: cmd
+        run: >
+          "%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:winexe /platform:anycpu /optimize+
+          /win32icon:assets\app.ico /out:VolumeGuard.exe
+          /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll src\*.cs
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force VolumeGuard | Out-Null
+          Copy-Item VolumeGuard.exe, LICENSE VolumeGuard/
+          Compress-Archive -Path VolumeGuard -DestinationPath VolumeGuard.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VolumeGuard
+          path: VolumeGuard.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: VolumeGuard ${{ github.ref_name }}
+          body_path: .github/release-notes.md
+          files: VolumeGuard.zip
