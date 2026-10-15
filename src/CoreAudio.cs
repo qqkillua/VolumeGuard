@@ -171,6 +171,30 @@ namespace VolumeGuard
 
         public const int PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
+        [DllImport("winmm.dll")]
+        public static extern int timeBeginPeriod(int periodMs);
+
+        [DllImport("winmm.dll")]
+        public static extern int timeEndPeriod(int periodMs);
+
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll")]
+        public static extern bool SetProcessWorkingSetSize(IntPtr process, IntPtr minSize, IntPtr maxSize);
+
+        /// Gives unused memory back to Windows (used when the window goes to the tray).
+        public static void TrimMemory()
+        {
+            try
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                SetProcessWorkingSetSize(GetCurrentProcess(), (IntPtr)(-1), (IntPtr)(-1));
+            }
+            catch { }
+        }
+
         public static string ProcessPath(int pid)
         {
             IntPtr h = IntPtr.Zero;

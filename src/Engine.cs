@@ -41,6 +41,7 @@ namespace VolumeGuard
         public float Gain = 1f;         // volume actually applied (<= UserVol)
         public float Env;               // peak envelope of the input signal
         public float OutLevel;          // estimated output peak, linear
+        public float DisplayPeak;       // highest OutLevel since the window last drew it
         public bool Limiting;
         public bool Active;
         public int UiVersion;
@@ -57,6 +58,7 @@ namespace VolumeGuard
         public float R = 1f;            // our reduction factor, linear (1 = none)
         public float Env;
         public float OutLevel;
+        public float DisplayPeak;
         public bool Limiting;
         public int UiVersion;
     }
@@ -152,6 +154,7 @@ namespace VolumeGuard
                                 Key = p[1], Title = p[2], UserVol = Db.Clamp(PF(p[3], 1f)), LimitOn = p[4] == "1",
                                 LimitDb = PF(p[5], -12f), Muted = p[6] == "1", Pending = p[7] == "1"
                             };
+                            if (p.Length > 8) a.Env = Math.Max(0f, Math.Min(1.5f, PF(p[8], 0f)));
                             a.Gain = a.UserVol;
                             s.Apps[a.Key] = a;
                             break;
@@ -177,7 +180,7 @@ namespace VolumeGuard
                 sb.AppendLine("opt|masterMeterPost|" + B(MasterMeterPost));
                 sb.AppendLine(string.Join("|", new[] { "master", F(Master.UserVol), B(Master.LimitOn), F(Master.LimitDb), B(Master.Pending) }));
                 foreach (var a in Apps.Values)
-                    sb.AppendLine(string.Join("|", new[] { "app", Clean(a.Key), Clean(a.Title), F(a.UserVol), B(a.LimitOn), F(a.LimitDb), B(a.Muted), B(a.Pending) }));
+                    sb.AppendLine(string.Join("|", new[] { "app", Clean(a.Key), Clean(a.Title), F(a.UserVol), B(a.LimitOn), F(a.LimitDb), B(a.Muted), B(a.Pending), F(a.Env) }));
                 string tmp = FilePath + ".tmp";
                 File.WriteAllText(tmp, sb.ToString(), Encoding.UTF8);
                 File.Copy(tmp, FilePath, true);
@@ -190,12 +193,21 @@ namespace VolumeGuard
 
     static class Limiter
     {
+        /// Below this level (−50 dBFS) the input counts as silence.
+        public static readonly float Gate = Db.ToLin(-50f);
+
+        /// Level assumed for an app we have not heard yet (−3 dBFS): its volume starts already limited,
+        /// so the first sound after start-up or after switching the limit on is not too loud.
+        public const float StartEnv = 0.7f;
+
         /// One step of a feed-forward peak limiter that works by moving a volume knob.
         /// inPeak — level of the signal before our gain; instant attack, smooth release.
+        /// The envelope only decays while there is sound: during silence the reduced volume is held,
+        /// so a loud sound that starts after a pause does not hit at full volume.
         public static void Step(ref float gain, ref float env, float inPeak, float user, bool on, float limitDb,
                                 float floor, float decay, float rel)
         {
-            env = Math.Max(inPeak, env * decay);
+            env = inPeak >= Gate ? Math.Max(inPeak, env * decay) : Math.Max(inPeak, env);
             float target = user;
             if (on && env > 1e-4f) target = Math.Min(target, Db.ToLin(limitDb) / env);
             if (target < floor) target = floor;
@@ -332,7 +344,7 @@ namespace VolumeGuard
                 userDb = epv.GetMasterVolumeLevel();
                 lastScalar = epv.GetMasterVolumeLevelScalar();
                 lastSetDb = userDb;
-                m.R = 1f; m.Env = 0f; m.UiVersion++;
+                m.R = 1f; m.Env = Limiter.StartEnv * Db.ToLin(userDb); m.UiVersion++;
 
                 Status = null;
                 RefreshSessions();
@@ -402,16 +414,19 @@ namespace VolumeGuard
                 try
                 {
                     var d = En.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eMultimedia);
-                    if (d.GetId() != devId) { Close(); Open(); return true; }
+                    bool other = d.GetId() != devId;
+                    Release(d, dev);
+                    if (other) { Close(); Open(); return true; }
                 }
                 catch { }
             }
 
             bool changed = false;
             foreach (var w in sessions.Values) w.Seen = false;
+            IAudioSessionEnumerator se = null;
             try
             {
-                var se = mgr.GetSessionEnumerator();
+                se = mgr.GetSessionEnumerator();
                 int n = se.GetCount();
                 for (int i = 0; i < n; i++)
                 {
@@ -450,9 +465,15 @@ namespace VolumeGuard
                 }
             }
             catch { }
+            finally
+            {
+                // a new enumerator every second: free it now instead of waiting for the garbage collector
+                Release(se, null);
+            }
 
             foreach (var w in sessions.Values.Where(x => !x.Seen || x.Dead).ToList())
             {
+                Release(w.Ctl, null);
                 sessions.Remove(w.Id);
                 foreach (var a in s.Apps.Values) a.Sessions.Remove(w);
                 changed = true;
@@ -477,6 +498,13 @@ namespace VolumeGuard
             return changed;
         }
 
+        /// Frees a COM object we no longer need. Never frees one that is still in use (keep).
+        static void Release(object com, object keep)
+        {
+            if (com == null || ReferenceEquals(com, keep)) return;
+            try { if (Marshal.IsComObject(com)) Marshal.FinalReleaseComObject(com); } catch { }
+        }
+
         void Attach(AppModel app, SessionWrap w)
         {
             float cur = w.Vol.GetMasterVolume();
@@ -496,7 +524,11 @@ namespace VolumeGuard
                     app.Gain = cur;
                     app.Muted = mute;
                 }
-                app.Env = 0f;
+                // Start already limited: use the level remembered from last time, or a cautious guess,
+                // so the first sound of a freshly opened app is not played at full volume.
+                if (app.Env < Limiter.Gate) app.Env = Limiter.StartEnv;
+                if (s.Enabled && app.LimitOn)
+                    app.Gain = Math.Min(app.UserVol, Math.Max(Math.Min(app.UserVol, 0.02f), Db.ToLin(app.LimitDb) / app.Env));
                 app.UiVersion++;
                 s.Dirty = true;
             }
@@ -579,9 +611,11 @@ namespace VolumeGuard
             {
                 // the user moved the Windows volume (keyboard, tray flyout…) — that is the new wish
                 m.UserVol = scalar;
+                float oldDb = userDb;
                 userDb = epv.GetMasterVolumeLevel();
                 lastSetDb = userDb;
-                m.R = 1f; m.Env = 0f; m.UiVersion++;
+                m.Env *= Db.ToLin(userDb - oldDb);
+                m.R = 1f; m.UiVersion++;
                 s.Dirty = true;
             }
             lastScalar = scalar;
@@ -602,6 +636,7 @@ namespace VolumeGuard
                 lastScalar = epv.GetMasterVolumeLevelScalar();
             }
             m.OutLevel = inLevel * userAmp * m.R;
+            if (m.OutLevel > m.DisplayPeak) m.DisplayPeak = m.OutLevel;
             m.Limiting = m.R < 0.97f;
             bool pend = m.R < 0.99f;
             if (pend != m.Pending) { m.Pending = pend; s.Dirty = true; }
@@ -619,7 +654,7 @@ namespace VolumeGuard
                     if (w.LastSet >= 0f && Math.Abs(cur - w.LastSet) > 0.015f)
                     {
                         // changed in the Windows volume mixer
-                        a.UserVol = cur; a.Gain = cur; a.Env = 0f; a.UiVersion++;
+                        a.UserVol = cur; a.Gain = cur; a.UiVersion++;
                         w.LastSet = cur;
                         s.Dirty = true;
                     }
@@ -648,6 +683,7 @@ namespace VolumeGuard
                 catch { w.Dead = true; }
             }
             a.OutLevel = inPeak * a.Gain;
+            if (a.OutLevel > a.DisplayPeak) a.DisplayPeak = a.OutLevel;
             a.Limiting = a.Gain < a.UserVol * 0.97f;
             bool pend = a.Gain < a.UserVol - 0.01f;
             if (pend != a.Pending) { a.Pending = pend; s.Dirty = true; }
@@ -681,7 +717,9 @@ namespace VolumeGuard
             try
             {
                 epv.SetMasterVolumeLevelScalar(v, ref ctx);
+                float oldDb = userDb;
                 userDb = epv.GetMasterVolumeLevel();
+                m.Env *= Db.ToLin(userDb - oldDb);
                 m.UserVol = v;
                 float db = userDb;
                 if (m.R < 0.999f)
@@ -742,12 +780,14 @@ namespace VolumeGuard
                 float inPeak = a.Active ? (0.15f + 0.85f * burst * burst) * (0.6f + 0.4f * (float)rnd.NextDouble()) : 0f;
                 Limiter.Step(ref a.Gain, ref a.Env, inPeak, a.UserVol, s.Enabled && a.LimitOn, a.LimitDb, 0.02f, decay, rel);
                 a.OutLevel = a.Muted ? 0f : inPeak * a.Gain;
+                a.DisplayPeak = Math.Max(a.DisplayPeak, a.OutLevel);
                 a.Limiting = a.Gain < a.UserVol * 0.97f;
                 sum = Math.Max(sum, a.OutLevel);
             }
             var m = s.Master;
             Limiter.Step(ref m.R, ref m.Env, sum * m.UserVol, 1f, s.Enabled && m.LimitOn, m.LimitDb, 0.01f, decay, rel);
             m.OutLevel = sum * m.UserVol * m.R;
+            m.DisplayPeak = Math.Max(m.DisplayPeak, m.OutLevel);
             m.Limiting = m.R < 0.97f;
         }
     }

@@ -34,7 +34,7 @@ namespace VolumeGuard
         readonly Stopwatch clock = Stopwatch.StartNew();
         List<KeyValuePair<string, string>> devices = new List<KeyValuePair<string, string>>();
         Icon iconOn, iconOff;
-        double lastT, lastRefresh, lastReopen, lastSave;
+        double lastT, lastRefresh, lastReopen, lastSave, lastUi;
         bool exiting, fillingDevices;
 
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -166,7 +166,9 @@ namespace VolumeGuard
             SyncMaster(true);
             RebuildCards();
 
-            timer.Interval = 50;
+            // The limiter reacts every 10 ms; ask Windows for 1 ms timer precision so the timer can keep up.
+            if (!demo) { try { Native.timeBeginPeriod(1); } catch { } }
+            timer.Interval = 10;
             timer.Tick += delegate { OnTick(); };
             timer.Start();
         }
@@ -186,7 +188,7 @@ namespace VolumeGuard
         void OnTick()
         {
             double now = clock.Elapsed.TotalSeconds;
-            float dt = (float)Math.Min(0.25, Math.Max(0.01, now - lastT));
+            float dt = (float)Math.Min(0.25, Math.Max(0.002, now - lastT));
             lastT = now;
 
             if (!eng.IsOpen)
@@ -218,8 +220,10 @@ namespace VolumeGuard
             string st = eng.Status ?? "";
             if (statusLabel.Text != st) statusLabel.Text = st;
 
-            if (Visible && WindowState != FormWindowState.Minimized)
+            // the window itself only needs ~20 updates per second
+            if (Visible && WindowState != FormWindowState.Minimized && now - lastUi >= 0.045)
             {
+                lastUi = now;
                 SyncMaster(false);
                 foreach (var a in s.Apps.Values)
                 {
@@ -229,7 +233,8 @@ namespace VolumeGuard
                     // show the volume the limiter actually set, in the same % as the slider and the Windows mixer
                     string badge = s.Enabled && a.LimitOn && a.Limiting
                         ? "громкость сейчас " + Math.Round(a.Gain * 100) + "%" : "";
-                    c.SetLive(a.Muted ? 0f : a.OutLevel, badge, a.Active);
+                    c.SetLive(a.Muted ? 0f : a.DisplayPeak, badge, a.Active);
+                    a.DisplayPeak = 0f;
                 }
             }
         }
@@ -245,7 +250,8 @@ namespace VolumeGuard
             float red = Db.FromLin(m.R);
             string badge = s.Enabled && m.LimitOn && m.Limiting && red < -0.5f
                 ? "звук тише на " + Math.Round(-red) + " дБ" : "";
-            masterCard.SetLive(m.OutLevel, badge, true);
+            masterCard.SetLive(m.DisplayPeak, badge, true);
+            m.DisplayPeak = 0f;
         }
 
         // ---------- app cards ----------
@@ -365,7 +371,7 @@ namespace VolumeGuard
 
         void ToggleWindow()
         {
-            if (Visible && WindowState != FormWindowState.Minimized) Hide();
+            if (Visible && WindowState != FormWindowState.Minimized) { Hide(); Native.TrimMemory(); }
             else ShowFromTray();
         }
 
@@ -394,6 +400,7 @@ namespace VolumeGuard
             {
                 e.Cancel = true;
                 Hide();
+                Native.TrimMemory();
                 if (!s.TrayHintShown)
                 {
                     s.TrayHintShown = true;
@@ -403,6 +410,7 @@ namespace VolumeGuard
                 return;
             }
             timer.Stop();
+            if (!demo) { try { Native.timeEndPeriod(1); } catch { } }
             try { eng.Close(); } catch { }
             if (!demo) s.Save();
             tray.Visible = false;
