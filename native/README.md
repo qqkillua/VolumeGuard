@@ -15,7 +15,7 @@
 | `include/vgaudio.h` | C API для VolumeGuard.exe (`vg_start`, `vg_stop`, `vg_set_params`, `vg_get_status`, `vg_list_devices`) |
 | `src/Engine.cpp` | WASAPI: устройства, потоки, MMCSS «Pro Audio», переподключение, `audio.log` |
 | `src/Bridge.hpp` | Кольцевой буфер, ресемплер с подстройкой под часы, преобразование форматов (float/16/24/32 бит, 1–8 каналов) |
-| `src/Processor.hpp` | Цепочка обработки — та же DSP, что в плагине (`plugin/src/GameDsp.hpp`, `LimiterDsp.hpp`) |
+| `src/Processor.hpp` | Обёртка над цепочкой обработки плагина (`plugin/src/ChainDsp.hpp`): те же звук и плавная смена настроек |
 | `tests/test_bridge.cpp` | 10 минут симуляции: дрейф ±1000 ppm, 44,1/48/96 кГц, дрожание пакетов, пауза 3 с; SNR > 80 дБ |
 | `tests/test_processor.cpp` | Потолок во всех режимах, bypass, весь путь 5.1 int16 → stereo float |
 | `tests/test_pump.cpp` | Push mode: пакеты 2,7/10 мс, дрейф, опоздания потока, пауза источника; пропуски и задержка |

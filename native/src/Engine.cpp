@@ -477,6 +477,11 @@ private:
         const double t0 = nowSec();
         double lastPoll = t0, lastData = t0, quietUntil = t0 + 1.0, lastGlitchLog = -1e9, waitSmooth = 0.0;
         bool produced = false;
+        // joins in the source: a gap Windows reports (DATA_DISCONTINUITY) or sound coming back after silence
+        float lastL = 0.0f, lastR = 0.0f;
+        uint64_t packets = 0, gaps = 0, resumes = 0;
+        double lastGapLog = -1e9, lastResumeLog = -1e9;
+        const size_t declickFrames = (size_t)std::max(8.0, srcRate * 0.002);   // 2 ms
         uint64_t lastDips = 0;
         hr = S_OK;
         // wake up every ~1 ms, and right when the output device has taken its period (its event)
@@ -503,6 +508,7 @@ private:
             }
 
             // 1. everything the source played since the last poll
+            bool wasStalled = produced && now - lastData > 3.0 * srcPeriodMs / 1000.0 + 0.003;
             for (;;)
             {
                 UINT32 next = 0;
@@ -518,6 +524,36 @@ private:
                         std::fill(lr.begin(), lr.begin() + (size_t)frames * 2, 0.0f);
                     else
                         vga::toStereo(cdata, frames, capFormat_, lr.data());
+                    const bool gap = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) && packets > 0;
+                    if (gap || wasStalled)
+                    {
+                        // after silence we played zeros, so fade in from 0; after a gap, from the last sample
+                        if (wasStalled) { lastL = lastR = 0.0f; }
+                        vga::declickStart(lr.data(), frames, declickFrames, lastL, lastR);
+                        if (gap)
+                        {
+                            ++gaps;
+                            if (now - lastGapLog > 10.0)
+                            {
+                                lastGapLog = now;
+                                logLine("source: gap in the captured sound (%llu so far), smoothed over 2 ms", (unsigned long long)gaps);
+                            }
+                        }
+                        if (wasStalled)
+                        {
+                            ++resumes;
+                            if (now - lastResumeLog > 10.0)
+                            {
+                                lastResumeLog = now;
+                                logLine("source: sound again after %.0f ms of nothing (%llu times so far), faded in",
+                                        1000.0 * (now - lastData), (unsigned long long)resumes);
+                            }
+                        }
+                        wasStalled = false;
+                    }
+                    lastL = lr[(size_t)frames * 2 - 2];
+                    lastR = lr[(size_t)frames * 2 - 1];
+                    ++packets;
                     ring_.write(lr.data(), frames, now);
                     lastData = now;
                 }

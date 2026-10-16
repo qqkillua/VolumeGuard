@@ -54,15 +54,20 @@ private:
 class BandCompressor
 {
 public:
+    /// Threshold and ratio glide to new values (see glide()), so switching mode or amount does not jump.
     void setup(double fs, float thresholdDb, float ratio, float attackMs, float releaseMs, float kneeDb = 6.0f)
     {
-        thr_ = thresholdDb;
-        ratio_ = std::max(1.0f, ratio);
+        thrT_ = thresholdDb;
+        ratioT_ = std::max(1.0f, ratio);
         knee_ = std::max(0.01f, kneeDb);
         att_ = (float)std::exp(-1.0 / (fs * attackMs / 1000.0));
         rel_ = (float)std::exp(-1.0 / (fs * releaseMs / 1000.0));
     }
     void reset() { env_ = 0.0f; }
+    /// Jump to the targets (after prepare, before any sound).
+    void snap() { thr_ = thrT_; ratio_ = ratioT_; }
+    /// One sample of gliding towards the targets; k = 1 - e^(-1 / (fs * 20 ms)).
+    inline void glide(float k) { thr_ += (thrT_ - thr_) * k; ratio_ += (ratioT_ - ratio_) * k; }
 
     /// Gain for this sample (linear, ≤ 1) from the louder of the two channels.
     inline float gain(float l, float r)
@@ -88,7 +93,7 @@ public:
     float takeReductionDb() { const float v = minGrDb_; minGrDb_ = 0.0f; return v; }
 
 private:
-    float thr_ = 0, ratio_ = 1, knee_ = 6, att_ = 0, rel_ = 0, env_ = 0, minGrDb_ = 0;
+    float thr_ = 0, ratio_ = 1, thrT_ = 0, ratioT_ = 1, knee_ = 6, att_ = 0, rel_ = 0, env_ = 0, minGrDb_ = 0;
 };
 
 class GameProcessor
@@ -106,14 +111,25 @@ public:
         lp2_.lowpass(fs_, kCrossoverHz, q);
         hp1_.highpass(fs_, kCrossoverHz, q);
         hp2_.highpass(fs_, kCrossoverHz, q);
+        glideK_ = (float)(1.0 - std::exp(-1.0 / (fs_ * 0.020)));
         configure();
         reset();
     }
 
+    /// Clears the filters and jumps straight to the current settings (no glide): call before sound starts.
     void reset()
     {
         lp1_.reset(); lp2_.reset(); hp1_.reset(); hp2_.reset();
         low_.reset(); high_.reset();
+        snap();
+    }
+
+    /// Jump to the current settings without gliding (the next sound starts with them).
+    void snap()
+    {
+        low_.snap(); high_.snap();
+        makeup_ = makeupT_;
+        mix_ = mode_ != kOff ? 1.0f : 0.0f;
     }
 
     void setMode(int mode)
@@ -131,12 +147,29 @@ public:
 
     int mode() const { return mode_; }
 
-    /// In-place stereo processing. Does nothing in kOff.
+    /// In-place stereo processing. Switching the mode on or off fades over ~20 ms, and changing the mode or
+    /// the amount glides the settings over ~20 ms, so neither clicks.
     void process(float* l, float* r, int frames)
     {
-        if (mode_ == kOff) return;
+        const float wantMix = mode_ != kOff ? 1.0f : 0.0f;
+        if (mode_ == kOff && mix_ <= 1e-4f)
+        {
+            if (mix_ != 0.0f)
+            {
+                mix_ = 0.0f;
+                lp1_.reset(); lp2_.reset(); hp1_.reset(); hp2_.reset();
+                low_.reset(); high_.reset();
+            }
+            return;   // off: the signal is untouched
+        }
+        const float k = glideK_;
         for (int i = 0; i < frames; ++i)
         {
+            low_.glide(k);
+            high_.glide(k);
+            makeup_ += (makeupT_ - makeup_) * k;
+            mix_ += (wantMix - mix_) * k;
+            if (std::fabs(mix_ - wantMix) < 1e-5f) mix_ = wantMix;
             const float lowL = lp2_.process(lp1_.process(l[i], 0), 0);
             const float lowR = lp2_.process(lp1_.process(r[i], 1), 1);
             const float highL = hp2_.process(hp1_.process(l[i], 0), 0);
@@ -144,8 +177,10 @@ public:
             const float gLow = low_.gain(lowL, lowR);
             const float gHigh = high_.gain(highL, highR);
             // 4th-order Linkwitz-Riley bands are in phase and add up flat (checked: ±0.00 dB, 50 Hz…5 kHz)
-            l[i] = (lowL * gLow + highL * gHigh) * makeup_;
-            r[i] = (lowR * gLow + highR * gHigh) * makeup_;
+            const float yl = (lowL * gLow + highL * gHigh) * makeup_;
+            const float yr = (lowR * gLow + highR * gHigh) * makeup_;
+            if (mix_ >= 1.0f) { l[i] = yl; r[i] = yr; }
+            else { l[i] += (yl - l[i]) * mix_; r[i] += (yr - r[i]) * mix_; }
         }
     }
 
@@ -164,22 +199,22 @@ private:
         {
             low_.setup(fs_, -16.0f - 10.0f * a, 3.0f, 10.0f, 200.0f);
             high_.setup(fs_, -20.0f - 10.0f * a, 2.5f, 8.0f, 250.0f);
-            makeup_ = dbToGainLocal(6.0f * a);
+            makeupT_ = dbToGainLocal(6.0f * a);
         }
         else if (mode_ == kTactical)
         {
             low_.setup(fs_, -26.0f - 10.0f * a, 8.0f, 3.0f, 150.0f);
             high_.setup(fs_, -22.0f - 14.0f * a, 6.0f, 1.5f, 120.0f);
-            makeup_ = dbToGainLocal(4.0f + 10.0f * a);
+            makeupT_ = dbToGainLocal(4.0f + 10.0f * a);
         }
-        else makeup_ = 1.0f;
+        else makeupT_ = 1.0f;
     }
 
     static float dbToGainLocal(float db) { return std::pow(10.0f, db / 20.0f); }
 
     double fs_ = 48000.0;
     int mode_ = kOff;
-    float amount_ = 0.5f, makeup_ = 1.0f;
+    float amount_ = 0.5f, makeup_ = 1.0f, makeupT_ = 1.0f, mix_ = 0.0f, glideK_ = 0.001f;
     Biquad lp1_, lp2_, hp1_, hp2_;
     BandCompressor low_, high_;
 };

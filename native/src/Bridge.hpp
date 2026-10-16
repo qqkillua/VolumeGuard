@@ -499,6 +499,20 @@ inline void writeSample(uint8_t* p, const SampleFormat& f, float x)
     }
 }
 
+/// Smooths a jump at the start of a packet (after a gap in the source, or after silence we filled in):
+/// the first `ramp` frames blend from the last value that was played (fromL / fromR) into the packet with a
+/// raised-cosine curve, so the join is a short fade instead of a step (a click).
+inline void declickStart(float* lr, size_t frames, size_t ramp, float fromL, float fromR)
+{
+    const size_t n = std::min(frames, ramp);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const float w = 0.5f - 0.5f * (float)std::cos(3.14159265358979323846 * (double)(i + 1) / (double)(n + 1));
+        lr[2 * i] = fromL + (lr[2 * i] - fromL) * w;
+        lr[2 * i + 1] = fromR + (lr[2 * i + 1] - fromR) * w;
+    }
+}
+
 /// Device frames → interleaved stereo. Surround (5.1 / 7.1 in the usual Windows order
 /// FL FR FC LFE BL BR [SL SR]) is folded down; LFE is left out.
 inline void toStereo(const uint8_t* data, size_t frames, const SampleFormat& f, float* lr)

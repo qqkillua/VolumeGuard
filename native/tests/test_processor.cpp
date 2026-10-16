@@ -116,6 +116,18 @@ int main()
         CHECK(peak > 0.3 && peak <= vgl::dbToGain(-1.0f) * 1.000001, "output peak %.3f", peak);
     }
 
+    // 5. A gap in the source (last sample 0.8, the next packet starts at -0.8): smoothed over 2 ms, no step.
+    {
+        const size_t n = 480, ramp = 96;
+        std::vector<float> lr(n * 2);
+        for (size_t i = 0; i < n; ++i) lr[2 * i] = lr[2 * i + 1] = -0.8f * (float)std::cos(2 * 3.14159265358979 * 300 * i / 48000.0);
+        vga::declickStart(lr.data(), n, ramp, 0.8f, 0.8f);
+        double worst = std::fabs(lr[0] - 0.8f);
+        for (size_t i = 1; i < n; ++i) worst = std::max(worst, (double)std::fabs(lr[2 * i] - lr[2 * i - 2]));
+        std::printf("gap 0.8 -> -0.8 smoothed: largest step %.3f (a clean 300 Hz sine of 0.8 steps up to 0.031)\n", worst);
+        CHECK(worst < 0.04, "declick left a step of %.3f", worst);
+    }
+
     if (failures) { std::printf("%d check(s) failed\n", failures); return 1; }
     std::printf("all processor checks passed\n");
     return 0;

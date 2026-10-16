@@ -35,6 +35,7 @@ public:
         L_ = std::max(2, (int)std::lround(sr_ * lookaheadMs / 1000.0));
         D_ = L_ - 1;
         delay_.assign((size_t)channels_ * (size_t)D_, 0.0f);
+        ceilDelay_.assign((size_t)D_, ceiling_);
         box_.assign((size_t)L_, 1.0f);
         dqVal_.assign((size_t)L_ + 1, 1.0f);
         dqIdx_.assign((size_t)L_ + 1, 0);
@@ -45,6 +46,8 @@ public:
     void reset()
     {
         std::fill(delay_.begin(), delay_.end(), 0.0f);
+        std::fill(ceilDelay_.begin(), ceilDelay_.end(), ceiling_);
+        clamps_ = 0;
         std::fill(box_.begin(), box_.end(), 1.0f);
         boxSum_ = (double)L_;
         boxPos_ = 0;
@@ -77,6 +80,9 @@ public:
 
     /// Loudest input (after Input Gain) and output sample since the last call, linear. For the meters.
     float takeInputPeak() { const float v = inPeak_; inPeak_ = 0.0f; return v; }
+    /// How many samples the final safety clamp had to change. Should stay 0: the algorithm itself keeps the
+    /// ceiling; the clamp is only a guard against float rounding.
+    uint64_t clampCount() const { return clamps_; }
     float takeOutputPeak() { const float v = outPeak_; outPeak_ = 0.0f; return v; }
 
     /// in and out may point to the same buffers. bypass keeps the latency but applies no gain.
@@ -123,17 +129,23 @@ public:
             const float gain = std::min(1.0f, (float)(boxSum_ / (double)L_));
             minGain_ = std::min(minGain_, gain);
 
-            // 6. delay and apply; the final clamp only guards against float rounding
+            // 6. delay and apply. The clamp uses the ceiling that was in force when this sample's gain was
+            //    worked out (it travels through the delay too): when the ceiling is lowered, samples already
+            //    in the delay line keep their old one for 5 ms instead of being hard-clipped (a click).
+            float& cd = ceilDelay_[(size_t)dPos_];
+            const float ceil = cd;
+            cd = ceiling_;
             for (int c = 0; c < nch; ++c)
             {
                 float& d = delay_[(size_t)c * (size_t)D_ + (size_t)dPos_];
                 const float delayed = d;
                 d = x[c];
                 const float y = bypass ? delayed / inGain_ : delayed * gain;
+                if (!bypass && std::fabs(y) > ceil * 1.000001f) ++clamps_;
 #ifdef VGL_TEST_NO_CLAMP
                 out[c][i] = y;   // tests: prove the algorithm alone keeps the ceiling
 #else
-                out[c][i] = bypass ? y : std::max(-ceiling_, std::min(ceiling_, y));
+                out[c][i] = bypass ? y : std::max(-ceil, std::min(ceil, y));
 #endif
                 outPeak_ = std::max(outPeak_, std::fabs(out[c][i]));
             }
@@ -150,8 +162,9 @@ private:
     int channels_ = 2, L_ = 240, D_ = 239;
     float ceiling_ = dbToGain(-1.0f), inGain_ = 1.0f, releaseMs_ = 100.0f, relCoef_ = 0.0f;
 
-    std::vector<float> delay_;
+    std::vector<float> delay_, ceilDelay_;
     int dPos_ = 0;
+    uint64_t clamps_ = 0;
 
     std::vector<float> dqVal_;
     std::vector<int64_t> dqIdx_;

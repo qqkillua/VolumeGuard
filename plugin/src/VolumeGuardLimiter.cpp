@@ -1,8 +1,7 @@
 // VolumeGuard Limiter — DPF plugin: input gain → Game mode (optional) → lookahead limiter.
 // Copyright (c) 2026 Nikita Bainov (qqkillua). MIT License.
 #include "DistrhoPlugin.hpp"
-#include "LimiterDsp.hpp"
-#include "GameDsp.hpp"
+#include "ChainDsp.hpp"
 
 START_NAMESPACE_DISTRHO
 
@@ -35,7 +34,6 @@ public:
         fValues[kOutputLevel] = -60.0f;
         fValues[kMode] = 0.0f;
         fValues[kAmount] = 50.0f;
-        fLimiter.setInputGainDb(0.0f);   // input gain is applied before the Game mode, see run()
         prepare();
     }
 
@@ -48,7 +46,7 @@ protected:
     const char* getMaker() const override { return "qqkillua"; }
     const char* getHomePage() const override { return "https://github.com/qqkillua/VolumeGuard"; }
     const char* getLicense() const override { return "MIT"; }
-    uint32_t getVersion() const override { return d_version(1, 2, 0); }
+    uint32_t getVersion() const override { return d_version(1, 2, 1); }
     int64_t getUniqueId() const override { return d_cconst('V', 'G', 'L', 'm'); }
 
     void initAudioPort(bool input, uint32_t index, AudioPort& port) override
@@ -159,55 +157,30 @@ protected:
         fValues[index] = value;
         switch (index)
         {
-        case kInputGain: fInputGain = vgl::dbToGain(value); break;
-        case kCeiling:   fLimiter.setCeilingDb(value); break;
-        case kRelease:   fLimiter.setReleaseMs(value); break;
-        case kMode:      fGame.setMode((int)std::lround(value)); break;
-        case kAmount:    fGame.setAmount(value / 100.0f); break;
+        case kInputGain: fChain.setInputGainDb(value); break;
+        case kCeiling:   fChain.setCeilingDb(value); break;
+        case kRelease:   fChain.setReleaseMs(value); break;
+        case kBypass:    fChain.setBypass(value > 0.5f); break;
+        case kMode:      fChain.setMode((int)std::lround(value)); break;
+        case kAmount:    fChain.setAmount(value / 100.0f); break;
         }
     }
 
-    void activate() override { fLimiter.reset(); fGame.reset(); }
+    void activate() override { fChain.reset(); }
 
     void run(const float** inputs, float** outputs, uint32_t frames) override
     {
         if (frames == 0 || inputs == nullptr || outputs == nullptr
             || inputs[0] == nullptr || inputs[1] == nullptr || outputs[0] == nullptr || outputs[1] == nullptr)
             return;
-        float inPeak = 0.0f;
-        float gameGrDb = 0.0f;
-        if (fValues[kBypass] > 0.5f)
-        {
-            // dry signal, same latency
-            fLimiter.process(inputs, outputs, 2, (int)frames, true);
-            inPeak = fLimiter.takeInputPeak();
-        }
-        else
-        {
-            // in chunks through a scratch buffer: input gain → Game mode → limiter
-            for (uint32_t pos = 0; pos < frames; pos += kChunk)
-            {
-                const uint32_t n = std::min<uint32_t>(kChunk, frames - pos);
-                for (uint32_t i = 0; i < n; ++i)
-                {
-                    fScratch[0][i] = inputs[0][pos + i] * fInputGain;
-                    fScratch[1][i] = inputs[1][pos + i] * fInputGain;
-                    inPeak = std::max(inPeak, std::max(std::fabs(fScratch[0][i]), std::fabs(fScratch[1][i])));
-                }
-                fGame.process(fScratch[0], fScratch[1], (int)n);
-                const float* in[2] = { fScratch[0], fScratch[1] };
-                float* out[2] = { outputs[0] + pos, outputs[1] + pos };
-                fLimiter.process(in, out, 2, (int)n);
-            }
-            fLimiter.takeInputPeak();
-            if (fGame.mode() != vgl::GameProcessor::kOff) gameGrDb = fGame.takeReductionDb();
-        }
+        // input gain → Game mode → limiter; every setting change glides and bypass cross-fades (ChainDsp.hpp)
+        fChain.process(inputs[0], inputs[1], outputs[0], outputs[1], (int)frames);
 
         // Meters: jump up at once, fall back at 20 dB per second so they are readable.
         const float fall = 20.0f * (float)frames / (float)getSampleRate();
-        const float gr = std::max(-40.0f, fLimiter.takeGainReductionDb() + gameGrDb);
-        const float in = std::max(-60.0f, vgl::gainToDb(inPeak));
-        const float out = std::max(-60.0f, vgl::gainToDb(fLimiter.takeOutputPeak()));
+        const float gr = fChain.takeReductionDb();
+        const float in = std::max(-60.0f, vgl::gainToDb(fChain.takeInputPeak()));
+        const float out = std::max(-60.0f, vgl::gainToDb(fChain.takeOutputPeak()));
         fValues[kGainReduction] = std::min(gr, std::min(0.0f, fValues[kGainReduction] + fall));
         fValues[kInputLevel] = std::min(6.0f, std::max(in, fValues[kInputLevel] - fall));
         fValues[kOutputLevel] = std::min(6.0f, std::max(out, fValues[kOutputLevel] - fall));
@@ -218,23 +191,17 @@ protected:
 private:
     void prepare()
     {
-        fLimiter.prepare(getSampleRate(), 2, 5.0);
-        fLimiter.setInputGainDb(0.0f);
-        fLimiter.setCeilingDb(fValues[kCeiling]);
-        fInputGain = vgl::dbToGain(fValues[kInputGain]);
-        fGame.prepare(getSampleRate());
-        fGame.setMode((int)std::lround(fValues[kMode]));
-        fGame.setAmount(fValues[kAmount] / 100.0f);
-        fLimiter.setReleaseMs(fValues[kRelease]);
-        setLatency((uint32_t)fLimiter.latencySamples());
+        fChain.prepare(getSampleRate());
+        fChain.setInputGainDb(fValues[kInputGain]);
+        fChain.setCeilingDb(fValues[kCeiling]);
+        fChain.setReleaseMs(fValues[kRelease]);
+        fChain.setBypass(fValues[kBypass] > 0.5f);
+        fChain.setMode((int)std::lround(fValues[kMode]));
+        fChain.setAmount(fValues[kAmount] / 100.0f);
+        setLatency((uint32_t)fChain.latencySamples());
     }
 
-    static constexpr uint32_t kChunk = 256;
-
-    vgl::LookaheadLimiter fLimiter;
-    vgl::GameProcessor fGame;
-    float fInputGain = 1.0f;
-    float fScratch[2][kChunk];
+    vgl::Chain fChain;
     float fValues[kParameterCount];
 
     DISTRHO_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(VolumeGuardLimiter)

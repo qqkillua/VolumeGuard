@@ -31,9 +31,9 @@ jobs:
       - name: DSP tests
         run: |
           cmake -S plugin -B build-linux -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-linux --target test_limiter test_limiter_noclamp test_game test_game_noclamp --parallel
+          cmake --build build-linux --target test_limiter test_limiter_noclamp test_game test_game_noclamp test_chain --parallel
           ctest --test-dir build-linux --output-on-failure
-          echo "::notice title=DSP tests::limiter and game mode checks passed (44.1/48/96 kHz, with and without the safety clamp)"
+          echo "::notice title=DSP tests::limiter, game mode and click-free setting changes passed (44.1/48/96 kHz, with and without the safety clamp)"
 
       - name: Build for Windows
         run: |

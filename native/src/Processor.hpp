@@ -1,11 +1,10 @@
-// VolumeGuard audio engine — the processing chain, the same as in the VolumeGuard Limiter plugin:
-//   input gain → Game mode (Comfort / Tactical) → 5 ms lookahead limiter
+// VolumeGuard audio engine — the processing chain: exactly the plugin's (plugin/src/ChainDsp.hpp),
+//   input gain → Game mode (Comfort / Tactical) → 5 ms lookahead limiter, with click-free setting changes
 // Plain C++, tested offline (tests/test_processor.cpp).
 // Copyright (c) 2026 Nikita Bainov (qqkillua). MIT License.
 #pragma once
 
-#include "GameDsp.hpp"
-#include "LimiterDsp.hpp"
+#include "ChainDsp.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -45,10 +44,9 @@ class Processor
 public:
     void prepare(double sampleRate)
     {
-        lim_.prepare(sampleRate, 2, 5.0);
-        lim_.setInputGainDb(0.0f);          // the gain is applied before the Game mode, below
-        game_.prepare(sampleRate);
+        chain_.prepare(sampleRate);
         apply(params_);
+        chain_.reset();   // start directly with the current settings
     }
 
     void setParams(const Params& p)
@@ -56,63 +54,34 @@ public:
         const Params s = p.sanitized();
         if (s == params_) return;
         params_ = s;
-        apply(s);
+        apply(s);           // the chain glides to the new values: no clicks
     }
 
     const Params& params() const { return params_; }
-    int latencyFrames() const { return lim_.latencySamples(); }
+    int latencyFrames() const { return chain_.latencySamples(); }
+    uint64_t clampCount() const { return chain_.clampCount(); }
 
     /// In place, any number of frames.
-    void process(float* l, float* r, int frames)
-    {
-        if (params_.bypass)
-        {
-            for (int i = 0; i < frames; ++i) inPeak_ = std::max(inPeak_, std::max(std::fabs(l[i]), std::fabs(r[i])));
-            const float* in[2] = { l, r };
-            float* out[2] = { l, r };
-            lim_.process(in, out, 2, frames, true);   // dry, but with the same delay, so switching does not jump
-            lim_.takeInputPeak();
-            lim_.takeGainReductionDb();
-            return;
-        }
-        for (int i = 0; i < frames; ++i)
-        {
-            l[i] *= gain_;
-            r[i] *= gain_;
-            inPeak_ = std::max(inPeak_, std::max(std::fabs(l[i]), std::fabs(r[i])));
-        }
-        game_.process(l, r, frames);
-        if (game_.mode() != vgl::GameProcessor::kOff) gameGrDb_ = std::min(gameGrDb_, game_.takeReductionDb());
-        const float* in[2] = { l, r };
-        float* out[2] = { l, r };
-        lim_.process(in, out, 2, frames);
-        lim_.takeInputPeak();
-    }
+    void process(float* l, float* r, int frames) { chain_.process(l, r, l, r, frames); }
 
     /// Meter values since the previous call.
-    float takeInputPeak() { const float v = inPeak_; inPeak_ = 0.0f; return v; }
-    float takeOutputPeak() { return lim_.takeOutputPeak(); }
-    float takeReductionDb()
-    {
-        const float v = std::max(-40.0f, lim_.takeGainReductionDb() + gameGrDb_);
-        gameGrDb_ = 0.0f;
-        return std::min(0.0f, v);
-    }
+    float takeInputPeak() { return chain_.takeInputPeak(); }
+    float takeOutputPeak() { return chain_.takeOutputPeak(); }
+    float takeReductionDb() { return chain_.takeReductionDb(); }
 
 private:
     void apply(const Params& p)
     {
-        gain_ = vgl::dbToGain(p.inputGainDb);
-        lim_.setCeilingDb(p.ceilingDb);
-        lim_.setReleaseMs(p.releaseMs);
-        game_.setMode(p.mode);
-        game_.setAmount(p.amount / 100.0f);
+        chain_.setInputGainDb(p.inputGainDb);
+        chain_.setCeilingDb(p.ceilingDb);
+        chain_.setReleaseMs(p.releaseMs);
+        chain_.setMode(p.mode);
+        chain_.setAmount(p.amount / 100.0f);
+        chain_.setBypass(p.bypass);
     }
 
     Params params_;
-    vgl::LookaheadLimiter lim_;
-    vgl::GameProcessor game_;
-    float gain_ = 1.0f, inPeak_ = 0.0f, gameGrDb_ = 0.0f;
+    vgl::Chain chain_;
 };
 
 } // namespace vga
