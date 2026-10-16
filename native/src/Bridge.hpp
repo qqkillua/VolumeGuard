@@ -424,6 +424,19 @@ public:
         return false;
     }
 
+    /// The source turned out to deliver in bigger lumps than its packet size (see SourceWatch): the queue must
+    /// cover a whole lump. Only grows the target (the 20 s check lowers it again if it is not needed).
+    void setPacketFrames(double packetFrames)
+    {
+        if (packetFrames <= packet_) return;
+        packet_ = packetFrames;
+        minTarget_ = floor_ + 0.5 * period_;
+        target_ = std::min(maxTarget_, std::max(target_, floor_ + 0.5 * (period_ + packet_) + 0.001 * rate_));
+        lowSince_ = 1e18;
+        lowSec_ = 0.0;
+    }
+    double packetFrames() const { return packet_; }
+
     /// How far the average queue is above what it should be (frames).
     double excess() const { return primed_ ? smooth_ - target_ : 0.0; }
     double targetFrames() const { return target_; }
@@ -451,6 +464,67 @@ private:
     double lowSince_ = 1e18, lowSec_ = 0, lastRaise_ = -1e9, clock_ = 0;
     bool primed_ = false;
     uint64_t glitches_ = 0, dips_ = 0;
+};
+
+// ---------------------------------------------------------------------------------------------------------
+// SourceWatch: tells a source that STOPPED (nothing plays into it and there is no keep-alive: the output
+// should get silence) from a source that is only LATE (some drivers/systems deliver the loopback in lumps:
+// nothing for 20 ms, then all 20 ms at once). A late source must not get silence inserted — that cut the
+// sound ~17 times a second on one laptop — but a queue big enough to cover its holes.
+//   - every poll: stalled(now) → may the output be fed silence now?
+//   - when audio arrives: onData(now, seconds of audio that arrived in this poll)
+//     returns true if the hole before it was a lump (late audio caught up); holeSec() then grows
+
+class SourceWatch
+{
+public:
+    void prepare(double packetSec)
+    {
+        packet_ = std::max(0.0005, packetSec);
+        hole_ = 0.0;
+        lastData_ = -1e9;
+        lastLump_ = -1e9;
+        lumps_ = 0;
+    }
+
+    /// Longest lump hole seen recently (seconds), 0 if the source is steady.
+    double holeSec() const { return hole_; }
+    uint64_t lumps() const { return lumps_; }
+    double lastData() const { return lastData_; }
+
+    /// No audio for longer than the source's usual holes: it has stopped, feed silence.
+    bool stalled(double now) const
+    {
+        return lastData_ > -1e8 && now - lastData_ > 3.0 * packet_ + 0.003 + 1.5 * hole_;
+    }
+
+    /// Audio arrived at `now`: `seconds` of it in this poll. Returns true if it ended a lump hole.
+    bool onData(double now, double seconds)
+    {
+        bool lump = false;
+        if (lastData_ > -1e8)
+        {
+            const double gap = now - lastData_;
+            // a hole long enough to count as a stop, followed by at least half of it in one go: late, not absent
+            if (gap > 3.0 * packet_ + 0.003 && seconds >= 0.5 * gap)
+            {
+                lump = true;
+                ++lumps_;
+                hole_ = std::min(kMaxHole, std::max(hole_, gap));
+                lastLump_ = now;
+            }
+        }
+        // a steady source again for 30 s: forget the holes slowly
+        if (hole_ > 0.0 && now - lastLump_ > 30.0) { hole_ = 0.0; lastLump_ = now; }
+        lastData_ = now;
+        return lump;
+    }
+
+    static constexpr double kMaxHole = 0.060;
+
+private:
+    double packet_ = 0.00267, hole_ = 0.0, lastData_ = -1e9, lastLump_ = -1e9;
+    uint64_t lumps_ = 0;
 };
 
 // ---------------------------------------------------------------------------------------------------------

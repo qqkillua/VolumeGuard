@@ -454,6 +454,8 @@ private:
         vga::OutputPacer pacer;
         const double packetOut = srcPeriodMs * outRate / 1000.0;
         pacer.prepare(outRate, outPeriod, packetOut, 2.0);
+        vga::SourceWatch watch;   // stopped (feed silence) or only late in lumps (wait for it): see Bridge.hpp
+        watch.prepare(srcPeriodMs / 1000.0);
         vga::Processor proc;
         proc.prepare(outRate);
         vga::Params params = currentParams();
@@ -478,8 +480,9 @@ private:
         if (first) { firstResult_ = VG_OK; SetEvent(readyEvent_); }
 
         const double t0 = nowSec();
-        double lastPoll = t0, lastData = t0, quietUntil = t0 + 1.0, lastGlitchLog = -1e9, waitSmooth = 0.0;
+        double lastPoll = t0, quietUntil = t0 + 1.0, lastGlitchLog = -1e9, waitSmooth = 0.0, lastLumpLog = -1e9;
         bool produced = false;
+        bool silenced = false;   // silence was put into the output since the last audio: fade the next one in
         // joins in the source: a gap Windows reports (DATA_DISCONTINUITY) or sound coming back after silence
         float lastL = 0.0f, lastR = 0.0f;
         uint64_t packets = 0, gaps = 0, resumes = 0;
@@ -511,7 +514,9 @@ private:
             }
 
             // 1. everything the source played since the last poll
-            bool wasStalled = produced && now - lastData > 3.0 * srcPeriodMs / 1000.0 + 0.003;
+            bool wasStalled = silenced;
+            const double silentFor = now - watch.lastData();
+            UINT32 polledFrames = 0;
             for (;;)
             {
                 UINT32 next = 0;
@@ -549,7 +554,7 @@ private:
                             {
                                 lastResumeLog = now;
                                 logLine("source: sound again after %.0f ms of nothing (%llu times so far), faded in",
-                                        1000.0 * (now - lastData), (unsigned long long)resumes);
+                                        1000.0 * silentFor, (unsigned long long)resumes);
                             }
                         }
                         wasStalled = false;
@@ -558,17 +563,29 @@ private:
                     lastR = lr[(size_t)frames * 2 - 1];
                     ++packets;
                     ring_.write(lr.data(), frames, now);
-                    lastData = now;
+                    polledFrames += frames;
+                    silenced = false;
                 }
                 if (FAILED(hr = capture_->ReleaseBuffer(frames))) break;
             }
             if (FAILED(hr)) { logLine("source failed: 0x%08lX", (unsigned long)hr); break; }
+            if (polledFrames > 0 && watch.onData(now, (double)polledFrames / srcRate))
+            {
+                // the source was only late: make the output queue big enough to cover such holes
+                pacer.setPacketFrames(watch.holeSec() * outRate);
+                if (now - lastLumpLog > 10.0)
+                {
+                    lastLumpLog = now;
+                    logLine("source delivers in lumps (%llu so far): up to %.0f ms of nothing, then all of it; keeping %.1f ms queued",
+                            (unsigned long long)watch.lumps(), 1000.0 * watch.holeSec(), pacer.targetMs());
+                }
+            }
 
             // 2. how much the output still has queued
             UINT32 padding = 0;
             if (FAILED(hr = renClient->GetCurrentPadding(&padding))) { logLine("output: GetCurrentPadding 0x%08lX", (unsigned long)hr); break; }
 
-            const bool stalled = now - lastData > 3.0 * srcPeriodMs / 1000.0 + 0.003;
+            const bool stalled = watch.stalled(now);
 
             // Right after the device took its period the queue is at its lowest: the safety check.
             if (pulled)
@@ -607,6 +624,7 @@ private:
                     n = (int)std::min<UINT32>(want - padding, (UINT32)l.size());
                     std::fill(l.begin(), l.begin() + n, 0.0f);
                     std::fill(r.begin(), r.begin() + n, 0.0f);
+                    silenced = true;
                 }
                 quietUntil = now + 0.3;
                 state_.store(VG_STATE_BUFFERING);
