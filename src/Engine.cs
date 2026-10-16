@@ -1006,7 +1006,10 @@ namespace VolumeGuard
             // (only when limiting every peak: the other modes let short peaks through on purpose)
             // (only the streams on the window's device: the device volume does not act on the other devices)
             if (inPeakMain > 4f) inPeakMain = 4f;
-            if (s.Enabled && a.LimitOn && s.AntiClick && HardwareVolume && s.LimitMode == 0 && inPeakMain >= Limiter.Gate)
+            // (not on the device the sound processing records the game from: pulling its volume down would only
+            // make the processed game sound dip — the processing has its own limiter that catches every peak)
+            bool procSource = s.ProcOn && devId != null && devId == s.ProcSource;
+            if (s.Enabled && a.LimitOn && s.AntiClick && HardwareVolume && !procSource && s.LimitMode == 0 && inPeakMain >= Limiter.Gate)
             {
                 float applied = -1f;
                 foreach (var w in a.Sessions)

@@ -350,10 +350,11 @@ public:
     {
         rate_ = outRate;
         period_ = std::max(1.0, periodFrames);
-        packet_ = std::max(0.0, packetFrames);
+        packet_ = basePacket_ = std::max(0.0, packetFrames);
         floor_ = floorMs * outRate / 1000.0;
         target_ = floor_ + 0.5 * (period_ + packet_) + 0.001 * outRate;
-        minTarget_ = floor_ + 0.5 * period_;
+        // never below what the worst moment needs: a whole packet arriving just after the device took its period
+        minTarget_ = floor_ + 0.5 * (period_ + packet_);
         maxTarget_ = maxTargetMs * outRate / 1000.0;
         window_ = 0.1;
         reset();
@@ -361,7 +362,7 @@ public:
 
     void reset()
     {
-        integ_ = corr_ = want_ = 0.0;
+        integ_ = corr_ = want_ = ramp_ = giveBack_ = 0.0;
         sumQ_ = sumT_ = 0.0;
         smooth_ = target_;
         primed_ = false;
@@ -390,23 +391,33 @@ public:
             if (std::fabs(unclamped) < kMax)
                 integ_ = std::max(-kMax / kI, std::min(kMax / kI, integ_ + err * d));
             want_ = std::max(-kMax, std::min(kMax, kP * err + kI * integ_));
+            ramp_ = std::fabs(want_ - corr_) / window_;   // get there within one window, in a straight line
 
             lowSec_ += d;
             if (lowSec_ > 20.0)
             {
                 // 20 s in which the queue never came near the floor: the margin is more than needed. Give back
-                // a quarter of what was never used (0.5…2 ms at a time, gently for the speed correction),
-                // so a one-off raise does not stay for ever.
+                // a quarter of what was never used, 0.5…1 ms at a time. Slowly on purpose: with two clocks
+                // drifting apart, the worst moment (a packet just missing a period) comes round only every few
+                // minutes, so 20 calm seconds do not prove much (2.8.0 gave back up to 2 ms and then ran dry).
+                // The margin glides down (kGiveBackPerSec), it does not step: a step every 20 s, about the
+                // period of the speed control itself, kept it swinging by up to ±0.4 % (heard as a slight warble).
                 const double unused = lowSince_ - floor_ - 0.002 * rate_;
                 if (unused > 0.0 && target_ > minTarget_)
-                    target_ = std::max(minTarget_, target_ - std::min(0.002 * rate_, std::max(0.0005 * rate_, 0.25 * unused)));
+                    giveBack_ += std::min(0.001 * rate_, std::max(0.0005 * rate_, 0.25 * unused));
                 lowSince_ = 1e18;
                 lowSec_ = 0.0;
             }
         }
-        // the speed glides to the wanted one (every poll, at most kSlewPerSec) instead of jumping once per
-        // window: catching up after a hiccup bends the pitch smoothly
-        const double step = kSlewPerSec * dt;
+        if (giveBack_ > 0.0)
+        {
+            const double g = std::min(giveBack_, kGiveBackPerSec * rate_ * dt);
+            target_ = std::max(minTarget_, target_ - g);
+            giveBack_ = target_ > minTarget_ ? giveBack_ - g : 0.0;
+        }
+        // the speed glides to the wanted one within a window (every poll) instead of jumping once per window:
+        // the pitch bends smoothly. (2.8.0 limited it to 0.3 %/s: that lag made the control swing to ±0.5 %.)
+        const double step = ramp_ * dt;
         corr_ += std::max(-step, std::min(step, want_ - corr_));
         return corr_;
     }
@@ -439,13 +450,22 @@ public:
         return false;
     }
 
-    /// The source turned out to deliver in bigger lumps than its packet size (see SourceWatch): the queue must
-    /// cover a whole lump. Only grows the target (the 20 s check lowers it again if it is not needed).
+    /// The source delivers in bigger lumps than its packet size (see SourceWatch): the queue must cover a whole
+    /// lump. Grows the target at once; when the lumps are over (0 or less than the packet), only the lowest
+    /// allowed target comes back down, and the 20 s check lets the margin glide down.
     void setPacketFrames(double packetFrames)
     {
-        if (packetFrames <= packet_) return;
+        packetFrames = std::max(basePacket_, packetFrames);
+        if (packetFrames < packet_)
+        {
+            // the lumps are over: the floor of the margin comes down again (the margin itself glides down)
+            packet_ = packetFrames;
+            minTarget_ = floor_ + 0.5 * (period_ + packet_);
+            return;
+        }
+        if (packetFrames == packet_) return;
         packet_ = packetFrames;
-        minTarget_ = floor_ + 0.5 * period_;
+        minTarget_ = floor_ + 0.5 * (period_ + packet_);
         target_ = std::min(maxTarget_, std::max(target_, floor_ + 0.5 * (period_ + packet_) + 0.001 * rate_));
         lowSince_ = 1e18;
         lowSec_ = 0.0;
@@ -456,6 +476,7 @@ public:
     double excess() const { return primed_ ? smooth_ - target_ : 0.0; }
     double targetFrames() const { return target_; }
     double targetMs() const { return target_ * 1000.0 / rate_; }
+    double maxTargetFrames() const { return maxTarget_; }
     double floorFrames() const { return floor_; }
     double correction() const { return corr_; }
     uint64_t glitches() const { return glitches_; }
@@ -463,20 +484,22 @@ public:
     void settle(double removedFrames) { smooth_ -= removedFrames; integ_ = 0.0; }
 
     static constexpr double kMax = 0.005;
-    static constexpr double kSlewPerSec = 0.003;   // 0.3 % per second
     static constexpr double kP = 0.54, kI = 0.09;
+    static constexpr double kGiveBackPerSec = 0.00005;   // the margin shrinks by at most 0.05 ms per second
 
 private:
     void raise(double sec)
     {
+        giveBack_ = 0.0;
         target_ = std::min(maxTarget_, target_ + sec * rate_);
         lastRaise_ = clock_;
         lowSince_ = 1e18;
         lowSec_ = 0.0;
     }
 
+    double basePacket_ = 128;
     double rate_ = 48000, period_ = 480, packet_ = 128, floor_ = 96, target_ = 500, minTarget_ = 336, maxTarget_ = 2880;
-    double window_ = 0.1, integ_ = 0, corr_ = 0, want_ = 0, sumQ_ = 0, sumT_ = 0, smooth_ = 0;
+    double window_ = 0.1, integ_ = 0, corr_ = 0, want_ = 0, ramp_ = 0, giveBack_ = 0, sumQ_ = 0, sumT_ = 0, smooth_ = 0;
     double lowSince_ = 1e18, lowSec_ = 0, lastRaise_ = -1e9, clock_ = 0;
     bool primed_ = false;
     uint64_t glitches_ = 0, dips_ = 0;
@@ -501,6 +524,8 @@ public:
         lastData_ = -1e9;
         lastLump_ = -1e9;
         lumps_ = 0;
+        recentPos_ = 0;
+        recent_[0] = recent_[1] = recent_[2] = -1e9;
     }
 
     /// Longest lump hole seen recently (seconds), 0 if the source is steady.
@@ -514,20 +539,28 @@ public:
         return lastData_ > -1e8 && now - lastData_ > 3.0 * packet_ + 0.003 + 1.5 * hole_;
     }
 
-    /// Audio arrived at `now`: `seconds` of it in this poll. Returns true if it ended a lump hole.
-    bool onData(double now, double seconds)
+    /// Audio arrived at `now`: `seconds` of it in this poll. ourGap: how long our own thread had not looked
+    /// before this poll — if WE were late (the system was busy), the hole is ours, not the source's.
+    /// Returns true if it ended a lump hole and the source is known to come in lumps (holeSec() then grows).
+    bool onData(double now, double seconds, double ourGap = 0.0)
     {
         bool lump = false;
         if (lastData_ > -1e8)
         {
             const double gap = now - lastData_;
-            // a hole long enough to count as a stop, followed by at least half of it in one go: late, not absent
-            if (gap > 3.0 * packet_ + 0.003 && seconds >= 0.5 * gap)
+            // a hole long enough to count as a stop, followed by at least half of it in one go: late, not absent.
+            // Only a pattern counts (3 such holes within a second): one long hole is a hiccup, not the source's way.
+            if (gap > 3.0 * packet_ + 0.003 && seconds >= 0.5 * gap && ourGap < 0.008)
             {
-                lump = true;
                 ++lumps_;
-                hole_ = std::min(kMaxHole, std::max(hole_, gap));
-                lastLump_ = now;
+                recent_[recentPos_++ % 3] = now;
+                const bool pattern = recentPos_ >= 3 && now - std::min(recent_[0], std::min(recent_[1], recent_[2])) < 1.0;
+                if (pattern)
+                {
+                    lump = true;
+                    hole_ = std::min(kMaxHole, std::max(hole_, gap));
+                    lastLump_ = now;
+                }
             }
         }
         // a steady source again for 30 s: forget the holes slowly
@@ -540,6 +573,8 @@ public:
 
 private:
     double packet_ = 0.00267, hole_ = 0.0, lastData_ = -1e9, lastLump_ = -1e9;
+    double recent_[3] = { -1e9, -1e9, -1e9 };
+    unsigned recentPos_ = 0;
     uint64_t lumps_ = 0;
 };
 

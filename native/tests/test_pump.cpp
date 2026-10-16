@@ -142,7 +142,7 @@ static Res run(double capMs, double perMs, double ppm, double seconds, unsigned 
             // what arrived since the last poll (the engine reads it from the capture client here)
             if (written > lastWritten)
             {
-                if (watch.onData(t, (double)(written - lastWritten) / rate))
+                if (watch.onData(t, (double)(written - lastWritten) / rate, t - lastPoll))
                     pacer.setPacketFrames(watch.holeSec() * rate);
                 lastWritten = written;
             }
@@ -152,14 +152,16 @@ static Res run(double capMs, double perMs, double ppm, double seconds, unsigned 
                 eventPending = false;
                 if (pacer.onPull(q, produced && !stalled && t > quietUntil, t - lastPoll > 0.008)) ++res.lates;
             }
-            const double corr = pacer.update(q, t - lastPoll);
+            const double corr = pacer.update(q + rs.pendingInput(ring), t - lastPoll);   // whole wait
             lastPoll = t;
             if (pacer.excess() > 0.020 * rate)
             {
                 const double drop = std::min(rs.pendingInput(ring), pacer.excess());
                 if (drop > 0) { rs.skipInput(ring, (size_t)drop); pacer.settle(drop); }
             }
-            const int n = rs.produce(ring, l.data(), r.data(), 4096, corr);
+            // the device buffer is ~2.2 periods (1056 frames at 10 ms, 280 at 2.67 ms): the rest waits in the ring
+            const int room = std::max(0, (int)std::ceil(2.2 * period) - (int)queue.size());
+            const int n = rs.produce(ring, l.data(), r.data(), std::min(4096, room), corr);
             for (int i = 0; i < n; ++i) queue.push_back(l[i]);
             if (stalled && produced)
             {
@@ -175,7 +177,7 @@ static Res run(double capMs, double perMs, double ppm, double seconds, unsigned 
             if (n > 0) produced = true;
             if (n > 0 && t > 3.0)
             {
-                const double w = 1000.0 * (double)queue.size() / rate;   // the newest sample waits this long
+                const double w = 1000.0 * ((double)queue.size() + rs.pendingInput(ring)) / rate;   // the newest sample waits this long
                 waitSum += w; ++waitN;
                 res.maxWaitMs = std::max(res.maxWaitMs, w);
             }

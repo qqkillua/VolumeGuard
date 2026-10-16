@@ -5,6 +5,8 @@
 //   - the game pauses its sound for 5 s every 7 minutes
 //   - the computer sleeps for 30 s at 30:00 (nothing runs, then everything continues)
 //   - our thread is 40 ms late once a minute, and 4 ms late now and then
+//   - three times the whole program stops for 0.3 s (the game loads a level and takes every core)
+// The device queue is as small as a real one (1056 frames, ~22 ms): what does not fit waits in the ring.
 // Checked: nothing grows without bound (queue, ring, margin), the sound recovers after every event,
 // few glitches outside the events, no NaN, clean sound at the end. Same code paths as Engine.cpp.
 // Build: g++ -O2 -std=c++17 -Isrc tests/test_soak.cpp
@@ -37,6 +39,8 @@ int main()
         if (m >= 400.0 && m < 406.0) return true;                                  // pause + 1 s
         if (t >= sleepAt - 0.01 && t < sleepAt + sleepFor + 2.0) return true;      // sleep + 2 s
         for (double e : { 600.0, 1200.0, 2400.0, 3000.0 }) if (t >= e && t < e + 2.0) return true;   // lumps start/stop
+        for (double e : { 900.0, 2000.0, 3300.0 }) if (t >= e && t < e + 3.0) return true;         // 0.3 s stalls
+        if (t > 60.0 && std::fmod(t, 60.0) < 0.3) return true;                                     // 40 ms hiccups
         return false;
     };
 
@@ -50,12 +54,18 @@ int main()
     std::vector<float> lr((size_t)capFrames * 2), l(4096), r(4096), tail;
     uint64_t sample = 0, written = 0, lastWritten = 0, pulls = 0;
     double srcPos = 0;                        // source clock, in its own frames
+    double srcIdeal = capFrames / rate;       // when the next packet is due on the source's own (drifting) clock
     double tCap = capFrames / rate, tPull = 0.0013 + period / rate, tPoll = 0.001, lastPoll = 0, quietUntil = 0;
     int held = 0, glitches = 0, glitchesNearEvents = 0, lateHiccups = 0;
     bool produced = false, eventPending = false, nan = false;
     double maxWaitLate = 0, waitSumLast = 0, maxRing = 0, maxTarget = 0, silenceMs = 0;
     long waitNLast = 0;
     double nextHiccup = 60.0;
+    const int bufFrames = 1056;               // the device buffer: what does not fit stays in the ring
+    std::vector<double> stalls = { 900.0, 2000.0, 3300.0 };
+    size_t nextStall = 0;
+    int drops = 0;
+    double blockedUntil = 0;
     bool slept = false;
 
     while (tPull < hour)
@@ -65,7 +75,7 @@ int main()
         if (!slept && t >= sleepAt)
         {
             slept = true;
-            tCap += sleepFor; tPull += sleepFor; tPoll += sleepFor; lastPoll += sleepFor;
+            tCap += sleepFor; srcIdeal += sleepFor; tPull += sleepFor; tPoll += sleepFor; lastPoll += sleepFor;
             continue;
         }
         if (t == tCap)
@@ -89,7 +99,9 @@ int main()
             }
             srcPos += capFrames;
             const double srcRate = rate * (1 + ppmAt(t) * 1e-6);
-            tCap += capFrames / srcRate + (u(rng) - 0.5) * 0.0005;
+            // the clock drifts, the delivery jitters around it (±0.25 ms, not adding up)
+            srcIdeal += capFrames / srcRate;
+            tCap = srcIdeal + (u(rng) - 0.5) * 0.0005;
             if (tCap <= t) tCap = t + 1e-5;
         }
         else if (t == tPull)
@@ -108,26 +120,31 @@ int main()
             ++pulls;
             tPull += period / rate + (u(rng) - 0.5) * 0.0002;
             eventPending = true;
-            tPoll = std::min(tPoll, t + 0.00005 + u(rng) * 0.0004);
+            tPoll = std::max(blockedUntil, std::min(tPoll, t + 0.00005 + u(rng) * 0.0004));   // a stalled thread does not wake
         }
         else
         {
             const double q = (double)queue.size();
             if (written > lastWritten)
             {
-                if (watch.onData(t, (double)(written - lastWritten) / rate)) pacer.setPacketFrames(watch.holeSec() * rate);
+                if (watch.onData(t, (double)(written - lastWritten) / rate, t - lastPoll)) pacer.setPacketFrames(watch.holeSec() * rate);
                 lastWritten = written;
             }
+            if (watch.holeSec() == 0.0) pacer.setPacketFrames(0.0);
             const bool stalled = watch.stalled(t);
             if (eventPending) { eventPending = false; pacer.onPull(q, produced && !stalled && t > quietUntil, t - lastPoll > 0.008); }
-            const double corr = pacer.update(q, std::min(0.1, t - lastPoll));
+            const double corr = pacer.update(q + rs.pendingInput(ring), std::min(0.1, t - lastPoll));   // whole wait
             lastPoll = t;
-            if (pacer.excess() > 0.020 * rate)
+            // as Engine.cpp: drop late input from the device queue's excess and from the ring's backlog
             {
-                const double drop = std::min(rs.pendingInput(ring), pacer.excess());
-                if (drop > 0) { rs.skipInput(ring, (size_t)drop); pacer.settle(drop); }
+                const double pending = rs.pendingInput(ring);
+                double drop = 0.0;
+                if (pacer.excess() > 0.020 * rate) { drop = std::min(pending, pacer.excess()); pacer.settle(drop); }
+                if (pending - drop > pacer.maxTargetFrames()) drop = pending - pacer.maxTargetFrames();
+                if (drop >= 1.0) { rs.skipInput(ring, (size_t)drop); ++drops; }
             }
-            const int n = rs.produce(ring, l.data(), r.data(), 4096, corr);
+            const int room = std::max(0, bufFrames - (int)queue.size());
+            const int n = rs.produce(ring, l.data(), r.data(), std::min(4096, room), corr);
             for (int i = 0; i < n; ++i) queue.push_back(l[i]);
             if (n == 0 && stalled && produced)
             {
@@ -141,13 +158,15 @@ int main()
             if (n > 0 && !produced) { produced = true; quietUntil = t + 1.0; }
             maxRing = std::max(maxRing, (double)ring.fill() / rate * 1000.0);
             maxTarget = std::max(maxTarget, pacer.targetMs());
-            const double w = 1000.0 * queue.size() / rate;
+            const double w = 1000.0 * (queue.size() + rs.pendingInput(ring)) / rate;   // device queue + ring backlog
             if (t > 60.0 && !nearEvent(t)) maxWaitLate = std::max(maxWaitLate, w);
             if (t > hour - 600.0 && n > 0) { waitSumLast += w; ++waitNLast; }
             // our thread: usually ~1 ms, sometimes 4 ms late, once a minute 40 ms late (a hiccup)
             double next = t + 0.001 + (u(rng) < 0.002 ? 0.004 : u(rng) * 0.0004);
             if (t >= nextHiccup) { next += 0.040; nextHiccup += 60.0; ++lateHiccups; }
+            if (nextStall < stalls.size() && t >= stalls[nextStall]) { next += 0.300; ++nextStall; }
             tPoll = next;
+            blockedUntil = next;
         }
     }
 
@@ -184,6 +203,7 @@ int main()
     const double snr = 10 * std::log10(sig / (noise + 1e-30));
     const double avgLast = waitSumLast / std::max(1L, waitNLast);
 
+    std::printf("late input dropped %d times\n", drops);
     std::printf("1 h soak: glitches %d (+%d right after events), silence put in while only late %.0f ms, %d hiccups of 40 ms\n",
                 glitches, glitchesNearEvents, silenceMs, lateHiccups);
     std::printf("          queue max %.1f ms (outside events), last 10 min avg %.1f ms, ring max %.1f ms, margin max %.1f ms, "
@@ -192,7 +212,7 @@ int main()
     CHECK(!nan, "NaN in the output");
     CHECK(glitches <= 60, "%d glitches outside the events in an hour", glitches);   // 40 ms hiccups may cost one each
     CHECK(silenceMs < 200.0, "%.0f ms of silence put in while the source was only late", silenceMs);
-    CHECK(maxWaitLate < 70.0, "queue reached %.1f ms", maxWaitLate);
+    CHECK(maxWaitLate < 80.0, "queue reached %.1f ms", maxWaitLate);   // in the lumpy stretches: a 20 ms hole on top of the margin
     CHECK(avgLast < 30.0, "queue at the end %.1f ms on average: it kept growing", avgLast);
     CHECK(maxRing < 200.0, "ring reached %.1f ms", maxRing);
     CHECK(maxTarget <= 60.0 + 1e-6, "margin reached %.1f ms", maxTarget);

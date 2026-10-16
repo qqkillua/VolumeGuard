@@ -510,6 +510,10 @@ private:
         double lastPoll = t0, quietUntil = t0 + 1.0, lastGlitchLog = -1e9, waitSmooth = 0.0, lastLumpLog = -1e9;
         bool produced = false;
         bool silenced = false;   // silence was put into the output since the last audio: fade the next one in
+        bool rejoin = false;     // late sound was dropped: crossfade into what comes next
+        float lastProdL = 0.0f, lastProdR = 0.0f;
+        uint64_t drops = 0;
+        double droppedMs = 0.0, lastDropLog = -1e9;
         // joins in the source: a gap Windows reports (DATA_DISCONTINUITY) or sound coming back after silence
         float lastL = 0.0f, lastR = 0.0f;
         uint64_t packets = 0, gaps = 0, resumes = 0;
@@ -596,7 +600,7 @@ private:
                 if (FAILED(hr = capture_->ReleaseBuffer(frames))) break;
             }
             if (FAILED(hr)) { logLine("source failed: 0x%08lX", (unsigned long)hr); break; }
-            if (polledFrames > 0 && watch.onData(now, (double)polledFrames / srcRate))
+            if (polledFrames > 0 && watch.onData(now, (double)polledFrames / srcRate, dt))
             {
                 // the source was only late: make the output queue big enough to cover such holes
                 pacer.setPacketFrames(watch.holeSec() * outRate);
@@ -612,6 +616,7 @@ private:
             UINT32 padding = 0;
             if (FAILED(hr = renClient->GetCurrentPadding(&padding))) { logLine("output: GetCurrentPadding 0x%08lX", (unsigned long)hr); break; }
 
+            if (watch.holeSec() == 0.0) pacer.setPacketFrames(0.0);   // lumps forgotten: let the margin come down
             const bool stalled = watch.stalled(now);
 
             // Right after the device took its period the queue is at its lowest: the safety check.
@@ -628,13 +633,40 @@ private:
                 }
                 lastDips = pacer.dips();
             }
-            const double corr = pacer.update((double)padding, dt);
+            // The pacer keeps the WHOLE wait steady: the device queue plus the input still in the ring. The device
+            // buffer can be small (~6 ms on a low-latency output, ~22 ms on a 10 ms one); a bigger margin then has
+            // to wait in the ring. In 2.8.0 it watched the device queue alone: a margin bigger than the device
+            // buffer could hold could never be reached, so it slowed the sound down for ever and the ring grew to ~0.9 s.
+            const double pendingOut = rs.pendingInput(ring_) * (double)outRate / srcRate;
+            const double corr = pacer.update((double)padding + pendingOut, dt);
 
-            // far too much queued (e.g. after the system hung for a moment): drop input not queued yet
-            if (pacer.excess() > 0.020 * outRate)
+            // Far too much waiting (the system hung for a moment, the game loaded a level): drop the oldest input
+            // so the delay does not stay (excess counts the device queue and the ring together).
             {
-                const double drop = std::min(rs.pendingInput(ring_), pacer.excess());
-                if (drop > 0) { rs.skipInput(ring_, (size_t)drop); pacer.settle(drop); }
+                const double inPerOut = (double)srcRate / outRate;
+                const double pending = rs.pendingInput(ring_);
+                double drop = 0.0;
+                if (pacer.excess() > 0.020 * outRate)
+                {
+                    drop = std::min(pending, pacer.excess() * inPerOut);
+                    pacer.settle(drop / inPerOut);
+                }
+                // and a hard limit, whatever the pacer thinks: never more than its biggest margin in the ring
+                const double hardIn = pacer.maxTargetFrames() * inPerOut;
+                if (pending - drop > hardIn) drop = pending - hardIn;
+                if (drop >= 1.0)
+                {
+                    rs.skipInput(ring_, (size_t)drop);
+                    rejoin = true;   // crossfade over the jump
+                    droppedMs += 1000.0 * drop / srcRate;
+                    ++drops;
+                    if (now - lastDropLog > 10.0)
+                    {
+                        lastDropLog = now;
+                        logLine("caught up: dropped %.0f ms of late sound (%llu times, %.0f ms in all) to keep the delay short",
+                                1000.0 * drop / srcRate, (unsigned long long)drops, droppedMs);
+                    }
+                }
             }
 
             // 3. turn everything that arrived into output, process, queue
@@ -642,6 +674,23 @@ private:
             if (p != params) { params = p; proc.setParams(p); }
             const UINT32 room = renFrames - std::min(renFrames, padding);
             int n = rs.produce(ring_, l.data(), r.data(), (int)std::min<UINT32>(room, (UINT32)l.size()), corr);
+            if (n > 0)
+            {
+                // after dropping late sound: glide from the last sample played to the new one over 2 ms
+                if (rejoin)
+                {
+                    const int ramp = std::min(n, (int)(outRate * 0.002));
+                    for (int i = 0; i < ramp; ++i)
+                    {
+                        const float w = 0.5f - 0.5f * std::cos(3.14159265f * (float)(i + 1) / (float)ramp);
+                        l[i] = lastProdL + (l[i] - lastProdL) * w;
+                        r[i] = lastProdR + (r[i] - lastProdR) * w;
+                    }
+                    rejoin = false;
+                }
+                lastProdL = l[n - 1];
+                lastProdR = r[n - 1];
+            }
             if (n == 0 && produced && stalled)
             {
                 // the source sends nothing (no keep-alive and the game is quiet): keep the output fed with
@@ -653,6 +702,7 @@ private:
                     std::fill(l.begin(), l.begin() + n, 0.0f);
                     std::fill(r.begin(), r.begin() + n, 0.0f);
                     silenced = true;
+                    lastProdL = lastProdR = 0.0f;
                 }
                 quietUntil = now + 0.3;
                 state_.store(VG_STATE_BUFFERING);
@@ -707,7 +757,9 @@ private:
                     }
                     else if (srcMode_ == 1 && trialScore0_ >= 0.0)
                     {
-                        const int best = score < trialScore0_ - 1.0 ? 1 : 0;
+                        // normal packets only if clearly faster: they make the worst moment (a packet just missing
+                        // the output's period) longer, which the short trial may not have seen yet
+                        const int best = score < trialScore0_ - 3.0 ? 1 : 0;
                         srcChoice_[sourceId_] = best;
                         logLine("source mode: normal packets %.1f ms, small packets %.1f ms: keeping %s", score, trialScore0_,
                                 best ? "normal packets" : "small packets");
@@ -764,10 +816,10 @@ private:
 
         const int kBeeps = 5;
         const double kGap = 0.4;                                     // s between beeps
-        const int beepFrames = (int)(pRate * 0.003);                 // 3 ms of 2 kHz at -10 dBFS
+        const int beepFrames = (int)(pRate * 0.004);                 // 4 ms of 2 kHz at -6 dBFS
         std::vector<double> beepAt;                                  // when each beep starts playing (s, QPC)
         std::vector<float> lr, l(4096), r(4096);
-        std::vector<float> recLevel;                                 // what the output played: |level| per frame
+        std::vector<float> recLevel;                                 // what the output played (L+R)/2 per frame
         std::vector<double> recTime;                                 // ... and when (s, QPC)
         recLevel.reserve((size_t)(cRate * 3.0));
         recTime.reserve((size_t)(cRate * 3.0));
@@ -795,7 +847,7 @@ private:
                     if (beepsSent < kBeeps && el > 0.3 + beepsSent * kGap && (int)n >= beepFrames)
                     {
                         for (int i = 0; i < beepFrames; ++i)
-                            l[i] = r[i] = 0.316f * (float)std::sin(2.0 * 3.14159265358979 * 2000.0 * i / pRate);
+                            l[i] = r[i] = 0.5f * (float)std::sin(2.0 * 3.14159265358979 * 2000.0 * i / pRate);
                         // the device position tells when frame `written` will play
                         UINT64 pos = 0, qpc = 0;
                         if (SUCCEEDED(clock->GetPosition(&pos, &qpc)))
@@ -829,7 +881,7 @@ private:
                 else vga::toStereo(d, frames, cFmt, lr.data());
                 for (UINT32 i = 0; i < frames; ++i)
                 {
-                    recLevel.push_back(std::max(std::fabs(lr[2 * i]), std::fabs(lr[2 * i + 1])));
+                    recLevel.push_back(0.5f * (lr[2 * i] + lr[2 * i + 1]));
                     recTime.push_back(qpc * qpcScale + i / cRate);
                 }
                 rec->ReleaseBuffer(frames);
@@ -838,19 +890,35 @@ private:
         player->Stop();
         recorder->Stop();
 
-        // each beep: the first sample clearly above what played just before it, within 300 ms
+        // Each beep: where the recording matches a 4 ms 2 kHz tone best (correlation with the tone, whatever its
+        // phase), within 300 ms after it was played. It must stand out from the same measure just before
+        // (the game's own sound): a matched filter finds the beep under loud game sound, a level threshold did not.
+        const int N = std::max(16, (int)(cRate * 0.004));
+        std::vector<float> cs((size_t)N), sn((size_t)N);
+        for (int k = 0; k < N; ++k)
+        {
+            cs[(size_t)k] = (float)std::cos(2.0 * 3.14159265358979 * 2000.0 * k / cRate);
+            sn[(size_t)k] = (float)std::sin(2.0 * 3.14159265358979 * 2000.0 * k / cRate);
+        }
+        auto match = [&](size_t i) {
+            double re = 0.0, im = 0.0;
+            for (int k = 0; k < N; ++k) { re += recLevel[i + (size_t)k] * cs[(size_t)k]; im += recLevel[i + (size_t)k] * sn[(size_t)k]; }
+            return std::sqrt(re * re + im * im) * 2.0 / N;   // ≈ the amplitude of a 2 kHz tone filling the window
+        };
         std::vector<double> found;
         size_t from = 0;
         for (double at : beepAt)
         {
             while (from < recTime.size() && recTime[from] < at - 0.15) ++from;
-            double sum = 0.0;
-            size_t i = from, n = 0;
-            for (; i < recTime.size() && recTime[i] < at; ++i, ++n) sum += (double)recLevel[i] * recLevel[i];
-            const double bg = n ? std::sqrt(sum / n) : 0.0;
-            const float thr = (float)std::max(0.01, 6.0 * bg);    // -40 dBFS, or well above the game's sound
-            for (; i < recTime.size() && recTime[i] < at + 0.3; ++i)
-                if (recLevel[i] > thr) { found.push_back(1000.0 * (recTime[i] - at)); break; }
+            double before = 0.0, best = 0.0;
+            size_t i = from, bestAt = 0;
+            for (; i + (size_t)N < recTime.size() && recTime[i] < at - 0.005; i += 4) before = std::max(before, match(i));
+            for (; i + (size_t)N < recTime.size() && recTime[i] < at + 0.3; ++i)
+            {
+                const double m = match(i);
+                if (m > best) { best = m; bestAt = i; }
+            }
+            if (best > 0.01 && best > 3.0 * before) found.push_back(1000.0 * (recTime[bestAt] - at));
         }
         *valid = (int)found.size();
         if (found.size() < 3)
