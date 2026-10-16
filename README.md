@@ -179,6 +179,7 @@ build.cmd
 | `src/Processing.cs` | Окно «Обработка звука» и связь с `vgaudio.dll` |
 | `src/AssemblyInfo.cs` | Название и версия программы |
 | `native/` | Звуковой движок `vgaudio.dll` (C++, WASAPI) и его тесты |
+| `tests/LimiterTests.cs` | Тесты лимитера приложений и чтения настроек (запускаются при каждой сборке) |
 
 ## Настройки
 

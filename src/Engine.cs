@@ -130,7 +130,13 @@ namespace VolumeGuard
 
         static string B(bool b) { return b ? "1" : "0"; }
         static string F(float f) { return f.ToString("0.####", IC); }
-        static float PF(string s, float def) { float f; return float.TryParse(s, NumberStyles.Float, IC, out f) ? f : def; }
+        /// A number from settings.txt; anything unreadable, NaN or infinite gives the default.
+        static float PF(string s, float def)
+        {
+            float f;
+            return float.TryParse(s, NumberStyles.Float, IC, out f) && !float.IsNaN(f) && !float.IsInfinity(f) ? f : def;
+        }
+        static float LimitOf(string s) { return Math.Max(Db.MinDb, Math.Min(0f, PF(s, -12f))); }
         static string Clean(string s) { return (s ?? "").Replace("|", "/").Replace("\r", " ").Replace("\n", " "); }
 
         public static Settings Load()
@@ -147,7 +153,19 @@ namespace VolumeGuard
                     path = old;
                     s.Dirty = true;
                 }
-                foreach (var line in File.ReadAllLines(path, Encoding.UTF8))
+                s.ParseLines(File.ReadAllLines(path, Encoding.UTF8));
+            }
+            catch { }
+            return s;
+        }
+
+        /// Reads the lines of settings.txt into this object. One bad line does not spoil the others.
+        public void ParseLines(IEnumerable<string> lines)
+        {
+            var s = this;
+            foreach (var line in lines)
+            {
+                try
                 {
                     var p = line.Split(new[] { '|' });
                     if (p.Length < 2) continue;
@@ -181,7 +199,7 @@ namespace VolumeGuard
                             if (p.Length < 5) break;
                             s.Master.UserVol = Db.Clamp(PF(p[1], 0.5f));
                             s.Master.LimitOn = p[2] == "1";
-                            s.Master.LimitDb = PF(p[3], -12f);
+                            s.Master.LimitDb = LimitOf(p[3]);
                             s.Master.Pending = p[4] == "1";
                             break;
                         case "app":
@@ -189,7 +207,7 @@ namespace VolumeGuard
                             var a = new AppModel
                             {
                                 Key = p[1], Title = p[2], UserVol = Db.Clamp(PF(p[3], 1f)), LimitOn = p[4] == "1",
-                                LimitDb = PF(p[5], -12f), Muted = p[6] == "1", Pending = p[7] == "1"
+                                LimitDb = LimitOf(p[5]), Muted = p[6] == "1", Pending = p[7] == "1"
                             };
                             if (p.Length > 8) a.Env = Math.Max(0f, Math.Min(1.5f, PF(p[8], 0f)));
                             a.Gain = a.UserVol;
@@ -197,9 +215,8 @@ namespace VolumeGuard
                             break;
                     }
                 }
+                catch { }   // a bad line is skipped, the rest still loads
             }
-            catch { }
-            return s;
         }
 
         public void Save()
@@ -257,6 +274,14 @@ namespace VolumeGuard
         public const double LoudnessSec = 0.4;
         /// …and single short peaks may go this far over the limit (a shot, a click) without pulling the volume down.
         public const float PeakAllowanceDb = 6f;
+
+        /// The level of an app that plays through several streams at once: they add up after mixing, so the sum
+        /// of their peaks is the honest upper bound (two equally loud streams: +6 dB). Streams below the
+        /// silence gate are left out, so idle streams do not count.
+        public static float CombinePeak(float sumSoFar, float peak)
+        {
+            return peak >= Gate ? sumSoFar + peak : Math.Max(sumSoFar, peak);
+        }
 
         /// Memory of loud sounds: decay time (s) for the settings 0 (off), 1, 2; and how far over the limit
         /// a remembered loud sound may come back.
@@ -844,7 +869,7 @@ namespace VolumeGuard
                     }
                     float p = w.Meter.GetPeakValue();
                     float lin = s.SessionMeterPost ? (cur > 1e-3f ? p / cur : 0f) : p;
-                    if (lin > inPeak) inPeak = lin;
+                    inPeak = Limiter.CombinePeak(inPeak, lin);   // several streams add up
                 }
                 catch { w.Dead = true; }
             }

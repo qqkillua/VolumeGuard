@@ -70,6 +70,14 @@ jobs:
           copy LICENSE out\LICENSE &&
           copy native-bin\vgaudio.dll out\vgaudio.dll
 
+      - name: Limiter tests
+        shell: cmd
+        run: >
+          "%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /target:exe /main:VolumeGuard.Tests.TestProgram
+          /out:LimiterTests.exe /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Core.dll
+          src\*.cs tests\LimiterTests.cs &&
+          LimiterTests.exe
+
       - name: Smoke test vgaudio.dll
         shell: pwsh
         run: |

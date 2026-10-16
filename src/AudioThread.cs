@@ -121,7 +121,7 @@ namespace VolumeGuard
                     Action a = null;
                     lock (queue) if (queue.Count > 0) a = queue.Dequeue();
                     if (a == null) break;
-                    lock (s.Sync) { try { a(); } catch { } }
+                    lock (s.Sync) { try { a(); } catch (Exception ex) { Report("command", ex); } }
                     Publish();
                 }
                 if (quit) break;
@@ -143,12 +143,29 @@ namespace VolumeGuard
                             if (inner.IsOpen && inner.RefreshSessions()) changed = true;
                         }
                     }
-                    catch { }
+                    catch (Exception ex) { Report(full ? "full step" : "fast step", ex); }
                 }
                 Publish();
             }
             try { Native.timeEndPeriod(1); } catch { }
             if (mmcss != IntPtr.Zero) { try { AvRevertMmThreadCharacteristics(mmcss); } catch { } }
+        }
+
+        // Errors are survived (a device can vanish at any moment), but written to limiter.log —
+        // each kind at most once every 10 s, so a repeating one cannot flood the file.
+        readonly Dictionary<string, DateTime> lastReport = new Dictionary<string, DateTime>();
+        readonly Dictionary<string, int> reportCount = new Dictionary<string, int>();
+
+        void Report(string where, Exception ex)
+        {
+            string key = where + ":" + ex.GetType().Name + ":" + System.Runtime.InteropServices.Marshal.GetHRForException(ex).ToString("X8");
+            int n;
+            reportCount.TryGetValue(key, out n);
+            reportCount[key] = ++n;
+            DateTime last;
+            if (lastReport.TryGetValue(key, out last) && (DateTime.UtcNow - last).TotalSeconds < 10) return;
+            lastReport[key] = DateTime.UtcNow;
+            Log.Line("error in " + where + " (" + n + " so far): " + ex.GetType().Name + " 0x" + System.Runtime.InteropServices.Marshal.GetHRForException(ex).ToString("X8") + " " + ex.Message);
         }
 
         void Publish()
