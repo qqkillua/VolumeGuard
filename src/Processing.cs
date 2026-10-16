@@ -647,10 +647,10 @@ namespace VolumeGuard
             y = AddSlider("Потолок", ceiling, ceilingVal, x, y, w);
             y = AddSlider("Усиление", gain, gainVal, x, y, w);
             amount.Value = s.ProcAmount / 100f;
-            ceiling.Value = 1f + s.ProcCeiling / 12f;
+            ceiling.Value = 1f + s.ProcCeiling / 24f;   // -24…0 dB
             gain.Value = (s.ProcGain + 12f) / 24f;
             amount.ValueChanged += delegate { s.ProcAmount = (float)Math.Round(amount.Value * 100f); OnParamsChanged(); };
-            ceiling.ValueChanged += delegate { s.ProcCeiling = (float)Math.Round(-12f * (1f - ceiling.Value) * 2f) / 2f; OnParamsChanged(); };
+            ceiling.ValueChanged += delegate { s.ProcCeiling = (float)Math.Round(-24f * (1f - ceiling.Value) * 2f) / 2f; OnParamsChanged(); };
             gain.ValueChanged += delegate { s.ProcGain = (float)Math.Round((gain.Value * 24f - 12f) * 2f) / 2f; OnParamsChanged(); };
             y += Theme.D(8);
 
