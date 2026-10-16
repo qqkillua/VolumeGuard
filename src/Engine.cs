@@ -275,6 +275,14 @@ namespace VolumeGuard
         /// …and single short peaks may go this far over the limit (a shot, a click) without pulling the volume down.
         public const float PeakAllowanceDb = 6f;
 
+        /// The lowest volume the limiter may set for an app. Windows 10/11 meters an app BEFORE its volume, so the
+        /// limiter can go all the way down to keep any limit (a 0 dBFS peak and a −40 dB limit need 1 %). Only in
+        /// the old "meter after the volume" mode it keeps 2 %, or it would no longer hear the app at all.
+        public static float Floor(float user, bool meterAfterVolume)
+        {
+            return meterAfterVolume ? Math.Min(user, 0.02f) : 0f;
+        }
+
         /// The level of an app that plays through several streams at once: they add up after mixing, so the sum
         /// of their peaks is the honest upper bound (two equally loud streams: +6 dB). Streams below the
         /// silence gate are left out, so idle streams do not count.
@@ -701,7 +709,7 @@ namespace VolumeGuard
                 // so the first sound of a freshly opened app is not played at full volume.
                 if (app.Env < Limiter.Gate) app.Env = Limiter.StartEnv;
                 if (s.Enabled && app.LimitOn)
-                    app.Gain = Math.Min(app.UserVol, Math.Max(Math.Min(app.UserVol, 0.02f), Db.ToLin(app.LimitDb) / app.Env));
+                    app.Gain = Math.Min(app.UserVol, Math.Max(Limiter.Floor(app.UserVol, s.SessionMeterPost), Db.ToLin(app.LimitDb) / app.Env));
                 app.UiVersion++;
                 s.Dirty = true;
             }
@@ -897,7 +905,7 @@ namespace VolumeGuard
             }
 
             Limiter.Step(ref a.Gain, ref a.Env, ref a.Ms, ref a.Hold, inPeak, a.UserVol, s.Enabled && a.LimitOn, a.LimitDb,
-                         Math.Min(a.UserVol, 0.02f), decay, rel, msCoef, s.LimitMode, holdDecay, attackCoef);
+                         Limiter.Floor(a.UserVol, s.SessionMeterPost), decay, rel, msCoef, s.LimitMode, holdDecay, attackCoef);
 
             foreach (var w in a.Sessions)
             {
@@ -1009,7 +1017,7 @@ namespace VolumeGuard
                 i++;
                 float burst = (float)Math.Max(0, Math.Sin(t * (0.7 + i * 0.3) + i));
                 float inPeak = a.Active ? (0.15f + 0.85f * burst * burst) * (0.6f + 0.4f * (float)rnd.NextDouble()) : 0f;
-                Limiter.Step(ref a.Gain, ref a.Env, ref a.Ms, ref a.Hold, inPeak, a.UserVol, s.Enabled && a.LimitOn, a.LimitDb, 0.02f, decay, rel, msCoef, s.LimitMode, holdDecay, attackCoef);
+                Limiter.Step(ref a.Gain, ref a.Env, ref a.Ms, ref a.Hold, inPeak, a.UserVol, s.Enabled && a.LimitOn, a.LimitDb, 0f, decay, rel, msCoef, s.LimitMode, holdDecay, attackCoef);
                 a.OutLevel = a.Muted ? 0f : inPeak * a.Gain;
                 a.DisplayPeak = Math.Max(a.DisplayPeak, a.OutLevel);
                 a.Limiting = a.Gain < a.UserVol * 0.97f;

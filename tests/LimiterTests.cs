@@ -45,7 +45,7 @@ namespace VolumeGuard.Tests
                     // the volume in effect while this packet plays is the one set before it was measured
                     float outDb = DbOf(p * Gain) - LimitDb;
                     if (p >= Limiter.Gate && outDb > MaxOverDb) MaxOverDb = outDb;
-                    Limiter.Step(ref Gain, ref Env, ref Ms, ref Hold, p, User, true, LimitDb, Math.Min(User, 0.02f),
+                    Limiter.Step(ref Gain, ref Env, ref Ms, ref Hold, p, User, true, LimitDb, Limiter.Floor(User, false),
                                  decay, rel, msCoef, Mode, holdDecay, attack);
                     if (float.IsNaN(Gain) || Gain > User + 1e-6f || Gain < 0f) throw new Exception("gain out of range: " + Gain);
                 }
@@ -64,6 +64,14 @@ namespace VolumeGuard.Tests
                 s.Run(1.0, t => Amb);
                 s.Run(2.0, t => Ad);
                 Check(Math.Abs(s.GainDb - (-6f)) < 0.3f, "peaks: steady -6 dB sound should be turned down 6 dB, got " + s.GainDb);
+            }
+
+            // 1b. Low limits are kept too: a full-scale sound with a −40 or −60 dB limit needs 1 % / 0.1 % volume.
+            foreach (float lim in new[] { -40f, -60f })
+            {
+                var s = new Sim { LimitDb = lim };
+                s.Run(1.0, t => 1f);
+                Check(DbOf(1f * s.Gain) <= lim + 0.1f, "limit " + lim + " dB: output " + DbOf(s.Gain) + " dB");
             }
 
             // 2. Return speed: time to get back to 90 % volume after a loud sound ends.
