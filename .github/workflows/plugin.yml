@@ -3,7 +3,7 @@ name: Limiter plugin
 on:
   push:
     branches: [main]
-    paths: ['plugin/**', '.github/workflows/plugin.yml']
+    paths: ['plugin/**', 'assets/app.ico', '.github/workflows/plugin.yml']
   pull_request:
     paths: ['plugin/**', '.github/workflows/plugin.yml']
   workflow_dispatch:
@@ -96,6 +96,64 @@ jobs:
           $tests = ([regex]::Matches($log, 'Completed tests in')).Count
           Write-Host "::notice title=pluginval::SUCCESS at strictness 10, $tests test groups passed (incl. editor and Steinberg vst3 validator)"
 
+      # Installer: copies VST3 / CLAP into Common Files, so nobody has to do it by hand (plugin/installer).
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress | Out-Null
+            $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) { throw "Inno Setup not found" }
+          $ver = (Get-Content plugin/VERSION -Raw).Trim()
+          & $iscc /Q "/DAppVer=$ver" "/DPkg=$((Resolve-Path pkg).Path)" "/DOutDir=$PWD" plugin/installer/VolumeGuardLimiter.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+          Get-Item VolumeGuardLimiter-Setup.exe | Format-Table Name, Length
+
+      # Install silently on the runner, check the files landed where DAWs look, load the installed VST3,
+      # then uninstall and check nothing is left. Once more with only VST3 ticked.
+      - name: Test installer
+        shell: pwsh
+        run: |
+          $vst3 = "$env:CommonProgramFiles\VST3\VolumeGuardLimiter.vst3"
+          $vst3Bin = "$vst3\Contents\x86_64-win\VolumeGuardLimiter.vst3"
+          $clap = "$env:CommonProgramFiles\CLAP\VolumeGuardLimiter.clap"
+          $uninst = "$env:ProgramFiles\VolumeGuard Limiter\unins000.exe"
+          function Install($extra) {
+            $p = Start-Process .\VolumeGuardLimiter-Setup.exe -Wait -PassThru -ArgumentList (@('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=install.log') + $extra)
+            if ($p.ExitCode -ne 0) { Get-Content install.log; throw "installer exit code $($p.ExitCode)" }
+          }
+          function Uninstall {
+            Start-Process $uninst -Wait -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+            # the uninstaller hands over to a copy of itself; wait for it to finish
+            for ($i = 0; $i -lt 60 -and ((Test-Path $vst3) -or (Test-Path $clap) -or (Test-Path $uninst)); $i++) { Start-Sleep 1 }
+            if ((Test-Path $vst3) -or (Test-Path $clap)) { throw "uninstall left the plugin behind" }
+          }
+          function SameAs($installed, $packaged) {
+            if (-not (Test-Path $installed)) { throw "missing after install: $installed" }
+            if ((Get-FileHash $installed).Hash -ne (Get-FileHash $packaged).Hash) { throw "differs from the package: $installed" }
+          }
+
+          Install @()
+          SameAs $vst3Bin "pkg\VST3\VolumeGuardLimiter.vst3\Contents\x86_64-win\VolumeGuardLimiter.vst3"
+          SameAs $clap "pkg\CLAP\VolumeGuardLimiter.clap"
+          $p = Start-Process pluginval/pluginval.exe -Wait -PassThru -NoNewWindow -ArgumentList @(
+            '--strictness-level', '5', '--validate-in-process', '--skip-gui-tests', '--validate', "`"$vst3`"")
+          if ($p.ExitCode -ne 0) { throw "the installed VST3 failed pluginval ($($p.ExitCode))" }
+          Uninstall
+
+          Install @('/COMPONENTS=vst3')
+          SameAs $vst3Bin "pkg\VST3\VolumeGuardLimiter.vst3\Contents\x86_64-win\VolumeGuardLimiter.vst3"
+          if (Test-Path $clap) { throw "CLAP installed although only VST3 was ticked" }
+          Uninstall
+          Write-Host "::notice title=Installer::installs VST3 + CLAP into Common Files, the installed VST3 passes pluginval, uninstall removes everything"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VolumeGuardLimiter-Setup
+          path: VolumeGuardLimiter-Setup.exe
+
       # Commit message with [limiter-release] publishes plugin/VERSION as a release.
       # It is not marked "latest", so the app download button keeps pointing at VolumeGuard itself.
       - name: Publish release
@@ -106,5 +164,7 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: VolumeGuard Limiter ${{ needs.build.outputs.tag }}
           body_path: plugin/release-notes.md
-          files: VolumeGuardLimiter-Windows.zip
+          files: |
+            VolumeGuardLimiter-Setup.exe
+            VolumeGuardLimiter-Windows.zip
           make_latest: false

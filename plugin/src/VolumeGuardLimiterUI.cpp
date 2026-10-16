@@ -13,13 +13,13 @@ namespace {
 
 // Parameter indices — keep in sync with VolumeGuardLimiter.cpp
 enum { kInputGain = 0, kCeiling, kRelease, kBypass, kGainReduction, kInputLevel, kOutputLevel, kMode, kAmount,
-       kAutoRelease, kTruePeak, kCount };
+       kAutoRelease, kTruePeak, kLookahead, kCount };
 
-constexpr uint kWidth = 520, kHeight = 560;
+constexpr uint kWidth = 520, kHeight = 600;
 constexpr int kHistory = 200;          // gain reduction graph: 200 points × 50 ms = the last 10 seconds
 constexpr double kHistoryStepSec = 0.05;
 const char* const kPresetLabels[vgl::kPresetCount] = { "DEFAULT", "SHOOTER", "MOVIE", "NIGHT" };
-constexpr int kSliderCount = 4;
+constexpr int kSliderCount = 5;
 
 const char* const kModeNames[3] = { "LIMITER", "COMFORT", "TACTICAL" };
 const char* const kModeHints[3] = {
@@ -74,12 +74,14 @@ public:
         fValues[kAmount] = 50.0f;
         fValues[kAutoRelease] = 1.0f;
         fValues[kTruePeak] = 1.0f;
+        fValues[kLookahead] = 5.0f;
 
         const float x = 132, w = 290;
         fSliders[0] = { kInputGain, "Input Gain", -12.0f, 24.0f, 0.0f, false, x, 226, w };
         fSliders[1] = { kAmount, "Amount", 0.0f, 100.0f, 50.0f, false, x, 266, w };
         fSliders[2] = { kCeiling, "Ceiling", -30.0f, 0.0f, -1.0f, false, x, 306, w };
         fSliders[3] = { kRelease, "Release", 1.0f, 1000.0f, 100.0f, true, x, 346, w };
+        fSliders[4] = { kLookahead, "Lookahead", 1.0f, 10.0f, 5.0f, false, x, 386, w };
 
         for (float& v : fHistory) v = 0.0f;
         fHistoryTime = std::chrono::steady_clock::now();
@@ -136,8 +138,8 @@ protected:
         rectFill(0, 0, kWidth, kHeight, kBg);
         roundFill(12, 56, kWidth - 24, 66, 10, kCard);
         roundFill(12, 130, kWidth - 24, 46, 10, kCard);
-        roundFill(12, 184, kWidth - 24, 216, 10, kCard);
-        roundFill(12, 408, kWidth - 24, 144, 10, kCard);
+        roundFill(12, 184, kWidth - 24, 256, 10, kCard);
+        roundFill(12, 448, kWidth - 24, 144, 10, kCard);
 
         // header
         fontFace(NANOVG_DEJAVU_SANS_TTF);
@@ -162,7 +164,7 @@ protected:
         text(26, 70, "MODE", nullptr);
         text(26, 153, "PRESET", nullptr);
         text(26, 198, "SETTINGS", nullptr);
-        text(26, 422, "METERS", nullptr);
+        text(26, 462, "METERS", nullptr);
 
         // preset buttons: the one matching the current settings is lit
         const int preset = currentPreset();
@@ -202,15 +204,15 @@ protected:
             drawSlider(s, bypass || (s.param == kAmount && mode == 0));
 
         // switches: auto release and true peak
-        drawSmallSwitch(26, 132, 380, "Auto Release", fValues[kAutoRelease] > 0.5f, bypass);
-        drawSmallSwitch(292, 398, 380, "True Peak", fValues[kTruePeak] > 0.5f, bypass);
+        drawSmallSwitch(26, 132, 420, "Auto Release", fValues[kAutoRelease] > 0.5f, bypass);
+        drawSmallSwitch(292, 398, 420, "True Peak", fValues[kTruePeak] > 0.5f, bypass);
 
         // meters
         const float ceiling = fValues[kCeiling];
-        drawMeter(442, "IN", fValues[kInputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
-        drawMeter(464, "OUT", fValues[kOutputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
-        drawReduction(486, bypass ? 0.0f : fValues[kGainReduction]);
-        drawHistory(500, 44, bypass);
+        drawMeter(482, "IN", fValues[kInputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
+        drawMeter(504, "OUT", fValues[kOutputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
+        drawReduction(526, bypass ? 0.0f : fValues[kGainReduction]);
+        drawHistory(540, 44, bypass);
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -226,8 +228,11 @@ protected:
         {
             if (fDragging >= 0)
             {
-                editParameter((uint32_t)fSliders[fDragging].param, false);
+                const int param = fSliders[fDragging].param;
                 fDragging = -1;
+                // the lookahead changes the latency: the host hears only where the drag ended
+                if (param == kLookahead) setParameterValue(kLookahead, fValues[kLookahead]);
+                editParameter((uint32_t)param, false);
                 return true;
             }
             return false;
@@ -244,7 +249,7 @@ protected:
         }
 
         // auto release and true peak switches (the label is clickable too)
-        if (my >= 366 && my <= 394)
+        if (my >= 406 && my <= 434)
         {
             int param = -1;
             if (mx >= 26 && mx <= 172) param = kAutoRelease;
@@ -337,7 +342,10 @@ protected:
             if (s.param == kAmount && modeIndex() == 0) return true;
             const float step = ev.delta.getY() > 0 ? 0.01f : -0.01f;
             editParameter((uint32_t)s.param, true);
-            setValue(s.param, s.fromPos(s.toPos(fValues[s.param]) + step));
+            if (s.param == kLookahead)   // whole milliseconds: one notch = 1 ms
+                setValue(s.param, std::fmax(s.min, std::fmin(s.max, fValues[kLookahead] + (step > 0 ? 1.0f : -1.0f))));
+            else
+                setValue(s.param, s.fromPos(s.toPos(fValues[s.param]) + step));
             editParameter((uint32_t)s.param, false);
             return true;
         }
@@ -390,10 +398,12 @@ private:
 
     void setValue(int param, float v)
     {
-        if (param == kRelease || param == kAmount || param == kMode) v = std::round(v);
+        if (param == kRelease || param == kAmount || param == kMode || param == kLookahead) v = std::round(v);
         else if (param != kBypass && param != kAutoRelease && param != kTruePeak) v = std::round(v * 10.0f) / 10.0f;
+        if (fValues[param] == v && param == kLookahead) return;
         fValues[param] = v;
         repaint();
+        if (param == kLookahead && fDragging >= 0 && fSliders[fDragging].param == kLookahead) return;   // sent on release
         // tell the host last: nothing in this window is touched after the host has reacted
         setParameterValue((uint32_t)param, v);
     }
@@ -462,7 +472,7 @@ private:
         }
 
         char buf[32];
-        if (s.param == kRelease) std::snprintf(buf, sizeof buf, "%.0f ms", v);
+        if (s.param == kRelease || s.param == kLookahead) std::snprintf(buf, sizeof buf, "%.0f ms", v);
         else if (s.param == kAmount) std::snprintf(buf, sizeof buf, "%.0f %%", v);
         else if (std::fabs(v) < 0.05f) std::snprintf(buf, sizeof buf, "0.0 dB");
         else std::snprintf(buf, sizeof buf, "%+.1f dB", v);

@@ -1,6 +1,10 @@
 **VolumeGuard Limiter** — плагин-лимитер VST3 и CLAP для FL Studio, Ableton, Reaper и других программ с плагинами.
 
-**Новое в 1.3.0:**
+**Новое в 1.4.0:**
+- **Установщик** `VolumeGuardLimiter-Setup.exe` — сам кладёт плагин в `Common Files\VST3` и `Common Files\CLAP`, копировать вручную больше не нужно.
+- **Lookahead 1…10 мс** — меньше задержка (≈ 1,2 мс при 1 мс, удобно для мониторинга в Wave Link) или мягче звук (до 10 мс). По умолчанию 5 мс, как раньше.
+
+**1.3.0:**
 - **Пресеты** SHOOTER / MOVIE / NIGHT — одним нажатием в окне плагина или из списка пресетов программы.
 - **Шаги слышнее в TACTICAL:** тихие высокие звуки поднимаются на ~7 дБ (до +12 дБ при Amount 100 %).
 - **True Peak** — не пропускает пики и между сэмплами.
@@ -14,13 +18,15 @@
 **COMFORT** — мягкий вариант для фильмов и одиночных игр. Ручка **Amount** задаёт силу.
 Направление звуков не меняется: оба канала обрабатываются одинаково.
 
-Звук на выходе никогда не бывает громче потолка: плагин заглядывает на 5 мс вперёд и убавляет громкость заранее.
+Звук на выходе никогда не бывает громче потолка: плагин заглядывает на 1…10 мс вперёд (по умолчанию 5) и убавляет громкость заранее.
 
 **Установка**
-1. Скачайте `VolumeGuardLimiter-Windows.zip` ниже и до распаковки снимите блокировку: «Свойства» → «Разблокировать».
-2. Папку `VST3\VolumeGuardLimiter.vst3` скопируйте в `C:\Program Files\Common Files\VST3\`.
+1. Скачайте `VolumeGuardLimiter-Setup.exe` ниже и запустите. Если Windows покажет «Система Windows защитила ваш компьютер» — «Подробнее» → «Выполнить в любом случае» (установщик не подписан).
+2. Оставьте отмеченными VST3 и CLAP и нажмите «Установить».
 3. Обновите список плагинов в своей программе и найдите **VolumeGuard Limiter**.
 
-Параметры: Mode, Amount, Input Gain, Ceiling, Release, Auto Release, True Peak, Bypass. Подробнее — в [plugin/README.md](https://github.com/qqkillua/VolumeGuard/blob/main/plugin/README.md).
+Вручную: `VolumeGuardLimiter-Windows.zip` — разблокировать в «Свойствах», папку `VST3\VolumeGuardLimiter.vst3` скопировать в `C:\Program Files\Common Files\VST3\`.
+
+Параметры: Mode, Amount, Input Gain, Ceiling, Release, Auto Release, True Peak, Lookahead, Bypass. Подробнее — в [plugin/README.md](https://github.com/qqkillua/VolumeGuard/blob/main/plugin/README.md).
 
 Проверено [pluginval](https://github.com/Tracktion/pluginval) на максимальной строгости.

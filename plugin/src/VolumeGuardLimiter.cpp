@@ -22,6 +22,7 @@ public:
         kAmount,          // Game mode strength, %
         kAutoRelease,     // release adapts to the sound (added in 1.3.0, so new ones come last)
         kTruePeak,        // also limit the peaks between samples (1.3.0)
+        kLookahead,       // how far ahead the limiter looks, 1…10 ms = the plugin's latency (1.4.0)
         kParameterCount
     };
 
@@ -39,6 +40,7 @@ public:
         fValues[kAmount] = 50.0f;
         fValues[kAutoRelease] = 1.0f;
         fValues[kTruePeak] = 1.0f;
+        fValues[kLookahead] = 5.0f;
         prepare();
     }
 
@@ -51,7 +53,7 @@ protected:
     const char* getMaker() const override { return "qqkillua"; }
     const char* getHomePage() const override { return "https://github.com/qqkillua/VolumeGuard"; }
     const char* getLicense() const override { return "MIT"; }
-    uint32_t getVersion() const override { return d_version(1, 3, 0); }
+    uint32_t getVersion() const override { return d_version(1, 4, 0); }
     int64_t getUniqueId() const override { return d_cconst('V', 'G', 'L', 'm'); }
 
     void initAudioPort(bool input, uint32_t index, AudioPort& port) override
@@ -165,6 +167,17 @@ protected:
             p.ranges.max = 1.0f;
             p.ranges.def = 1.0f;
             break;
+        case kLookahead:
+            // changes the latency, so it is a setting rather than something to automate
+            p.hints = kParameterIsInteger;
+            p.name = "Lookahead";
+            p.shortName = "Look";
+            p.symbol = "lookahead";
+            p.unit = "ms";
+            p.ranges.min = 1.0f;
+            p.ranges.max = 10.0f;
+            p.ranges.def = 5.0f;
+            break;
         }
     }
 
@@ -205,6 +218,11 @@ protected:
         case kAmount:    fChain.setAmount(value / 100.0f); break;
         case kAutoRelease: fChain.setAutoRelease(value > 0.5f); break;
         case kTruePeak:    fChain.setTruePeak(value > 0.5f); break;
+        case kLookahead:
+            fValues[index] = (float)std::max(1L, std::min(10L, std::lround(value)));
+            fChain.setLookaheadMs(fValues[index]);
+            setLatency((uint32_t)fChain.latencySamples());   // DPF tells the host (VST3 restart / CLAP latency)
+            break;
         }
     }
 
@@ -242,6 +260,7 @@ private:
         fChain.setAmount(fValues[kAmount] / 100.0f);
         fChain.setAutoRelease(fValues[kAutoRelease] > 0.5f);
         fChain.setTruePeak(fValues[kTruePeak] > 0.5f);
+        fChain.setLookaheadMs(fValues[kLookahead]);
         setLatency((uint32_t)fChain.latencySamples());
     }
 

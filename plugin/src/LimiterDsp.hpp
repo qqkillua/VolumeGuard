@@ -37,21 +37,36 @@ class LookaheadLimiter
 public:
     static constexpr int kMaxChannels = 8;
 
+    static constexpr double kMinLookaheadMs = 1.0, kMaxLookaheadMs = 10.0;
+
+    /// Allocates for the longest lookahead (kMaxLookaheadMs), so setLookaheadMs never allocates.
     void prepare(double sampleRate, int channels, double lookaheadMs = 5.0)
     {
         sr_ = sampleRate > 0 ? sampleRate : 48000.0;
         channels_ = std::max(1, std::min(channels, kMaxChannels));
-        L_ = std::max(2, (int)std::lround(sr_ * lookaheadMs / 1000.0));
-        D_ = L_ - 1;
+        Lmax_ = std::max(2, (int)std::lround(sr_ * kMaxLookaheadMs / 1000.0));
+        Dmax_ = Lmax_ - 1;
         if (!tpReady_) buildTruePeakFilter();
-        delay_.assign((size_t)channels_ * (size_t)D_, 0.0f);
-        ceilDelay_.assign((size_t)D_, ceiling_);
-        box_.assign((size_t)L_, 1.0f);
-        dqVal_.assign((size_t)L_ + 1, 1.0f);
-        dqIdx_.assign((size_t)L_ + 1, 0);
+        delay_.assign((size_t)channels_ * (size_t)Dmax_, 0.0f);
+        ceilDelay_.assign((size_t)Dmax_, ceiling_);
+        box_.assign((size_t)Lmax_, 1.0f);
+        dqVal_.assign((size_t)Lmax_ + 1, 1.0f);
+        dqIdx_.assign((size_t)Lmax_ + 1, 0);
         setReleaseMs(releaseMs_);
+        applyLookahead(lookaheadMs);
         reset();
     }
+
+    /// How far ahead the limiter looks, 1…10 ms. Longer: the gain comes down more gently (cleaner, less
+    /// distortion on bass); shorter: less delay. Changing it clears the limiter's history (call it between
+    /// sounds, or fade around it — the Chain does), and changes latencySamples(). Never allocates.
+    void setLookaheadMs(double ms)
+    {
+        const int before = L_;
+        applyLookahead(ms);
+        if (L_ != before) reset();
+    }
+    double lookaheadMs() const { return 1000.0 * L_ / sr_; }
 
     void reset()
     {
@@ -62,7 +77,7 @@ public:
         std::fill(ceilDelay_.begin(), ceilDelay_.end(), ceiling_);
         clamps_ = 0;
         std::fill(box_.begin(), box_.end(), 1.0f);
-        boxSum_ = (double)L_;
+        boxSum_ = (double)L_;   // only the first L_ entries are in use
         boxPos_ = 0;
         sinceResum_ = 0;
         dPos_ = 0;
@@ -186,7 +201,7 @@ public:
             {
                 sinceResum_ = 0;
                 double s = 0.0;
-                for (float v : box_) s += v;
+                for (int k = 0; k < L_; ++k) s += box_[(size_t)k];
                 boxSum_ = s;
             }
             const float gain = std::min(1.0f, (float)(boxSum_ / (double)L_));
@@ -200,7 +215,7 @@ public:
             cd = ceiling_;
             for (int c = 0; c < nch; ++c)
             {
-                float& d = delay_[(size_t)c * (size_t)D_ + (size_t)dPos_];
+                float& d = delay_[(size_t)c * (size_t)Dmax_ + (size_t)dPos_];
                 const float delayed = d;
                 d = x[c];
                 const float y = bypass ? delayed / inGain_ : delayed * gain;
@@ -249,8 +264,15 @@ private:
     float coefMs(float ms) const { return (float)std::exp(-1.0 / (sr_ * std::max(0.1f, ms) / 1000.0)); }
     int back() const { return (dqHead_ + dqCount_ - 1) % (L_ + 1); }
 
+    void applyLookahead(double ms)
+    {
+        ms = std::max(kMinLookaheadMs, std::min(kMaxLookaheadMs, std::isfinite(ms) ? ms : 5.0));
+        L_ = std::max(2, std::min(Lmax_, (int)std::lround(sr_ * ms / 1000.0)));
+        D_ = L_ - 1;
+    }
+
     double sr_ = 48000.0;
-    int channels_ = 2, L_ = 240, D_ = 239;
+    int channels_ = 2, L_ = 240, D_ = 239, Lmax_ = 480, Dmax_ = 479;
     float ceiling_ = dbToGain(-1.0f), inGain_ = 1.0f, releaseMs_ = 100.0f, relCoef_ = 0.0f;
 
     std::vector<float> delay_, ceilDelay_;

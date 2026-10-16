@@ -307,6 +307,37 @@ int main()
         }
     }
 
+    // 8. Every lookahead from 1 to 10 ms keeps the ceiling (algorithm alone in the no-clamp build), with the
+    //    reported latency, at 44.1 / 48 / 96 kHz — also when it is changed between blocks.
+    for (double sr : { 44100.0, 48000.0, 96000.0 })
+    {
+        std::mt19937 rng(17);
+        std::normal_distribution<float> nd(0.0f, 0.4f);
+        vgl::LookaheadLimiter lim;
+        lim.prepare(sr, 2, 5.0);
+        lim.setCeilingDb(-3.0f);
+        float pk = 0;
+        std::vector<float> l(512), r(512);
+        for (int b = 0; b < 400; ++b)
+        {
+            if (b % 40 == 0)
+            {
+                const double ms = 1.0 + (b / 40) % 10;
+                lim.setLookaheadMs(ms);
+                CHECK(lim.latencySamples() == (int)std::lround(sr * ms / 1000.0) - 1 + vgl::LookaheadLimiter::kTpHalf,
+                      "sr %.0f, %.0f ms: latency %d", sr, ms, lim.latencySamples());
+            }
+            for (int i = 0; i < 512; ++i) { l[i] = nd(rng) * (b % 7 == 0 ? 4.0f : 1.0f); r[i] = -l[i]; }
+            const float* in[2] = { l.data(), r.data() };
+            float* out[2] = { l.data(), r.data() };
+            lim.process(in, out, 2, 512);
+            for (int i = 0; i < 512; ++i) pk = std::max(pk, std::max(std::fabs(l[i]), std::fabs(r[i])));
+        }
+        CHECK(pk <= vgl::dbToGain(-3.0f) * 1.000001f, "sr %.0f: peak %.4f over the ceiling with changing lookahead", sr, pk);
+        CHECK(lim.clampCount() == 0, "sr %.0f: safety clamp acted %llu times", sr, (unsigned long long)lim.clampCount());
+    }
+    std::printf("lookahead 1..10 ms: ceiling and latency right at 44.1 / 48 / 96 kHz\n");
+
     // 5. Speed: 60 s of stereo at 48 kHz.
     {
         LookaheadLimiter lim;

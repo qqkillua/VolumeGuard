@@ -122,6 +122,37 @@ int main()
         CHECK(ch.clampCount() == 0, "@%.0f: safety clamp acted %llu times", rate, (unsigned long long)ch.clampCount());
     }
 
+    // 7. Lookahead changed while a loud sine plays (5 -> 1 -> 10 -> 5 ms): a short gap with fades, no click;
+    //    the reported latency follows at once; the ceiling holds and the safety clamp never acts.
+    {
+        vgl::Chain ch; ch.prepare(sr); ch.setCeilingDb(-6.0f); ch.reset();
+        int lat[4] = { 0, 0, 0, 0 };
+        const double jump = worstJump(ch, sr, 2.0, 0.9f, [&](double t)
+        {
+            if (t >= 0.4 && !lat[1]) { ch.setLookaheadMs(1.0f); lat[1] = ch.latencySamples(); }
+            if (t >= 0.8 && !lat[2]) { ch.setLookaheadMs(10.0f); lat[2] = ch.latencySamples(); }
+            if (t >= 1.2 && !lat[3]) { ch.setLookaheadMs(5.0f); lat[3] = ch.latencySamples(); }
+        });
+        std::printf("lookahead 5 -> 1 -> 10 -> 5 ms: latency %d / %d / %d samples, worst step %.3f, clamps %llu\n",
+                    lat[1], lat[2], lat[3], jump, (unsigned long long)ch.clampCount());
+        CHECK(lat[1] == 47 + vgl::LookaheadLimiter::kTpHalf && lat[2] == 479 + vgl::LookaheadLimiter::kTpHalf
+              && lat[3] == 239 + vgl::LookaheadLimiter::kTpHalf, "latency did not follow the lookahead");
+        CHECK(jump < 0.6, "changing the lookahead jumped: %.3f (limited sine 0.5)", jump);
+        CHECK(ch.clampCount() == 0, "safety clamp acted %llu times", (unsigned long long)ch.clampCount());
+        // and the gap is short: within 0.1 s after a change the sound is back at full level
+        vgl::Chain c2; c2.prepare(sr); c2.reset();
+        std::vector<float> l(4800), r(4800);
+        double ph = 0;
+        auto blockRun = [&]() { for (auto& v : l) { v = 0.3f * (float)std::sin(ph); ph += 2 * kPi * 200 / sr; } r = l;
+                                c2.process(l.data(), r.data(), l.data(), r.data(), (int)l.size()); };
+        blockRun();
+        c2.setLookaheadMs(10.0f);
+        blockRun();   // 0.1 s: fade out, switch, wait for the 10 ms delay, fade in
+        blockRun();
+        float pk = 0; for (float v : l) pk = std::max(pk, std::fabs(v));
+        CHECK(pk > 0.29f, "sound not back 0.1 s after the lookahead change (peak %.3f)", pk);
+    }
+
     if (failures) { std::printf("%d check(s) failed\n", failures); return 1; }
     std::printf("all chain checks passed\n");
     return 0;
