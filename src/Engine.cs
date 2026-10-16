@@ -81,7 +81,7 @@ namespace VolumeGuard
         /// Plays to the device chosen in the window (whose volume the master limit and the anti-click move);
         /// false: another device (e.g. the virtual cable the game is sent to) — only its own volume is limited.
         public bool OnMain = true;
-        public string DeviceName = "";
+        public string DeviceName = "", DeviceId = "";
     }
 
     class Settings
@@ -649,9 +649,9 @@ namespace VolumeGuard
 
             bool changed = false;
             foreach (var w in sessions.Values) w.Seen = false;
-            ScanSessions(mgr, true, "", ref changed);
+            ScanSessions(mgr, true, "", devId, ref changed);
             UpdateOtherDevices();
-            foreach (var kv in otherMgrs) ScanSessions(kv.Value, false, otherNames[kv.Key], ref changed);
+            foreach (var kv in otherMgrs) ScanSessions(kv.Value, false, otherNames[kv.Key], kv.Key, ref changed);
             changed |= FinishRefresh();
             return changed;
         }
@@ -694,7 +694,7 @@ namespace VolumeGuard
             }
         }
 
-        void ScanSessions(IAudioSessionManager2 manager, bool onMain, string deviceName, ref bool changed)
+        void ScanSessions(IAudioSessionManager2 manager, bool onMain, string deviceName, string deviceId, ref bool changed)
         {
             IAudioSessionEnumerator se = null;
             try
@@ -731,7 +731,7 @@ namespace VolumeGuard
                         w = new SessionWrap
                         {
                             Id = id, Ctl = c, Vol = (ISimpleAudioVolume)c, Meter = (IAudioMeterInformation)c, Seen = true,
-                            Active = state == 1, OnMain = onMain, DeviceName = deviceName
+                            Active = state == 1, OnMain = onMain, DeviceName = deviceName, DeviceId = deviceId ?? ""
                         };
                         string key, title;
                         Icon icon;
@@ -776,6 +776,7 @@ namespace VolumeGuard
                 a.Active = a.Sessions.Any(x => x.Active);
                 // plays only to other devices: show where (e.g. the virtual cable of the sound processing)
                 string where = a.Sessions.Any(x => x.OnMain) ? "" : a.Sessions[0].DeviceName;
+                if (a.Sessions.All(IntoProcessing)) where = "обработка звука";   // its limit is the processing's ceiling
                 if (where != a.Where) { a.Where = where; changed = true; }
                 try
                 {
@@ -902,13 +903,13 @@ namespace VolumeGuard
             // with many apps on several devices.
             duckRequest = 0f;
             foreach (var a in s.Apps.Values)
-                if (a.Present && s.Enabled && a.LimitOn) TickApp(a, decay, rel, full);
+                if (a.Present && Limited(a)) TickApp(a, decay, rel, full);
             if (full)
             {
                 float decaySlow, relSlow;
                 SetCoefs(sinceFull, out decaySlow, out relSlow);
                 foreach (var a in s.Apps.Values)
-                    if (a.Present && !(s.Enabled && a.LimitOn)) TickApp(a, decaySlow, relSlow, true);
+                    if (a.Present && !Limited(a)) TickApp(a, decaySlow, relSlow, true);
                 SetCoefs(dt, out decay, out rel);
                 sinceFull = 0f;
             }
@@ -918,6 +919,22 @@ namespace VolumeGuard
 
         float sinceFull;
 
+        /// The app's limit is in force. Not for an app that plays only into the device the sound processing records
+        /// from while the processing is on: the processing's own limiter already keeps it under its ceiling, with
+        /// no click, and limiting it a second time made the game far too quiet (2.8.0–2.8.2).
+        bool Limited(AppModel a)
+        {
+            if (!s.Enabled || !a.LimitOn) return false;
+            foreach (var w in a.Sessions) if (!IntoProcessing(w)) return true;
+            return a.Sessions.Count == 0;
+        }
+
+        /// This stream plays into the device the running sound processing records from.
+        bool IntoProcessing(SessionWrap w)
+        {
+            return s.ProcOn && s.ProcSource.Length > 0 && w.DeviceId == s.ProcSource;
+        }
+
         /// Something is limited right now (an app or the device): the audio thread then steps every 2 ms.
         public bool NeedsFastSteps
         {
@@ -925,7 +942,7 @@ namespace VolumeGuard
             {
                 if (!s.Enabled) return false;
                 if (s.Master.LimitOn) return true;
-                foreach (var a in s.Apps.Values) if (a.Present && a.LimitOn) return true;
+                foreach (var a in s.Apps.Values) if (a.Present && Limited(a)) return true;
                 return false;
             }
         }
@@ -1004,10 +1021,22 @@ namespace VolumeGuard
 
         void TickApp(AppModel a, float decay, float rel, bool full)
         {
-            float inPeak = 0f, inPeakMain = 0f;
+            float inPeak = 0f, inPeakMain = 0f, shownPeak = 0f;
+            bool limited = Limited(a);
             foreach (var w in a.Sessions)
             {
                 if (w.Dead) continue;
+                if (IntoProcessing(w))
+                {
+                    // the processing limits this stream; leave it at the volume the user chose (the window still
+                    // shows its level)
+                    if (Math.Abs(w.LastSet - a.UserVol) > 0.002f)
+                    {
+                        try { w.Vol.SetMasterVolume(a.UserVol, ref ctx); w.LastSet = a.UserVol; } catch { w.Dead = true; }
+                    }
+                    try { shownPeak = Limiter.CombinePeak(shownPeak, w.Meter.GetPeakValue() * a.UserVol); } catch { w.Dead = true; }
+                    continue;
+                }
                 try
                 {
                     float cur = full || w.LastSet < 0f ? w.Vol.GetMasterVolume() : w.LastSet;
@@ -1042,7 +1071,7 @@ namespace VolumeGuard
             // (not on the device the sound processing records the game from: pulling its volume down would only
             // make the processed game sound dip — the processing has its own limiter that catches every peak)
             bool procSource = s.ProcOn && devId != null && devId == s.ProcSource;
-            if (s.Enabled && a.LimitOn && s.AntiClick && HardwareVolume && !procSource && s.LimitMode == 0 && inPeakMain >= Limiter.Gate)
+            if (limited && s.AntiClick && HardwareVolume && !procSource && s.LimitMode == 0 && inPeakMain >= Limiter.Gate)
             {
                 float applied = -1f;
                 foreach (var w in a.Sessions)
@@ -1053,16 +1082,16 @@ namespace VolumeGuard
                     duckRequest = Math.Min(duckRequest, Math.Max(-30f, Db.FromLin(lim / outLvl)));
             }
 
-            Limiter.Step(ref a.Gain, ref a.Env, ref a.Ms, ref a.Hold, inPeak, a.UserVol, s.Enabled && a.LimitOn, a.LimitDb,
+            Limiter.Step(ref a.Gain, ref a.Env, ref a.Ms, ref a.Hold, inPeak, a.UserVol, limited, a.LimitDb,
                          Limiter.Floor(a.UserVol, s.SessionMeterPost), decay, rel, msCoef, msRiseCoef, s.LimitMode, holdDecay, attackCoef);
 
             foreach (var w in a.Sessions)
             {
-                if (w.Dead || (full ? Math.Abs(w.LastSet - a.Gain) <= 0.002f : a.Gain >= w.LastSet - 0.002f)) continue;
+                if (w.Dead || IntoProcessing(w) || (full ? Math.Abs(w.LastSet - a.Gain) <= 0.002f : a.Gain >= w.LastSet - 0.002f)) continue;
                 try { w.Vol.SetMasterVolume(a.Gain, ref ctx); w.LastSet = a.Gain; }
                 catch { w.Dead = true; }
             }
-            a.OutLevel = inPeak * a.Gain;
+            a.OutLevel = Math.Max(inPeak * a.Gain, shownPeak);
             if (a.OutLevel > a.DisplayPeak) a.DisplayPeak = a.OutLevel;
             a.Limiting = a.Gain < a.UserVol * 0.97f;
             bool pend = a.Gain < a.UserVol - 0.01f;
