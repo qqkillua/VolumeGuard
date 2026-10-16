@@ -59,6 +59,10 @@ namespace VolumeGuard
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
         public static extern int vg_app_route(uint pid, StringBuilder buffer, int capacity);
+
+        // API 4: the real delay, measured with short beeps
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int vg_measure_latency(out float ms, out int beepsHeard);
     }
 
     /// An app that plays sound right now, and the device it plays to.
@@ -123,7 +127,7 @@ namespace VolumeGuard
             }
             try
             {
-                if (VgNative.vg_version() != 3)
+                if (VgNative.vg_version() != 4)
                 {
                     UnavailableReason = "vgaudio.dll другой версии — скачайте полный архив релиза заново.";
                     return;
@@ -291,6 +295,17 @@ namespace VolumeGuard
                 return sb.ToString();
             }
             catch { return ""; }
+        }
+
+        /// Measures the real delay of the running processing (blocks ~2.5 s: call it off the UI thread).
+        /// Returns 0 and the delay in ms, or an error code.
+        public int MeasureLatency(out float ms, out int heard)
+        {
+            ms = 0f; heard = 0;
+            if (demo) { Thread.Sleep(2500); ms = 23.6f; heard = 5; return 0; }
+            if (!Available) return -1;
+            try { return VgNative.vg_measure_latency(out ms, out heard); }
+            catch { return -6; }
         }
 
         /// Windows Settings → Volume mixer, where every app's output device can be chosen by hand.
@@ -512,6 +527,9 @@ namespace VolumeGuard
         readonly FlatButton routeBtn = new FlatButton();
         readonly Label routeInfo = new Label();
         readonly ToggleSwitch autoSw = new ToggleSwitch();
+        readonly LinkLabel measureLink = new LinkLabel();
+        readonly Label measureInfo = new Label();
+        volatile bool measuring;
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         List<AudioDevice> devices = new List<AudioDevice>();
         bool filling;
@@ -667,6 +685,19 @@ namespace VolumeGuard
             y = Para(status, w) + Theme.D(8);   // two lines of room
             status.Text = "";
 
+            // the real delay, measured end to end with five short beeps
+            measureLink.Text = "Проверить настоящую задержку";
+            measureLink.AutoSize = true;
+            measureLink.Location = new Point(x, y);
+            measureLink.LinkColor = Theme.Accent; measureLink.ActiveLinkColor = Theme.Text; measureLink.VisitedLinkColor = Theme.Accent;
+            measureLink.LinkClicked += delegate { Measure(); };
+            Controls.Add(measureLink);
+            measureInfo.ForeColor = Theme.Sub;
+            measureInfo.Font = Theme.Font(8f);
+            measureInfo.Location = new Point(x, measureLink.Bottom + Theme.D(2));
+            measureInfo.Text = "Прозвучат 5 коротких сигналов: программа замерит, когда каждый дошёл до наушников. Лучше в тишине.";
+            y = Para(measureInfo, w) + Theme.D(8);
+
             var note = new Label
             {
                 Text = "Громкость самого устройства-источника держите на 100 %: Windows отдаёт его звук уже после этой громкости. " +
@@ -819,6 +850,48 @@ namespace VolumeGuard
                 if (ex.NativeErrorCode != 1223)   // 1223: the user said "No" in the administrator prompt
                     MessageBox.Show(this, "Не удалось запустить установщик: " + ex.Message, "VolumeGuard", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
+        }
+
+        void Measure()
+        {
+            if (measuring) return;
+            if (!s.ProcOn || proc.Status().State != VgNative.StateRunning)
+            {
+                measureInfo.ForeColor = Theme.Warn;
+                measureInfo.Text = "Сначала включите обработку — замер идёт через неё.";
+                return;
+            }
+            measuring = true;
+            measureLink.Enabled = false;
+            measureInfo.ForeColor = Theme.Sub;
+            measureInfo.Text = "Измеряю… (5 коротких сигналов)";
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                float ms; int heard;
+                int r = proc.MeasureLatency(out ms, out heard);
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        measuring = false;
+                        measureLink.Enabled = true;
+                        if (r == 0)
+                        {
+                            measureInfo.ForeColor = Theme.Meter;
+                            measureInfo.Text = "Настоящая задержка: " + Math.Round(ms) + " мс (по " + heard + " сигналам из 5). " +
+                                               "Сами наушники добавляют ещё своё: проводные ~1–5 мс, радио 15–30, Bluetooth 150+.";
+                        }
+                        else
+                        {
+                            measureInfo.ForeColor = Theme.Warn;
+                            measureInfo.Text = r == -7
+                                ? "Сигналы не дошли (услышано " + heard + " из 5): слишком громко вокруг или обработка в обходе. Попробуйте в тишине."
+                                : "Не удалось измерить (код " + r + "). Подробности — в audio.log.";
+                        }
+                    }));
+                }
+                catch { measuring = false; }
+            });
         }
 
         /// Called by the main window when the processing was switched by a hotkey or by the game starting.

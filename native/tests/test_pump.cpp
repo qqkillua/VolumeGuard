@@ -150,7 +150,7 @@ static Res run(double capMs, double perMs, double ppm, double seconds, unsigned 
             if (eventPending)
             {
                 eventPending = false;
-                if (pacer.onPull(q, produced && !stalled && t > quietUntil)) ++res.lates;
+                if (pacer.onPull(q, produced && !stalled && t > quietUntil, t - lastPoll > 0.008)) ++res.lates;
             }
             const double corr = pacer.update(q, t - lastPoll);
             lastPoll = t;

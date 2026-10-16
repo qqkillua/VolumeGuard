@@ -29,12 +29,14 @@ jobs:
           g++ -O2 -std=c++17 -Wall -Wextra -Werror -Isrc tests/test_bridge.cpp -o test_bridge
           g++ -O2 -std=c++17 -Wall -Wextra -Werror -Isrc -I../plugin/src tests/test_processor.cpp -o test_processor
           g++ -O2 -std=c++17 -Wall -Wextra -Werror -Isrc tests/test_pump.cpp -o test_pump
+          g++ -O2 -std=c++17 -Wall -Wextra -Werror -Isrc tests/test_soak.cpp -o test_soak
           # the processing chain itself (also run by the plugin workflow): no clicks when settings change
           g++ -O2 -std=c++17 -Wall -Wextra -Werror -I../plugin/src ../plugin/tests/test_chain.cpp -o test_chain
           ./test_bridge | tee bridge.txt
           ./test_processor
           ./test_pump | tee pump.txt
           ./test_chain
+          ./test_soak | tee soak.txt   # one simulated hour of a long evening of play (~20 s)
           echo "::notice title=Engine tests::$(grep -c 'underruns 0' bridge.txt) drift scenarios without gaps; push mode: $(grep -o 'path ~[0-9]* ms' pump.txt | head -1 | tr -d '~') for VB-CABLE -> 10 ms headset"
 
       - name: Build vgaudio.dll
@@ -103,7 +105,7 @@ jobs:
             [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int vg_route_app(uint pid, string id);
           }
           "@
-          if ([Vg]::vg_version() -ne 3) { throw "vg_version via P/Invoke" }
+          if ([Vg]::vg_version() -ne 4) { throw "vg_version via P/Invoke" }
           if ([Vg]::vg_list_apps($null, 0) -lt 1) { throw "vg_list_apps via P/Invoke" }
           if ([Vg]::vg_route_app(0, $null) -ne -1) { throw "vg_route_app via P/Invoke" }
           if ([Vg]::vg_start("same", "same") -ne -2) { throw "vg_start via P/Invoke" }

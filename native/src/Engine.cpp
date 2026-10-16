@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,7 @@ const IID kIID_IAudioRenderClient = { 0xF294ACFC, 0x3146, 0x4483, { 0xA7, 0xBF, 
 const IID kIID_IAudioCaptureClient = { 0xC8ADBD64, 0xE71E, 0x48A0, { 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17 } };
 const GUID kSubtypeFloat = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
 const GUID kSubtypePcm = { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
+const IID kIID_IAudioClock = { 0xCD63314F, 0x3FBA, 0x4A1B, { 0x81, 0x2C, 0xEF, 0x96, 0x35, 0x87, 0x28, 0xE7 } };
 const IID kIID_IAudioSessionManager2 = { 0x77AA99A0, 0x1BD6, 0x484F, { 0x8B, 0xC7, 0x2C, 0x65, 0x4C, 0x9A, 0x9B, 0x6F } };
 const IID kIID_IAudioSessionControl2 = { 0xBFB7FF88, 0x7239, 0x4FC9, { 0x8F, 0xA2, 0x07, 0xC9, 0x50, 0xBE, 0x9C, 0x6D } };
 const PROPERTYKEY kPKEY_FriendlyName = { { 0xA45C254E, 0xDF1C, 0x4EFD, { 0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0 } }, 14 };
@@ -233,6 +235,12 @@ public:
         stopLocked();
         sourceId_ = sourceId;
         outputId_ = outputId;
+        {
+            auto it = srcChoice_.find(sourceId_);
+            srcMode_ = it != srcChoice_.end() ? it->second : 0;
+            trialScore0_ = -1.0;
+            restartQuick_ = false;
+        }
         firstResult_ = VG_OK;
         ResetEvent(stopEvent_);
         ResetEvent(readyEvent_);
@@ -288,6 +296,21 @@ public:
         s.sourceMs = sourceMs_.load();
         s.outputMs = outputMs_.load();
         s.lookaheadMs = lookaheadMs_.load();
+    }
+
+    /// Measures the real delay of the running processing: plays short beeps into the source device and
+    /// finds them in what the output device plays (its loopback), both on the QPC clock. Blocks ~2.5 s.
+    int measure(float* ms, int* valid)
+    {
+        EnterCriticalSection(&lock_);
+        const bool running = thread_ != nullptr && state_.load() == VG_STATE_RUNNING;
+        const std::wstring src = sourceId_, out = outputId_;
+        LeaveCriticalSection(&lock_);
+        if (!running) return fail(VG_ERR_ARGS, "measure: the processing is not running");
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const int r = measureOn(src, out, ms, valid);
+        if (SUCCEEDED(co)) CoUninitialize();
+        return r;
     }
 
     int lastError(wchar_t* buf, int cap)
@@ -357,6 +380,7 @@ private:
             }
             first = false;
             if (WaitForSingleObject(stopEvent_, 0) != WAIT_TIMEOUT) break;
+            if (restartQuick_) { restartQuick_ = false; continue; }   // switching the source mode
             // a device was unplugged, disabled or switched to another format: try again every 2 s
             state_.store(VG_STATE_RECONNECTING);
             restarts_.fetch_add(1);
@@ -395,7 +419,7 @@ private:
         keepClient_ = nullptr;
         UINT32 srcPeriod = 0;
         bool srcLow = false;
-        if (SUCCEEDED(openStream(srcDev.p, 0, 1000000, capFmt.p, true, keepClient, srcPeriod, srcLow))
+        if (SUCCEEDED(openStream(srcDev.p, 0, 1000000, capFmt.p, srcMode_ == 0, keepClient, srcPeriod, srcLow))
             && SUCCEEDED(keepClient->GetBufferSize(&keepFrames_))
             && SUCCEEDED(keepClient->GetService(kIID_IAudioRenderClient, keep_.putVoid())))
             keepClient_ = keepClient.p;
@@ -480,6 +504,9 @@ private:
         if (first) { firstResult_ = VG_OK; SetEvent(readyEvent_); }
 
         const double t0 = nowSec();
+        double scoreSum = 0.0, startedAt = -1.0;
+        long scoreN = 0;
+        const bool decided = srcChoice_.count(sourceId_) > 0;
         double lastPoll = t0, quietUntil = t0 + 1.0, lastGlitchLog = -1e9, waitSmooth = 0.0, lastLumpLog = -1e9;
         bool produced = false;
         bool silenced = false;   // silence was put into the output since the last audio: fade the next one in
@@ -590,7 +617,8 @@ private:
             // Right after the device took its period the queue is at its lowest: the safety check.
             if (pulled)
             {
-                const bool glitch = pacer.onPull((double)padding, produced && !stalled && now > quietUntil);
+                // dt > 8 ms: this thread itself did not run for a while (the system was busy)
+                const bool glitch = pacer.onPull((double)padding, produced && !stalled && now > quietUntil, dt > 0.008);
                 if (glitch) underrunsTotal_.fetch_add(1);
                 if ((glitch || pacer.dips() != lastDips) && now - lastGlitchLog > 5.0)
                 {
@@ -654,8 +682,42 @@ private:
             correctionPpm_.store((float)(corr * 1e6));
             outputMs_.store((float)waitSmooth);
             latencyMs_.store((float)srcPeriodMs + bufMs + (float)waitSmooth + lookMs);
+
+            // which source mode is faster here (see srcMode_): measured from 4 to 10 s after the sound started
+            if (!decided && produced)
+            {
+                if (startedAt < 0) startedAt = now;
+                const double age = now - startedAt;
+                if (age > 4.0) { scoreSum += srcPeriodMs + bufMs + waitSmooth; ++scoreN; }
+                if (age > 10.0 && scoreN > 0)
+                {
+                    const double score = scoreSum / scoreN;
+                    if (srcMode_ == 0 && trialScore0_ < 0.0)
+                    {
+                        if (watch.lumps() >= 30 && watch.holeSec() > 2.0 * srcPeriodMs / 1000.0)
+                        {
+                            trialScore0_ = score;
+                            srcMode_ = 1;
+                            logLine("source mode: small packets come in lumps, %.1f ms; trying normal packets", score);
+                            restartQuick_ = true;
+                            break;
+                        }
+                        srcChoice_[sourceId_] = 0;   // steady small packets: nothing to try
+                        logLine("source mode: small packets, steady (%.1f ms)", score);
+                    }
+                    else if (srcMode_ == 1 && trialScore0_ >= 0.0)
+                    {
+                        const int best = score < trialScore0_ - 1.0 ? 1 : 0;
+                        srcChoice_[sourceId_] = best;
+                        logLine("source mode: normal packets %.1f ms, small packets %.1f ms: keeping %s", score, trialScore0_,
+                                best ? "normal packets" : "small packets");
+                        if (best == 0) { srcMode_ = 0; restartQuick_ = true; break; }
+                    }
+                    startedAt = 1e18;   // decided for this session
+                }
+            }
         }
-        if (hr == S_OK && WaitForSingleObject(stopEvent_, 0) != WAIT_OBJECT_0) hr = E_FAIL;
+        if (hr == S_OK && !restartQuick_ && WaitForSingleObject(stopEvent_, 0) != WAIT_OBJECT_0) hr = E_FAIL;
 
         if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
         renClient->Stop();
@@ -663,6 +725,143 @@ private:
         cleanupCapture();
         if (FAILED(hr)) logLine("session ended: 0x%08lX, reconnecting", (unsigned long)hr);
         return true;
+    }
+
+    int measureOn(const std::wstring& srcId, const std::wstring& outId, float* ms, int* valid)
+    {
+        Com<IMMDeviceEnumerator> en;
+        Com<IMMDevice> srcDev, outDev;
+        HRESULT hr = CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, kIID_IMMDeviceEnumerator, en.putVoid());
+        if (FAILED(hr) || FAILED(en->GetDevice(srcId.c_str(), srcDev.put()))) return fail(VG_ERR_SOURCE, "measure: source device");
+        if (FAILED(en->GetDevice(outId.c_str(), outDev.put()))) return fail(VG_ERR_OUTPUT, "measure: output device");
+
+        // a beep player on the source device (where the game plays) and a recorder of what the headphones play
+        CoTaskFormat pf, cf;
+        Com<IAudioClient> player, recorder;
+        Com<IAudioRenderClient> play;
+        Com<IAudioCaptureClient> rec;
+        Com<IAudioClock> clock;
+        vga::SampleFormat pFmt, cFmt;
+        UINT32 pPeriod = 0, cPeriod = 0, pFrames = 0;
+        bool low = false;
+        if (FAILED(srcDev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, player.putVoid())) || FAILED(player->GetMixFormat(&pf.p))
+            || !parseFormat(pf.p, pFmt)
+            || FAILED(openStream(srcDev.p, 0, 2000000, pf.p, false, player, pPeriod, low))
+            || FAILED(player->GetBufferSize(&pFrames))
+            || FAILED(player->GetService(kIID_IAudioRenderClient, play.putVoid()))
+            || FAILED(player->GetService(kIID_IAudioClock, clock.putVoid())))
+            return fail(VG_ERR_SOURCE, "measure: could not play into the source device");
+        if (FAILED(outDev->Activate(kIID_IAudioClient, CLSCTX_ALL, nullptr, recorder.putVoid())) || FAILED(recorder->GetMixFormat(&cf.p))
+            || !parseFormat(cf.p, cFmt)
+            || FAILED(openStream(outDev.p, AUDCLNT_STREAMFLAGS_LOOPBACK, 2000000, cf.p, false, recorder, cPeriod, low))
+            || FAILED(recorder->GetService(kIID_IAudioCaptureClient, rec.putVoid())))
+            return fail(VG_ERR_OUTPUT, "measure: could not record the output device");
+
+        const double pRate = pf.p->nSamplesPerSec, cRate = cf.p->nSamplesPerSec;
+        UINT64 clockFreq = 0;
+        clock->GetFrequency(&clockFreq);
+        if (clockFreq == 0) return fail(VG_ERR_SYSTEM, "measure: no device clock");
+
+        const int kBeeps = 5;
+        const double kGap = 0.4;                                     // s between beeps
+        const int beepFrames = (int)(pRate * 0.003);                 // 3 ms of 2 kHz at -10 dBFS
+        std::vector<double> beepAt;                                  // when each beep starts playing (s, QPC)
+        std::vector<float> lr, l(4096), r(4096);
+        std::vector<float> recLevel;                                 // what the output played: |level| per frame
+        std::vector<double> recTime;                                 // ... and when (s, QPC)
+        recLevel.reserve((size_t)(cRate * 3.0));
+        recTime.reserve((size_t)(cRate * 3.0));
+
+        recorder->Start();
+        player->Start();
+        const double t0 = nowSec();
+        UINT64 written = 0;
+        int beepsSent = 0;
+        const double qpcScale = 1e-7;                                // GetBuffer / GetPosition QPC values: 100 ns
+        while (nowSec() - t0 < 0.3 + kBeeps * kGap + 0.4)
+        {
+            Sleep(2);
+            // keep ~30 ms queued in the player; put a beep in at its time
+            UINT32 pad = 0;
+            if (SUCCEEDED(player->GetCurrentPadding(&pad)))
+            {
+                const UINT32 want = (UINT32)(pRate * 0.03);
+                if (pad < want)
+                {
+                    const UINT32 n = std::min<UINT32>(std::min(want - pad, pFrames - pad), (UINT32)l.size());
+                    std::fill(l.begin(), l.begin() + n, 0.0f);
+                    std::fill(r.begin(), r.begin() + n, 0.0f);
+                    const double el = nowSec() - t0;
+                    if (beepsSent < kBeeps && el > 0.3 + beepsSent * kGap && (int)n >= beepFrames)
+                    {
+                        for (int i = 0; i < beepFrames; ++i)
+                            l[i] = r[i] = 0.316f * (float)std::sin(2.0 * 3.14159265358979 * 2000.0 * i / pRate);
+                        // the device position tells when frame `written` will play
+                        UINT64 pos = 0, qpc = 0;
+                        if (SUCCEEDED(clock->GetPosition(&pos, &qpc)))
+                        {
+                            const double posFrames = (double)pos * pRate / (double)clockFreq;
+                            beepAt.push_back(qpc * qpcScale + ((double)written - posFrames) / pRate);
+                        }
+                        ++beepsSent;
+                    }
+                    BYTE* d = nullptr;
+                    if (SUCCEEDED(play->GetBuffer(n, &d)))
+                    {
+                        vga::fromStereo(l.data(), r.data(), n, pFmt, d);
+                        play->ReleaseBuffer(n, 0);
+                        written += n;
+                    }
+                }
+            }
+            // everything the headphones played since the last look
+            for (;;)
+            {
+                UINT32 next = 0;
+                if (FAILED(rec->GetNextPacketSize(&next)) || next == 0) break;
+                BYTE* d = nullptr;
+                UINT32 frames = 0;
+                DWORD flags = 0;
+                UINT64 qpc = 0;
+                if (FAILED(rec->GetBuffer(&d, &frames, &flags, nullptr, &qpc))) break;
+                if (lr.size() < (size_t)frames * 2) lr.resize((size_t)frames * 2);
+                if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) || !d) std::fill(lr.begin(), lr.begin() + (size_t)frames * 2, 0.0f);
+                else vga::toStereo(d, frames, cFmt, lr.data());
+                for (UINT32 i = 0; i < frames; ++i)
+                {
+                    recLevel.push_back(std::max(std::fabs(lr[2 * i]), std::fabs(lr[2 * i + 1])));
+                    recTime.push_back(qpc * qpcScale + i / cRate);
+                }
+                rec->ReleaseBuffer(frames);
+            }
+        }
+        player->Stop();
+        recorder->Stop();
+
+        // each beep: the first sample clearly above what played just before it, within 300 ms
+        std::vector<double> found;
+        size_t from = 0;
+        for (double at : beepAt)
+        {
+            while (from < recTime.size() && recTime[from] < at - 0.15) ++from;
+            double sum = 0.0;
+            size_t i = from, n = 0;
+            for (; i < recTime.size() && recTime[i] < at; ++i, ++n) sum += (double)recLevel[i] * recLevel[i];
+            const double bg = n ? std::sqrt(sum / n) : 0.0;
+            const float thr = (float)std::max(0.01, 6.0 * bg);    // -40 dBFS, or well above the game's sound
+            for (; i < recTime.size() && recTime[i] < at + 0.3; ++i)
+                if (recLevel[i] > thr) { found.push_back(1000.0 * (recTime[i] - at)); break; }
+        }
+        *valid = (int)found.size();
+        if (found.size() < 3)
+        {
+            logLine("measure: heard %d of %d beeps", (int)found.size(), (int)beepAt.size());
+            return fail(VG_ERR_TIMEOUT, "measure: the beeps did not come through (too loud around, or bypassed)");
+        }
+        std::sort(found.begin(), found.end());
+        *ms = (float)found[found.size() / 2];
+        logLine("measure: real delay %.1f ms (median of %d beeps, %.1f..%.1f)", *ms, (int)found.size(), found.front(), found.back());
+        return VG_OK;
     }
 
     void cleanupCapture()
@@ -717,6 +916,15 @@ private:
     Com<IAudioRenderClient> keep_;
     IAudioClient* keepClient_ = nullptr;
     UINT32 keepFrames_ = 0;
+
+    // Source mode: 0 = keep-alive with the smallest engine period (2.7 ms packets), 1 = normal period (10 ms).
+    // Some systems deliver the small packets in lumps (~20 ms holes), and then the normal period may be
+    // faster in total. When lumps show up, both are tried once (~10 s each) and the faster one is kept for
+    // that source device while the DLL is loaded.
+    int srcMode_ = 0;
+    double trialScore0_ = -1.0;            // latency without lookahead in mode 0, while mode 1 is tried
+    std::map<std::wstring, int> srcChoice_;
+    bool restartQuick_ = false;            // end the session and start again at once (not a reconnect)
 
     // parameters (written by vg_set_params)
     std::atomic<int> pMode_{ 1 };
@@ -1023,5 +1231,13 @@ VG_API int vg_get_status(vg_status* status, int size)
 }
 
 VG_API int vg_last_error(wchar_t* buffer, int capacity) { return gEngine->lastError(buffer, capacity); }
+
+VG_API int vg_measure_latency(float* ms, int* beepsHeard)
+{
+    if (!ms || !beepsHeard) return VG_ERR_ARGS;
+    *ms = 0.0f;
+    *beepsHeard = 0;
+    return gEngine->measure(ms, beepsHeard);
+}
 
 } // extern "C"

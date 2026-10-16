@@ -226,6 +226,66 @@ namespace VolumeGuard.Tests
                 Check(s.ProcAuto && s.ProcAutoApp == "tslgame", "a short procauto line must be ignored");
             }
 
+            // 10. Update check: the newest app tag wins, the plugin's tags are ignored, 2.8 == 2.8.0.0.
+            {
+                string json = "[{\"tag_name\":\"limiter-v9.0.0\"},{\"tag_name\": \"v2.7.3\"},{\"tag_name\":\"v2.10.0\"},{\"tag_name\":\"v2.8\"}]";
+                var v = Updates.NewestIn(json);
+                Check(v != null && v.ToString() == "2.10.0", "newest tag: " + v);
+                Check(Updates.IsNewer(new Version(2, 8), new Version(2, 7, 3, 0)), "2.8 is newer than 2.7.3.0");
+                Check(!Updates.IsNewer(new Version(2, 8), new Version(2, 8, 0, 0)), "2.8 is not newer than 2.8.0.0");
+                Check(!Updates.IsNewer(null, new Version(2, 8)), "no tag: nothing newer");
+                Check(Updates.NewestIn("garbage") == null, "garbage json");
+            }
+
+            // 11. Soak: one hour of game-like sound per mode — calm, footsteps, shots, bursts, explosions, silence —
+            //     with the user moving the volume and the limit now and then. Nothing may go wrong over time:
+            //     the volume stays within 0…user, no NaN, and after each calm stretch it comes back up.
+            for (int mode = 0; mode < 3; mode++)
+            {
+                var rnd = new Random(7 + mode);
+                var s = new Sim { Mode = mode, Memory = 0, LimitDb = -12f };   // memory would hold the volume on purpose
+                double nextScene = 0, sceneEnd = 0;
+                int scene = 0, notBack = 0, calms = 0;
+                float worstStuck = 0f;
+                Func<double, float> sound = t =>
+                {
+                    switch (scene)
+                    {
+                        case 0: return Lin(-35f + 4f * (float)rnd.NextDouble());                                    // calm
+                        case 1: return (t % 0.45) < 0.05 ? Lin(-28f) : Lin(-40f);                                   // steps
+                        case 2: return (t % 0.1) < 0.03 ? Lin(-3f + 2f * (float)rnd.NextDouble()) : Lin(-30f);      // burst
+                        case 3: return Lin(-6f + 3f * (float)Math.Sin(t * 3));                                      // explosion
+                        default: return 0f;                                                                          // silence
+                    }
+                };
+                while (s.T < 3600.0)
+                {
+                    if (s.T >= nextScene)
+                    {
+                        int prev = scene;
+                        scene = rnd.Next(5);
+                        // after a calm stretch the volume must be back near what the calm allows
+                        if (prev == 0 && sceneEnd > 0)
+                        {
+                            calms++;
+                            float allowed = Math.Min(s.User, Lin(s.LimitDb) / Lin(-31f));
+                            float back = DbOf(s.Gain) - DbOf(allowed);
+                            if (back < -3f) { notBack++; worstStuck = Math.Min(worstStuck, back); }
+                        }
+                        double len = scene == 0 ? 8 + 10 * rnd.NextDouble() : 1 + 6 * rnd.NextDouble();
+                        nextScene = s.T + len;
+                        sceneEnd = nextScene;
+                        if (rnd.NextDouble() < 0.05) s.User = 0.3f + 0.7f * (float)rnd.NextDouble();   // volume moved
+                        if (rnd.NextDouble() < 0.03) s.LimitDb = -30f + 25f * (float)rnd.NextDouble(); // limit moved
+                        if (s.Gain > s.User) s.Gain = s.User;
+                    }
+                    s.Run(0.1, sound);   // Run throws if the volume ever leaves 0…user or is NaN
+                }
+                Console.WriteLine("soak " + new[] { "peaks", "loudness", "smooth" }[mode] + ": 1 h, " + calms + " calm stretches, " +
+                                  notBack + " without coming back (worst " + worstStuck.ToString("0.0") + " dB)");
+                Check(notBack == 0, "soak mode " + mode + ": the volume did not come back after " + notBack + " of " + calms + " calm stretches");
+            }
+
             if (failures > 0) { Console.WriteLine(failures + " check(s) failed"); Environment.Exit(1); }
             Console.WriteLine("all limiter checks passed");
         }

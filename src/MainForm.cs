@@ -42,6 +42,11 @@ namespace VolumeGuard
         // auto processing: the game was running at the last check; the processing was switched on by us
         bool gameWasRunning, autoEnabled;
         bool hotkeysRegistered;
+        double nextUpdateCheck = 15.0;   // seconds after start, then daily
+        Version newerVersion;
+        bool balloonIsUpdate;
+        readonly ToolStripMenuItem trayUpdates = new ToolStripMenuItem("Проверять обновления");
+        readonly ToolStripMenuItem trayDownload = new ToolStripMenuItem();
         readonly ToggleSwitch hotkeysSw = new ToggleSwitch();
         const int HkProcessing = 1, HkMode = 2, HkLimiter = 3;
         bool exiting, fillingDevices;
@@ -205,6 +210,13 @@ namespace VolumeGuard
             trayEnabled.Click += delegate { SetEnabled(!s.Enabled); };
             menu.Items.Add(trayEnabled);
             menu.Items.Add("Обработка звука…", null, delegate { ShowFromTray(); ShowProcessing(); });
+            trayUpdates.Checked = s.CheckUpdates;
+            trayUpdates.Click += delegate { s.CheckUpdates = !s.CheckUpdates; trayUpdates.Checked = s.CheckUpdates; s.Dirty = true; };
+            menu.Items.Add(trayUpdates);
+            trayDownload.Visible = false;
+            trayDownload.Click += delegate { OpenReleases(); };
+            menu.Items.Add(trayDownload);
+            tray.BalloonTipClicked += delegate { if (balloonIsUpdate) OpenReleases(); };
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Выход", null, delegate { ExitApp(); });
             tray.ContextMenuStrip = menu;
@@ -272,6 +284,13 @@ namespace VolumeGuard
             {
                 lastSave = now;
                 s.Save();
+            }
+
+            if (now >= nextUpdateCheck && !demo)
+            {
+                nextUpdateCheck = now + 24 * 3600;
+                if (s.CheckUpdates)
+                    Updates.CheckAsync(v => { try { BeginInvoke(new Action(() => OnNewerVersion(v))); } catch { } });
             }
 
             if (now - lastAutoCheck > 2.0)
@@ -360,7 +379,7 @@ namespace VolumeGuard
                     cards[a.Key] = c;
                     appsPanel.Controls.Add(c);
                 }
-                else c.Title = a.Title;
+                else c.Title = CardTitle(a);
                 appsPanel.Controls.SetChildIndex(c, idx++);
             }
             if (present.Count == 0)
@@ -374,7 +393,7 @@ namespace VolumeGuard
 
         ChannelCard MakeCard(AppModel a)
         {
-            var c = new ChannelCard(a.Title, a.Icon, true);
+            var c = new ChannelCard(CardTitle(a), a.Icon, true);
             c.Margin = new Padding(0);
             c.Version = a.UiVersion;
             c.SetValues(a.UserVol, a.LimitOn, a.LimitDb, a.Muted);
@@ -448,6 +467,16 @@ namespace VolumeGuard
         }
 
         public void OpenProcessing() { ShowProcessing(); }
+
+        /// "PUBG → CABLE Input" for an app that plays to another device than the one chosen in the window.
+        static string CardTitle(AppModel a)
+        {
+            if (a.Where.Length == 0) return a.Title;
+            string d = a.Where;
+            int paren = d.IndexOf(" (", StringComparison.Ordinal);
+            if (paren > 0) d = d.Substring(0, paren);   // "CABLE Input (VB-Audio Virtual Cable)" → "CABLE Input"
+            return a.Title + "  → " + d;
+        }
 
         // ---------- processing that follows the game, hotkeys ----------
 
@@ -554,10 +583,27 @@ namespace VolumeGuard
             }
         }
 
+        void OnNewerVersion(Version v)
+        {
+            bool first = newerVersion == null || newerVersion != v;
+            newerVersion = v;
+            string name = v.Build > 0 ? v.ToString(3) : v.ToString(2);
+            trayDownload.Text = "Скачать VolumeGuard " + name + "…";
+            trayDownload.Visible = true;
+            Text = "VolumeGuard — доступна версия " + name;
+            if (first) Notify("Вышла VolumeGuard " + name, "Нажмите, чтобы открыть страницу загрузки.", true);
+        }
+
+        static void OpenReleases()
+        {
+            try { Process.Start(Updates.ReleasesPage); } catch { }
+        }
+
         /// A short notification next to the tray icon.
-        void Notify(string title, string text)
+        void Notify(string title, string text, bool update = false)
         {
             if (demo || !tray.Visible) return;
+            balloonIsUpdate = update;
             try { tray.ShowBalloonTip(1500, title, string.IsNullOrEmpty(text) ? " " : text, ToolTipIcon.None); } catch { }
         }
 

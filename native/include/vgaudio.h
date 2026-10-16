@@ -20,7 +20,7 @@ extern "C" {
 #define VG_API __declspec(dllimport)
 #endif
 
-#define VG_API_VERSION 3
+#define VG_API_VERSION 4
 
 /* results */
 #define VG_OK              0
@@ -88,6 +88,11 @@ VG_API int  vg_list_apps(wchar_t* buffer, int capacity);
 VG_API int  vg_route_app(unsigned int pid, const wchar_t* deviceId);
 /* The device app pid is sent to ("" = the default). Returns the wchar_t count needed, like vg_list_devices. */
 VG_API int  vg_app_route(unsigned int pid, wchar_t* buffer, int capacity);
+/* API 4: the real delay of the running processing, measured: plays 5 short beeps (3 ms, 2 kHz, -10 dBFS)
+ * into the source device and finds them in what the output device plays (loopback), on the QPC clock.
+ * Does not include what the output device adds after Windows (its DAC / USB / Bluetooth). Blocks ~2.5 s.
+ * VG_OK: *ms = median delay; VG_ERR_ARGS: not running; VG_ERR_TIMEOUT: fewer than 3 beeps heard. */
+VG_API int  vg_measure_latency(float* ms, int* beepsHeard);
 /* The last error as text (English, for the log / tooltip). Returns its length. */
 VG_API int  vg_last_error(wchar_t* buffer, int capacity);
 

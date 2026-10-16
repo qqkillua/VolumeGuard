@@ -23,6 +23,7 @@ typedef int (*FnError)(wchar_t*, int);
 typedef int (*FnApps)(wchar_t*, int);
 typedef int (*FnRoute)(unsigned int, const wchar_t*);
 typedef int (*FnGetRoute)(unsigned int, wchar_t*, int);
+typedef int (*FnMeasure)(float*, int*);
 
 int main()
 {
@@ -38,7 +39,8 @@ int main()
     FnApps apps = (FnApps)GetProcAddress(dll, "vg_list_apps");
     FnRoute route = (FnRoute)GetProcAddress(dll, "vg_route_app");
     FnGetRoute getRoute = (FnGetRoute)GetProcAddress(dll, "vg_app_route");
-    if (!version || !list || !start || !stop || !params || !status || !error || !apps || !route || !getRoute)
+    FnMeasure measure = (FnMeasure)GetProcAddress(dll, "vg_measure_latency");
+    if (!version || !list || !start || !stop || !params || !status || !error || !apps || !route || !getRoute || !measure)
     {
         std::printf("::error title=vgaudio smoke test::an exported function is missing\n");
         return 1;
@@ -82,6 +84,14 @@ int main()
         std::printf("per-app routing on this Windows: %s (0x%08X)\n", r == VG_OK ? "available" : "not available", (unsigned)r);
     }
 
+    // measuring needs the processing running
+    {
+        float ms = -1.0f;
+        int heard = -1;
+        CHECK(measure(&ms, &heard) == VG_ERR_ARGS && heard == 0, "vg_measure_latency without the engine running");
+        CHECK(measure(nullptr, nullptr) == VG_ERR_ARGS, "vg_measure_latency(nullptr)");
+    }
+
     // argument checks
     CHECK(start(L"x", L"x") == VG_ERR_SAME, "same device was not refused");
     CHECK(start(nullptr, L"x") == VG_ERR_ARGS, "missing id was not refused");
@@ -109,6 +119,13 @@ int main()
         {
             for (int i = 0; i < 6; ++i)
             {
+                if (i == 4)
+                {
+                    float ms = 0.0f;
+                    int heard = 0;
+                    const int m = measure(&ms, &heard);
+                    std::printf("  measured delay: %d, %.1f ms (%d beeps heard)\n", m, ms, heard);
+                }
                 Sleep(500);
                 status(&st, sizeof st);
                 std::printf("  state %d, %d -> %d Hz, latency %.1f ms (source %.1f + buffer %.1f + output %.1f + lookahead %.1f), drift %+.0f ppm, gaps %d\n",

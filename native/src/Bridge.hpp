@@ -361,7 +361,7 @@ public:
 
     void reset()
     {
-        integ_ = corr_ = 0.0;
+        integ_ = corr_ = want_ = 0.0;
         sumQ_ = sumT_ = 0.0;
         smooth_ = target_;
         primed_ = false;
@@ -389,26 +389,41 @@ public:
             const double unclamped = kP * err + kI * (integ_ + err * d);
             if (std::fabs(unclamped) < kMax)
                 integ_ = std::max(-kMax / kI, std::min(kMax / kI, integ_ + err * d));
-            corr_ = std::max(-kMax, std::min(kMax, kP * err + kI * integ_));
+            want_ = std::max(-kMax, std::min(kMax, kP * err + kI * integ_));
 
             lowSec_ += d;
             if (lowSec_ > 20.0)
             {
-                if (lowSince_ > floor_ + 0.002 * rate_ && target_ > minTarget_)
-                    target_ = std::max(minTarget_, target_ - 0.0005 * rate_);
+                // 20 s in which the queue never came near the floor: the margin is more than needed. Give back
+                // a quarter of what was never used (0.5…2 ms at a time, gently for the speed correction),
+                // so a one-off raise does not stay for ever.
+                const double unused = lowSince_ - floor_ - 0.002 * rate_;
+                if (unused > 0.0 && target_ > minTarget_)
+                    target_ = std::max(minTarget_, target_ - std::min(0.002 * rate_, std::max(0.0005 * rate_, 0.25 * unused)));
                 lowSince_ = 1e18;
                 lowSec_ = 0.0;
             }
         }
+        // the speed glides to the wanted one (every poll, at most kSlewPerSec) instead of jumping once per
+        // window: catching up after a hiccup bends the pitch smoothly
+        const double step = kSlewPerSec * dt;
+        corr_ += std::max(-step, std::min(step, want_ - corr_));
         return corr_;
     }
 
     /// Right after the device took its period (its event): the queue is at its low point. judge = false while
     /// the source is silent or just started (then a low queue is not our fault).
     /// Returns true if this was a glitch (the device found the queue empty).
-    bool onPull(double queueFrames, bool judge)
+    /// ourThreadLate: our thread did not run for a while before this (the system was busy): a glitch then is
+    /// counted but does not make the margin bigger — a bigger queue would not have helped against that.
+    bool onPull(double queueFrames, bool judge, bool ourThreadLate = false)
     {
         if (!judge || !primed_) return false;
+        if (ourThreadLate)
+        {
+            if (queueFrames <= 0.0) { ++glitches_; return true; }
+            return false;
+        }
         lowSince_ = std::min(lowSince_, queueFrames);
         if (queueFrames <= 0.0)
         {
@@ -448,6 +463,7 @@ public:
     void settle(double removedFrames) { smooth_ -= removedFrames; integ_ = 0.0; }
 
     static constexpr double kMax = 0.005;
+    static constexpr double kSlewPerSec = 0.003;   // 0.3 % per second
     static constexpr double kP = 0.54, kI = 0.09;
 
 private:
@@ -460,7 +476,7 @@ private:
     }
 
     double rate_ = 48000, period_ = 480, packet_ = 128, floor_ = 96, target_ = 500, minTarget_ = 336, maxTarget_ = 2880;
-    double window_ = 0.1, integ_ = 0, corr_ = 0, sumQ_ = 0, sumT_ = 0, smooth_ = 0;
+    double window_ = 0.1, integ_ = 0, corr_ = 0, want_ = 0, sumQ_ = 0, sumT_ = 0, smooth_ = 0;
     double lowSince_ = 1e18, lowSec_ = 0, lastRaise_ = -1e9, clock_ = 0;
     bool primed_ = false;
     uint64_t glitches_ = 0, dips_ = 0;

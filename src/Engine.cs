@@ -50,6 +50,8 @@ namespace VolumeGuard
         public int UiVersion;
         public List<SessionWrap> Sessions = new List<SessionWrap>();
         public bool Present { get { return Sessions.Count > 0; } }
+        /// Name of the other device this app plays to ("" = the device chosen in the window), for the card.
+        public string Where = "";
     }
 
     class MasterModel
@@ -76,6 +78,10 @@ namespace VolumeGuard
         public IAudioMeterInformation Meter;
         public float LastSet = -1f;
         public bool Seen, Dead, Active;
+        /// Plays to the device chosen in the window (whose volume the master limit and the anti-click move);
+        /// false: another device (e.g. the virtual cable the game is sent to) — only its own volume is limited.
+        public bool OnMain = true;
+        public string DeviceName = "";
     }
 
     class Settings
@@ -111,6 +117,8 @@ namespace VolumeGuard
         public Dictionary<string, string> ProcPrevRoute = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         /// Ctrl+Alt+P processing on/off, Ctrl+Alt+M next mode, Ctrl+Alt+L limiter on/off.
         public bool Hotkeys = true;
+        /// Ask GitHub once a day whether a newer version is out.
+        public bool CheckUpdates = true;
         public Dictionary<string, AppModel> Apps = new Dictionary<string, AppModel>(StringComparer.OrdinalIgnoreCase);
         public bool Dirty;
         /// The audio thread and the window share the models: whoever enumerates Apps / Sessions holds this.
@@ -193,6 +201,7 @@ namespace VolumeGuard
                             else if (p[1] == "sessionMeterAfterVolume") s.SessionMeterPost = p[2] == "1";
                             else if (p[1] == "masterMeterPost") s.MasterMeterPost = p[2] == "1";
                             else if (p[1] == "hotkeys") s.Hotkeys = p[2] == "1";
+                            else if (p[1] == "updates") s.CheckUpdates = p[2] == "1";
                             else if (p[1] == "procauto" && p.Length >= 5)
                             {
                                 s.ProcAuto = p[2] == "1";
@@ -259,6 +268,7 @@ namespace VolumeGuard
                     sb.AppendLine("opt|sessionMeterAfterVolume|" + B(SessionMeterPost));
                     sb.AppendLine("opt|masterMeterPost|" + B(MasterMeterPost));
                     sb.AppendLine("opt|hotkeys|" + B(Hotkeys));
+                    sb.AppendLine("opt|updates|" + B(CheckUpdates));
                     sb.AppendLine(string.Join("|", new[] { "opt", "procauto", B(ProcAuto), Clean(ProcAutoApp), Clean(ProcAutoTitle) }));
                     sb.AppendLine(string.Join("|", new[] { "proc", B(ProcOn), Clean(ProcSource), Clean(ProcOutput), ProcMode.ToString(IC), F(ProcAmount), F(ProcCeiling), F(ProcGain) }));
                     foreach (var r in ProcPrevRoute)
@@ -445,6 +455,10 @@ namespace VolumeGuard
         IAudioEndpointVolume epv;
         IAudioMeterInformation epMeter;
         IAudioSessionManager2 mgr;
+        // the other active output devices: their apps get cards and limits too (2.8)
+        readonly Dictionary<string, IAudioSessionManager2> otherMgrs = new Dictionary<string, IAudioSessionManager2>();
+        readonly Dictionary<string, string> otherNames = new Dictionary<string, string>();
+        DateTime lastDeviceScan = DateTime.MinValue;
         readonly Dictionary<string, SessionWrap> sessions = new Dictionary<string, SessionWrap>();
         readonly Dictionary<int, string[]> procCache = new Dictionary<int, string[]>();
         readonly Dictionary<string, Icon> iconCache = new Dictionary<string, Icon>(StringComparer.OrdinalIgnoreCase);
@@ -569,6 +583,10 @@ namespace VolumeGuard
         {
             foreach (var a in s.Apps.Values) { a.Sessions.Clear(); a.Adopted = false; a.Active = false; }
             sessions.Clear();
+            foreach (var m in otherMgrs.Values) Release(m, null);
+            otherMgrs.Clear();
+            otherNames.Clear();
+            lastDeviceScan = DateTime.MinValue;
             epv = null; epMeter = null; mgr = null; dev = null; devId = null;
         }
 
@@ -631,10 +649,57 @@ namespace VolumeGuard
 
             bool changed = false;
             foreach (var w in sessions.Values) w.Seen = false;
+            ScanSessions(mgr, true, "", ref changed);
+            UpdateOtherDevices();
+            foreach (var kv in otherMgrs) ScanSessions(kv.Value, false, otherNames[kv.Key], ref changed);
+            changed |= FinishRefresh();
+            return changed;
+        }
+
+        /// Every 5 s: the list of the other active output devices (plugged in, unplugged, enabled, disabled).
+        void UpdateOtherDevices()
+        {
+            if ((DateTime.UtcNow - lastDeviceScan).TotalSeconds < 5.0) return;
+            lastDeviceScan = DateTime.UtcNow;
+            var now = new HashSet<string>();
+            try
+            {
+                var col = En.EnumAudioEndpoints(EDataFlow.eRender, DEVICE_STATE_ACTIVE);
+                int n = col.GetCount();
+                for (int i = 0; i < n; i++)
+                {
+                    IMMDevice d = null;
+                    try
+                    {
+                        d = col.Item(i);
+                        string id = d.GetId();
+                        if (id == devId) continue;
+                        now.Add(id);
+                        if (otherMgrs.ContainsKey(id)) continue;
+                        Guid iid = typeof(IAudioSessionManager2).GUID;
+                        otherMgrs[id] = (IAudioSessionManager2)d.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero);
+                        otherNames[id] = FriendlyName(d);
+                    }
+                    catch { }
+                    finally { Release(d, null); }
+                }
+                Release(col, null);
+            }
+            catch { return; }
+            foreach (var id in otherMgrs.Keys.Where(k => !now.Contains(k)).ToList())
+            {
+                Release(otherMgrs[id], null);
+                otherMgrs.Remove(id);
+                otherNames.Remove(id);
+            }
+        }
+
+        void ScanSessions(IAudioSessionManager2 manager, bool onMain, string deviceName, ref bool changed)
+        {
             IAudioSessionEnumerator se = null;
             try
             {
-                se = mgr.GetSessionEnumerator();
+                se = manager.GetSessionEnumerator();
                 int n = se.GetCount();
                 for (int i = 0; i < n; i++)
                 {
@@ -663,7 +728,11 @@ namespace VolumeGuard
                     if (spid == OwnPid) continue;
                     try
                     {
-                        w = new SessionWrap { Id = id, Ctl = c, Vol = (ISimpleAudioVolume)c, Meter = (IAudioMeterInformation)c, Seen = true, Active = state == 1 };
+                        w = new SessionWrap
+                        {
+                            Id = id, Ctl = c, Vol = (ISimpleAudioVolume)c, Meter = (IAudioMeterInformation)c, Seen = true,
+                            Active = state == 1, OnMain = onMain, DeviceName = deviceName
+                        };
                         string key, title;
                         Icon icon;
                         Identify(c, out key, out title, out icon);
@@ -683,7 +752,12 @@ namespace VolumeGuard
                 // a new enumerator every second: free it now instead of waiting for the garbage collector
                 Release(se, null);
             }
+        }
 
+        /// After all devices were scanned: drop sessions that are gone, update the apps.
+        bool FinishRefresh()
+        {
+            bool changed = false;
             foreach (var w in sessions.Values.Where(x => !x.Seen || x.Dead).ToList())
             {
                 Release(w.Ctl, null);
@@ -700,6 +774,9 @@ namespace VolumeGuard
                     continue;
                 }
                 a.Active = a.Sessions.Any(x => x.Active);
+                // plays only to other devices: show where (e.g. the virtual cable of the sound processing)
+                string where = a.Sessions.Any(x => x.OnMain) ? "" : a.Sessions[0].DeviceName;
+                if (where != a.Where) { a.Where = where; changed = true; }
                 try
                 {
                     bool mute = a.Sessions[0].Vol.GetMute();
@@ -894,7 +971,7 @@ namespace VolumeGuard
 
         void TickApp(AppModel a, float decay, float rel, bool full)
         {
-            float inPeak = 0f;
+            float inPeak = 0f, inPeakMain = 0f;
             foreach (var w in a.Sessions)
             {
                 if (w.Dead) continue;
@@ -911,6 +988,7 @@ namespace VolumeGuard
                     float p = w.Meter.GetPeakValue();
                     float lin = s.SessionMeterPost ? (cur > 1e-3f ? p / cur : 0f) : p;
                     inPeak = Limiter.CombinePeak(inPeak, lin);   // several streams add up
+                    if (w.OnMain) inPeakMain = Limiter.CombinePeak(inPeakMain, lin);
                 }
                 catch { w.Dead = true; }
             }
@@ -926,13 +1004,15 @@ namespace VolumeGuard
             // anti-click: how much louder than its limit this app is coming out right now, with the volume
             // that is actually set (the sessions' own volume only acts on the next packet)
             // (only when limiting every peak: the other modes let short peaks through on purpose)
-            if (s.Enabled && a.LimitOn && s.AntiClick && HardwareVolume && s.LimitMode == 0 && inPeak >= Limiter.Gate)
+            // (only the streams on the window's device: the device volume does not act on the other devices)
+            if (inPeakMain > 4f) inPeakMain = 4f;
+            if (s.Enabled && a.LimitOn && s.AntiClick && HardwareVolume && s.LimitMode == 0 && inPeakMain >= Limiter.Gate)
             {
                 float applied = -1f;
                 foreach (var w in a.Sessions)
-                    if (!w.Dead && w.LastSet > applied) applied = w.LastSet;
+                    if (!w.Dead && w.OnMain && w.LastSet > applied) applied = w.LastSet;
                 if (applied < 0f) applied = a.Gain;
-                float lim = Db.ToLin(Limiter.PeakLimitDb(a.LimitDb, s.LimitMode)), outLvl = inPeak * applied;
+                float lim = Db.ToLin(Limiter.PeakLimitDb(a.LimitDb, s.LimitMode)), outLvl = inPeakMain * applied;
                 if (outLvl > lim * 1.26f)   // more than 2 dB over: small overshoots are not worth moving the device
                     duckRequest = Math.Min(duckRequest, Math.Max(-30f, Db.FromLin(lim / outLvl)));
             }
