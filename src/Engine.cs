@@ -893,20 +893,53 @@ namespace VolumeGuard
         {
             if (epv == null) return;
             clock += dt;
-            float decay = (float)Math.Exp(-dt / Limiter.EnvSec(s.ReturnSpeed));
-            float rel = 1f - (float)Math.Exp(-dt / Limiter.ReturnSec(s.ReturnSpeed));
+            sinceFull += dt;
+            float decay, rel;
+            SetCoefs(dt, out decay, out rel);
+            // apps first: they tell the device step below whether a loud sound slipped past their volume.
+            // Only apps with a limit need the 2 ms steps; the others (just shown in the window) are stepped every
+            // 10 ms with coefficients for that time — 2.8.0 polled every app's meters 500 times a second, ~10 % CPU
+            // with many apps on several devices.
+            duckRequest = 0f;
+            foreach (var a in s.Apps.Values)
+                if (a.Present && s.Enabled && a.LimitOn) TickApp(a, decay, rel, full);
+            if (full)
+            {
+                float decaySlow, relSlow;
+                SetCoefs(sinceFull, out decaySlow, out relSlow);
+                foreach (var a in s.Apps.Values)
+                    if (a.Present && !(s.Enabled && a.LimitOn)) TickApp(a, decaySlow, relSlow, true);
+                SetCoefs(dt, out decay, out rel);
+                sinceFull = 0f;
+            }
+            try { TickMaster(decay, rel, full, dt); }
+            catch { Status = "Устройство вывода отключено"; Drop(); }
+        }
+
+        float sinceFull;
+
+        /// Something is limited right now (an app or the device): the audio thread then steps every 2 ms.
+        public bool NeedsFastSteps
+        {
+            get
+            {
+                if (!s.Enabled) return false;
+                if (s.Master.LimitOn) return true;
+                foreach (var a in s.Apps.Values) if (a.Present && a.LimitOn) return true;
+                return false;
+            }
+        }
+
+        void SetCoefs(float dt, out float decay, out float rel)
+        {
+            decay = (float)Math.Exp(-dt / Limiter.EnvSec(s.ReturnSpeed));
+            rel = 1f - (float)Math.Exp(-dt / Limiter.ReturnSec(s.ReturnSpeed));
             msCoef = 1f - (float)Math.Exp(-dt / Limiter.LevelSec(s.LimitMode));
             msRiseCoef = 1f - (float)Math.Exp(-dt / Limiter.RiseSec(s.LimitMode));
             double att = Limiter.AttackSec(s.LimitMode);
             attackCoef = att > 0 ? 1f - (float)Math.Exp(-dt / att) : 1f;
             double memSec = Limiter.MemorySec(s.Memory);
             holdDecay = memSec > 0 ? (float)Math.Exp(-dt / memSec) : 1f;
-            // apps first: they tell the device step below whether a loud sound slipped past their volume
-            duckRequest = 0f;
-            foreach (var a in s.Apps.Values)
-                if (a.Present) TickApp(a, decay, rel, full);
-            try { TickMaster(decay, rel, full, dt); }
-            catch { Status = "Устройство вывода отключено"; Drop(); }
         }
 
         void TickMaster(float decay, float rel, bool full, float dt)

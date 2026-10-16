@@ -112,9 +112,11 @@ namespace VolumeGuard
 
             var clock = Stopwatch.StartNew();
             double last = 0, lastFull = 0, lastRefresh = 0;
+            bool needFast = true;
             while (!quit)
             {
-                wake.WaitOne(FastMs);
+                // 2 ms steps only while something is limited; otherwise every 10 ms is plenty (less CPU)
+                wake.WaitOne(needFast ? FastMs : FullMs);
                 // queued work from the window
                 while (true)
                 {
@@ -128,15 +130,17 @@ namespace VolumeGuard
 
                 double now = clock.Elapsed.TotalSeconds;
                 if (now - last < FastMs / 1000.0 * 0.5) continue;   // woken early by a posted action
+                if (!needFast && now - lastFull < FullMs / 1000.0 * 0.9) continue;
                 float dt = (float)Math.Min(0.25, Math.Max(0.0005, now - last));
                 last = now;
-                bool full = now - lastFull >= FullMs / 1000.0;
+                bool full = !needFast || now - lastFull >= FullMs / 1000.0;
                 if (full) lastFull = now;
                 lock (s.Sync)
                 {
                     try
                     {
                         inner.Tick(dt, full);   // every step advances the limiter by the time since the previous one
+                        needFast = inner.NeedsFastSteps;
                         if (now - lastRefresh >= 1.0)
                         {
                             lastRefresh = now;
