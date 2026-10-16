@@ -869,9 +869,20 @@ namespace VolumeGuard
                     Enabled = srcName.Length > 0 && s.ProcSource != s.ProcOutput
                 };
                 to.Click += delegate { Route(app, s.ProcSource, srcName); };
-                var back = new ToolStripMenuItem("Вернуть на устройство по умолчанию");
-                back.Click += delegate { Route(app, "", ""); };
                 item.DropDownItems.Add(to);
+                // back to where it played before VolumeGuard moved it (remembered per app), if that was a device
+                string prev;
+                if (s.ProcPrevRoute.TryGetValue(app.Exe, out prev) && prev.Length > 0 && prev != app.DeviceId)
+                {
+                    string prevName;
+                    if (!names.TryGetValue(prev, out prevName)) prevName = "устройство, которое сейчас отключено";
+                    var was = new ToolStripMenuItem("Вернуть как было: «" + Short(prevName) + "»");
+                    string prevId = prev, prevLabel = prevName;
+                    was.Click += delegate { Route(app, prevId, prevLabel); };
+                    item.DropDownItems.Add(was);
+                }
+                var back = new ToolStripMenuItem(prev != null && prev.Length == 0 ? "Вернуть как было: устройство по умолчанию" : "Вернуть на устройство по умолчанию");
+                back.Click += delegate { Route(app, "", ""); };
                 item.DropDownItems.Add(back);
                 menu.Items.Add(item);
             }
@@ -884,6 +895,13 @@ namespace VolumeGuard
 
         void Route(AudioApp app, string deviceId, string deviceName)
         {
+            // going to the processing: remember where it played until now, to put it back later
+            bool toSource = deviceId.Length > 0 && deviceId == s.ProcSource;
+            if (toSource)
+            {
+                string before = proc.AppRoute(app.Pid);
+                if (before != s.ProcSource) { s.ProcPrevRoute[app.Exe] = before; s.Dirty = true; }
+            }
             int r = proc.RouteApp(app.Pid, deviceId);
             if (r != 0)
             {
@@ -893,14 +911,27 @@ namespace VolumeGuard
                 return;
             }
             routeInfo.ForeColor = Theme.Sub;
-            if (deviceId.Length == 0)
+            if (!toSource)
             {
-                routeInfo.Text = Short(app.Title) + " снова играет в устройство по умолчанию.";
+                routeInfo.Text = Short(app.Title) + (deviceId.Length == 0 ? " снова играет в устройство по умолчанию." : " снова играет в «" + Short(deviceName) + "».");
+                if (s.ProcAutoApp == app.Exe && s.ProcOn)
+                {
+                    // the game no longer goes through the processing: switch it off, and do not switch it on for this game
+                    s.ProcAuto = false;
+                    s.ProcOn = false;
+                    s.Dirty = true;
+                    onSw.Checked = false;
+                    proc.Apply();
+                    SyncAuto();
+                    routeInfo.Text += " Обработка выключена.";
+                }
                 return;
             }
-            routeInfo.Text = Short(app.Title) + " теперь играет в «" + Short(deviceName) + "». Если звук не переключился — перезапустите игру.";
+            routeInfo.Text = Short(app.Title) + " теперь играет в «" + Short(deviceName) + "». Если звук не переключился — перезапустите игру. " +
+                             "Вернуть как было — в этом же меню.";
             s.ProcAutoApp = app.Exe;
             s.ProcAutoTitle = app.Title;
+            s.ProcAuto = true;
             s.Dirty = true;
             // the game now plays into a device nobody listens to: without the processing it would be silent
             if (!s.ProcOn)

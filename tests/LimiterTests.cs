@@ -35,6 +35,7 @@ namespace VolumeGuard.Tests
                 float decay = (float)Math.Exp(-dt / Limiter.EnvSec(Speed));
                 float rel = 1f - (float)Math.Exp(-dt / Limiter.ReturnSec(Speed));
                 float msCoef = 1f - (float)Math.Exp(-dt / Limiter.LevelSec(Mode));
+                float msRise = 1f - (float)Math.Exp(-dt / Limiter.RiseSec(Mode));
                 double mem = Limiter.MemorySec(Memory);
                 float holdDecay = mem > 0 ? (float)Math.Exp(-dt / mem) : 1f;
                 double att = Limiter.AttackSec(Mode);
@@ -46,7 +47,7 @@ namespace VolumeGuard.Tests
                     float outDb = DbOf(p * Gain) - LimitDb;
                     if (p >= Limiter.Gate && outDb > MaxOverDb) MaxOverDb = outDb;
                     Limiter.Step(ref Gain, ref Env, ref Ms, ref Hold, p, User, true, LimitDb, Limiter.Floor(User, false),
-                                 decay, rel, msCoef, Mode, holdDecay, attack);
+                                 decay, rel, msCoef, msRise, Mode, holdDecay, attack);
                     if (float.IsNaN(Gain) || Gain > User + 1e-6f || Gain < 0f) throw new Exception("gain out of range: " + Gain);
                 }
             }
@@ -151,6 +152,26 @@ namespace VolumeGuard.Tests
                 Check(worstStep < 0.5f, "smooth: volume dropped " + worstStep + " dB in one 2 ms step");
             }
 
+            // 6b. A loud sound that starts after a calm and goes on (not a single shot): how long it stays more than
+            //     3 dB over the limit. Before 2.7.3 the average needed ~0.3 s (loudness) and ~1 s (smooth).
+            {
+                float[] limits = { 0.15f, 0.35f };   // seconds, loudness / smooth (measured: ~0.09 / ~0.31)
+                for (int mode = 1; mode <= 2; mode++)
+                {
+                    var s = new Sim { Mode = mode };
+                    s.Run(2.0, t => Amb);
+                    double start = s.T, loudFor = 0;
+                    for (int i = 0; i < 1000; i++)
+                    {
+                        float before = s.Gain;
+                        s.Run(0.002, t => Ad);
+                        if (DbOf(Ad * before) - s.LimitDb > 3f) loudFor = s.T - start;
+                    }
+                    Check(loudFor < limits[mode - 1], (mode == 1 ? "loudness" : "smooth") + ": a sudden long loud sound stays >3 dB over the limit for " + loudFor.ToString("0.00") + " s");
+                    Console.WriteLine((mode == 1 ? "loudness" : "smooth") + ": sudden loud sound over the limit by >3 dB for " + loudFor.ToString("0.000") + " s");
+                }
+            }
+
             // 7. Several streams of one app add up.
             {
                 float sum = 0f;
@@ -196,6 +217,11 @@ namespace VolumeGuard.Tests
                 Check(!s.Hotkeys, "hotkeys off should load");
                 Check(s.ProcAuto && s.ProcAutoApp == "tslgame" && s.ProcAutoTitle == "PUBG: BATTLEGROUNDS",
                       "auto game: " + s.ProcAutoApp + " / " + s.ProcAutoTitle);
+                s.ParseLines(new[] { "route|TslGame|{0.0.0.00000000}.{abc}", "route|discord|", "route||x", "route|short" });
+                string prev;
+                Check(s.ProcPrevRoute.TryGetValue("tslgame", out prev) && prev == "{0.0.0.00000000}.{abc}", "previous device of the game");
+                Check(s.ProcPrevRoute.TryGetValue("discord", out prev) && prev == "", "previous device \"default\"");
+                Check(s.ProcPrevRoute.Count == 2, "bad route lines must be skipped, got " + s.ProcPrevRoute.Count);
                 s.ParseLines(new[] { "opt|procauto|0" });   // too short: ignored
                 Check(s.ProcAuto && s.ProcAutoApp == "tslgame", "a short procauto line must be ignored");
             }
