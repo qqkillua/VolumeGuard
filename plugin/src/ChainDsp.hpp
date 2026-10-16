@@ -47,6 +47,8 @@ public:
     void setInputGainDb(float db) { gainT_ = dbToGain(db); }
     void setCeilingDb(float db) { lim_.setCeilingDb(db); }
     void setReleaseMs(float ms) { lim_.setReleaseMs(ms); }
+    void setAutoRelease(bool on) { lim_.setAutoRelease(on); }
+    void setTruePeak(bool on) { lim_.setTruePeak(on); }
     void setMode(int mode) { game_.setMode(mode); }
     void setAmount(float amount01) { game_.setAmount(amount01); }
     void setBypass(bool on) { mixT_ = on ? 1.0f : 0.0f; }

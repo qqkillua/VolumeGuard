@@ -1,10 +1,16 @@
 **VolumeGuard Limiter** — плагин-лимитер VST3 и CLAP для FL Studio, Ableton, Reaper и других программ с плагинами.
 
-**Новое в 1.2.1:** никаких щелчков при смене настроек на ходу — Input Gain, Ceiling, режим, Amount и Bypass
-меняются плавно.
+**Новое в 1.3.0:**
+- **Пресеты** SHOOTER / MOVIE / NIGHT — одним нажатием в окне плагина или из списка пресетов программы.
+- **Шаги слышнее в TACTICAL:** тихие высокие звуки поднимаются на ~7 дБ (до +12 дБ при Amount 100 %).
+- **True Peak** — не пропускает пики и между сэмплами.
+- **Auto Release** — после одного выстрела громкость возвращается быстрее, в долгой перестрелке не «качается».
+- **График ослабления** за последние 10 секунд.
+
+**1.2.1:** без щелчков при смене настроек на ходу.
 
 **1.2.0 — игровой режим.** Кнопка **TACTICAL** делает выстрелы, взрывы и гул машин тише, а шаги громче:
-в тестах разница между выстрелами и шагами сократилась с 37,6 до 22,7 дБ (при Amount 100 % — до 17,8 дБ).
+в тестах разница между выстрелами и шагами сократилась с 37,6 до 22,7 дБ (при Amount 100 % — до 15,5 дБ).
 **COMFORT** — мягкий вариант для фильмов и одиночных игр. Ручка **Amount** задаёт силу.
 Направление звуков не меняется: оба канала обрабатываются одинаково.
 
@@ -15,6 +21,6 @@
 2. Папку `VST3\VolumeGuardLimiter.vst3` скопируйте в `C:\Program Files\Common Files\VST3\`.
 3. Обновите список плагинов в своей программе и найдите **VolumeGuard Limiter**.
 
-Параметры: Input Gain, Ceiling, Release, Bypass и индикатор Gain Reduction. Подробнее — в [plugin/README.md](https://github.com/qqkillua/VolumeGuard/blob/main/plugin/README.md).
+Параметры: Mode, Amount, Input Gain, Ceiling, Release, Auto Release, True Peak, Bypass. Подробнее — в [plugin/README.md](https://github.com/qqkillua/VolumeGuard/blob/main/plugin/README.md).
 
 Проверено [pluginval](https://github.com/Tracktion/pluginval) на максимальной строгости.

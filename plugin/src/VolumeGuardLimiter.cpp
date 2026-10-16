@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Nikita Bainov (qqkillua). MIT License.
 #include "DistrhoPlugin.hpp"
 #include "ChainDsp.hpp"
+#include "Presets.hpp"
 
 START_NAMESPACE_DISTRHO
 
@@ -19,11 +20,13 @@ public:
         kOutputLevel,     // output: meter
         kMode,            // 0 Limiter, 1 Comfort, 2 Tactical (added in 1.2.0, so it comes after the meters)
         kAmount,          // Game mode strength, %
+        kAutoRelease,     // release adapts to the sound (added in 1.3.0, so new ones come last)
+        kTruePeak,        // also limit the peaks between samples (1.3.0)
         kParameterCount
     };
 
     VolumeGuardLimiter()
-        : Plugin(kParameterCount, 0, 0)
+        : Plugin(kParameterCount, vgl::kPresetCount, 0)
     {
         fValues[kInputGain] = 0.0f;
         fValues[kCeiling] = -1.0f;
@@ -34,6 +37,8 @@ public:
         fValues[kOutputLevel] = -60.0f;
         fValues[kMode] = 0.0f;
         fValues[kAmount] = 50.0f;
+        fValues[kAutoRelease] = 1.0f;
+        fValues[kTruePeak] = 1.0f;
         prepare();
     }
 
@@ -41,12 +46,12 @@ protected:
     const char* getLabel() const override { return "VolumeGuardLimiter"; }
     const char* getDescription() const override
     {
-        return "Lookahead brickwall limiter with a Game mode that tames gunshots and rumble and lifts quiet sounds.";
+        return "Lookahead true-peak limiter with a Game mode that tames gunshots and rumble and lifts quiet footsteps.";
     }
     const char* getMaker() const override { return "qqkillua"; }
     const char* getHomePage() const override { return "https://github.com/qqkillua/VolumeGuard"; }
     const char* getLicense() const override { return "MIT"; }
-    uint32_t getVersion() const override { return d_version(1, 2, 1); }
+    uint32_t getVersion() const override { return d_version(1, 3, 0); }
     int64_t getUniqueId() const override { return d_cconst('V', 'G', 'L', 'm'); }
 
     void initAudioPort(bool input, uint32_t index, AudioPort& port) override
@@ -142,7 +147,42 @@ protected:
             p.ranges.max = 100.0f;
             p.ranges.def = 50.0f;
             break;
+        case kAutoRelease:
+            p.hints = kParameterIsAutomatable | kParameterIsBoolean | kParameterIsInteger;
+            p.name = "Auto Release";
+            p.shortName = "Auto Rel";
+            p.symbol = "auto_release";
+            p.ranges.min = 0.0f;
+            p.ranges.max = 1.0f;
+            p.ranges.def = 1.0f;
+            break;
+        case kTruePeak:
+            p.hints = kParameterIsAutomatable | kParameterIsBoolean | kParameterIsInteger;
+            p.name = "True Peak";
+            p.shortName = "TP";
+            p.symbol = "true_peak";
+            p.ranges.min = 0.0f;
+            p.ranges.max = 1.0f;
+            p.ranges.def = 1.0f;
+            break;
         }
+    }
+
+    void initProgramName(uint32_t index, String& name) override
+    {
+        if (index < (uint32_t)vgl::kPresetCount) name = vgl::kPresets[index].name;
+    }
+
+    void loadProgram(uint32_t index) override
+    {
+        if (index >= (uint32_t)vgl::kPresetCount) return;
+        const vgl::Preset& p = vgl::kPresets[index];
+        setParameterValue(kInputGain, p.inputGainDb);
+        setParameterValue(kCeiling, p.ceilingDb);
+        setParameterValue(kRelease, p.releaseMs);
+        setParameterValue(kMode, p.mode);
+        setParameterValue(kAmount, p.amount);
+        setParameterValue(kAutoRelease, p.autoRelease);
     }
 
     float getParameterValue(uint32_t index) const override
@@ -163,6 +203,8 @@ protected:
         case kBypass:    fChain.setBypass(value > 0.5f); break;
         case kMode:      fChain.setMode((int)std::lround(value)); break;
         case kAmount:    fChain.setAmount(value / 100.0f); break;
+        case kAutoRelease: fChain.setAutoRelease(value > 0.5f); break;
+        case kTruePeak:    fChain.setTruePeak(value > 0.5f); break;
         }
     }
 
@@ -198,6 +240,8 @@ private:
         fChain.setBypass(fValues[kBypass] > 0.5f);
         fChain.setMode((int)std::lround(fValues[kMode]));
         fChain.setAmount(fValues[kAmount] / 100.0f);
+        fChain.setAutoRelease(fValues[kAutoRelease] > 0.5f);
+        fChain.setTruePeak(fValues[kTruePeak] > 0.5f);
         setLatency((uint32_t)fChain.latencySamples());
     }
 

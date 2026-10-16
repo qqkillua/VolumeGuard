@@ -1,7 +1,9 @@
 // VolumeGuard Limiter — plugin window (DPF + NanoVG), in the same dark style as the VolumeGuard app.
 // Copyright (c) 2026 Nikita Bainov (qqkillua). MIT License.
 #include "DistrhoUI.hpp"
+#include "Presets.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 
@@ -10,9 +12,13 @@ START_NAMESPACE_DISTRHO
 namespace {
 
 // Parameter indices — keep in sync with VolumeGuardLimiter.cpp
-enum { kInputGain = 0, kCeiling, kRelease, kBypass, kGainReduction, kInputLevel, kOutputLevel, kMode, kAmount, kCount };
+enum { kInputGain = 0, kCeiling, kRelease, kBypass, kGainReduction, kInputLevel, kOutputLevel, kMode, kAmount,
+       kAutoRelease, kTruePeak, kCount };
 
-constexpr uint kWidth = 520, kHeight = 440;
+constexpr uint kWidth = 520, kHeight = 560;
+constexpr int kHistory = 200;          // gain reduction graph: 200 points × 50 ms = the last 10 seconds
+constexpr double kHistoryStepSec = 0.05;
+const char* const kPresetLabels[vgl::kPresetCount] = { "DEFAULT", "SHOOTER", "MOVIE", "NIGHT" };
 constexpr int kSliderCount = 4;
 
 const char* const kModeNames[3] = { "LIMITER", "COMFORT", "TACTICAL" };
@@ -66,12 +72,17 @@ public:
         fValues[kOutputLevel] = -60.0f;
         fValues[kMode] = 0.0f;
         fValues[kAmount] = 50.0f;
+        fValues[kAutoRelease] = 1.0f;
+        fValues[kTruePeak] = 1.0f;
 
         const float x = 132, w = 290;
-        fSliders[0] = { kInputGain, "Input Gain", -12.0f, 24.0f, 0.0f, false, x, 172, w };
-        fSliders[1] = { kAmount, "Amount", 0.0f, 100.0f, 50.0f, false, x, 214, w };
-        fSliders[2] = { kCeiling, "Ceiling", -30.0f, 0.0f, -1.0f, false, x, 256, w };
-        fSliders[3] = { kRelease, "Release", 1.0f, 1000.0f, 100.0f, true, x, 298, w };
+        fSliders[0] = { kInputGain, "Input Gain", -12.0f, 24.0f, 0.0f, false, x, 226, w };
+        fSliders[1] = { kAmount, "Amount", 0.0f, 100.0f, 50.0f, false, x, 266, w };
+        fSliders[2] = { kCeiling, "Ceiling", -30.0f, 0.0f, -1.0f, false, x, 306, w };
+        fSliders[3] = { kRelease, "Release", 1.0f, 1000.0f, 100.0f, true, x, 346, w };
+
+        for (float& v : fHistory) v = 0.0f;
+        fHistoryTime = std::chrono::steady_clock::now();
     }
 
 protected:
@@ -81,8 +92,36 @@ protected:
     void parameterChanged(uint32_t index, float value) override
     {
         if (index >= kCount) return;
+        if (index == kGainReduction) fGrMin = std::fmin(fGrMin, value);
         if (fValues[index] == value) return;
         fValues[index] = value;
+        repaint();
+    }
+
+    void programLoaded(uint32_t index) override
+    {
+        if (index >= (uint32_t)vgl::kPresetCount) return;
+        applyPresetValues(vgl::kPresets[index]);
+        repaint();
+    }
+
+    // the gain reduction graph moves on even when the host sends nothing (silence, a paused track)
+    void uiIdle() override
+    {
+        const auto now = std::chrono::steady_clock::now();
+        int steps = (int)(std::chrono::duration<double>(now - fHistoryTime).count() / kHistoryStepSec);
+        if (steps <= 0) return;
+        steps = std::min(steps, kHistory);
+        fHistoryTime += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(steps * kHistoryStepSec));
+        if (std::chrono::duration<double>(now - fHistoryTime).count() > 1.0) fHistoryTime = now;   // after a long stall
+        const float v = fValues[kBypass] > 0.5f ? 0.0f : fGrMin;
+        for (int i = 0; i < steps; ++i)
+        {
+            fHistory[fHistoryPos] = v;
+            fHistoryPos = (fHistoryPos + 1) % kHistory;
+        }
+        fGrMin = fValues[kGainReduction];
         repaint();
     }
 
@@ -96,8 +135,9 @@ protected:
         // background and card
         rectFill(0, 0, kWidth, kHeight, kBg);
         roundFill(12, 56, kWidth - 24, 66, 10, kCard);
-        roundFill(12, 132, kWidth - 24, 186, 10, kCard);
-        roundFill(12, 328, kWidth - 24, 104, 10, kCard);
+        roundFill(12, 130, kWidth - 24, 46, 10, kCard);
+        roundFill(12, 184, kWidth - 24, 216, 10, kCard);
+        roundFill(12, 408, kWidth - 24, 144, 10, kCard);
 
         // header
         fontFace(NANOVG_DEJAVU_SANS_TTF);
@@ -120,8 +160,24 @@ protected:
         fontSize(10.5f);
         fillColor(kSub);
         text(26, 70, "MODE", nullptr);
-        text(26, 146, "SETTINGS", nullptr);
-        text(26, 342, "METERS", nullptr);
+        text(26, 153, "PRESET", nullptr);
+        text(26, 198, "SETTINGS", nullptr);
+        text(26, 422, "METERS", nullptr);
+
+        // preset buttons: the one matching the current settings is lit
+        const int preset = currentPreset();
+        for (int i = 0; i < vgl::kPresetCount; ++i)
+        {
+            float bx, bw;
+            presetButton(i, bx, bw);
+            const bool on = i == preset;
+            roundFill(bx, 141, bw, 24, 6, on ? (bypass ? kOff : kAccent) : kTrack);
+            fontSize(11);
+            textAlign(ALIGN_CENTER | ALIGN_MIDDLE);
+            fillColor(on ? Color(255, 255, 255) : kSub);
+            text(bx + bw / 2, 153, kPresetLabels[i], nullptr);
+        }
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
 
         // mode buttons
         const int mode = modeIndex();
@@ -145,11 +201,16 @@ protected:
         for (const Slider& s : fSliders)
             drawSlider(s, bypass || (s.param == kAmount && mode == 0));
 
+        // switches: auto release and true peak
+        drawSmallSwitch(26, 132, 380, "Auto Release", fValues[kAutoRelease] > 0.5f, bypass);
+        drawSmallSwitch(292, 398, 380, "True Peak", fValues[kTruePeak] > 0.5f, bypass);
+
         // meters
         const float ceiling = fValues[kCeiling];
-        drawMeter(364, "IN", fValues[kInputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
-        drawMeter(390, "OUT", fValues[kOutputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
-        drawReduction(416, bypass ? 0.0f : fValues[kGainReduction]);
+        drawMeter(442, "IN", fValues[kInputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
+        drawMeter(464, "OUT", fValues[kOutputLevel], -60.0f, 6.0f, kGreen, ceiling, bypass);
+        drawReduction(486, bypass ? 0.0f : fValues[kGainReduction]);
+        drawHistory(500, 44, bypass);
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -180,6 +241,42 @@ protected:
             setValue(kBypass, v);
             editParameter(kBypass, false);
             return true;
+        }
+
+        // auto release and true peak switches (the label is clickable too)
+        if (my >= 366 && my <= 394)
+        {
+            int param = -1;
+            if (mx >= 26 && mx <= 172) param = kAutoRelease;
+            else if (mx >= 292 && mx <= 438) param = kTruePeak;
+            if (param >= 0)
+            {
+                editParameter((uint32_t)param, true);
+                setValue(param, fValues[param] > 0.5f ? 0.0f : 1.0f);
+                editParameter((uint32_t)param, false);
+                return true;
+            }
+        }
+
+        // preset buttons
+        if (my >= 139 && my <= 167)
+        {
+            for (int i = 0; i < vgl::kPresetCount; ++i)
+            {
+                float bx, bw;
+                presetButton(i, bx, bw);
+                if (mx < bx || mx > bx + bw) continue;
+                const vgl::Preset& p = vgl::kPresets[i];
+                const int params[6] = { kInputGain, kCeiling, kRelease, kMode, kAmount, kAutoRelease };
+                const float values[6] = { p.inputGainDb, p.ceilingDb, p.releaseMs, p.mode, p.amount, p.autoRelease };
+                for (int k = 0; k < 6; ++k)
+                {
+                    editParameter((uint32_t)params[k], true);
+                    setValue(params[k], values[k]);
+                    editParameter((uint32_t)params[k], false);
+                }
+                return true;
+            }
         }
 
         // mode buttons
@@ -258,10 +355,43 @@ private:
         x = left + i * (w + gap);
     }
 
+    void presetButton(int i, float& x, float& w) const
+    {
+        const float left = 100, right = kWidth - 26, gap = 8;
+        w = (right - left - (vgl::kPresetCount - 1) * gap) / vgl::kPresetCount;
+        x = left + i * (w + gap);
+    }
+
+    /// The preset whose values the settings match right now, or -1.
+    int currentPreset() const
+    {
+        for (int i = 0; i < vgl::kPresetCount; ++i)
+        {
+            const vgl::Preset& p = vgl::kPresets[i];
+            const bool gameMode = p.mode > 0.5f;
+            if (std::fabs(fValues[kInputGain] - p.inputGainDb) < 0.05f && std::fabs(fValues[kCeiling] - p.ceilingDb) < 0.05f
+                && std::fabs(fValues[kRelease] - p.releaseMs) < 0.5f && modeIndex() == (int)p.mode
+                && (!gameMode || std::fabs(fValues[kAmount] - p.amount) < 0.5f)
+                && (fValues[kAutoRelease] > 0.5f) == (p.autoRelease > 0.5f))
+                return i;
+        }
+        return -1;
+    }
+
+    void applyPresetValues(const vgl::Preset& p)
+    {
+        fValues[kInputGain] = p.inputGainDb;
+        fValues[kCeiling] = p.ceilingDb;
+        fValues[kRelease] = p.releaseMs;
+        fValues[kMode] = p.mode;
+        fValues[kAmount] = p.amount;
+        fValues[kAutoRelease] = p.autoRelease;
+    }
+
     void setValue(int param, float v)
     {
         if (param == kRelease || param == kAmount || param == kMode) v = std::round(v);
-        else if (param != kBypass) v = std::round(v * 10.0f) / 10.0f;
+        else if (param != kBypass && param != kAutoRelease && param != kTruePeak) v = std::round(v * 10.0f) / 10.0f;
         fValues[param] = v;
         repaint();
         // tell the host last: nothing in this window is touched after the host has reacted
@@ -293,6 +423,16 @@ private:
         textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
         fillColor(on ? kText : kWarn);
         text(x + 42, y + 9, label, nullptr);
+    }
+
+    void drawSmallSwitch(float labelX, float x, float y, const char* label, bool on, bool bypass)
+    {
+        fontSize(13);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(kSub);
+        text(labelX, y, label, nullptr);
+        roundFill(x, y - 9, 34, 18, 9, on ? (bypass ? kOff : kAccent) : kTrack);
+        beginPath(); circle(on ? x + 25 : x + 9, y, 6); fillColor(Color(255, 255, 255)); fill();
     }
 
     void drawSlider(const Slider& s, bool bypass)
@@ -378,8 +518,46 @@ private:
         text(kWidth - 26, y, buf, nullptr);
     }
 
+    // gain reduction over the last 10 s: 0 dB at the top, -24 dB at the bottom; the newest point on the right
+    void drawHistory(float y, float h, bool bypass)
+    {
+        const float x = 70, w = 352;
+        fontSize(10.5f);
+        textAlign(ALIGN_LEFT | ALIGN_MIDDLE);
+        fillColor(kSub);
+        text(26, y + 8, "10 s", nullptr);
+        roundFill(x, y, w, h, 4, Color(kTrack, kCard, 0.5f));
+        for (float db : { -6.0f, -12.0f, -18.0f })
+            rectFill(x, y + h * (-db / 24.0f), w, 1, Color(kTrack, kCard, 0.25f));
+
+        beginPath();
+        moveTo(x, y);
+        float worst = 0.0f;
+        for (int i = 0; i < kHistory; ++i)
+        {
+            const float v = fHistory[(fHistoryPos + i) % kHistory];
+            worst = std::fmin(worst, v);
+            lineTo(x + w * (float)i / (kHistory - 1), y + h * std::fmin(1.0f, -v / 24.0f));
+        }
+        lineTo(x + w, y);
+        closePath();
+        fillColor(bypass ? kOff : Color(kWarn, kCard, 0.65f));
+        fill();
+
+        char buf[32];
+        if (worst > -0.05f) std::snprintf(buf, sizeof buf, "max 0.0");
+        else std::snprintf(buf, sizeof buf, "max %.1f", worst);
+        textAlign(ALIGN_RIGHT | ALIGN_MIDDLE);
+        fillColor(kSub);
+        text(kWidth - 26, y + 8, buf, nullptr);
+    }
+
     float fValues[kCount];
     Slider fSliders[kSliderCount];
+    float fHistory[kHistory];
+    int fHistoryPos = 0;
+    float fGrMin = 0.0f;
+    std::chrono::steady_clock::time_point fHistoryTime;
     int fDragging = -1;
     int fLastClickSlider = -1;
     uint fLastClickTime = 0;

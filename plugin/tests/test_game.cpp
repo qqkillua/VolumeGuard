@@ -158,7 +158,51 @@ int main()
         CHECK(l == l0, "Off mode changed the signal");
     }
 
-    // 6. Speed of the whole chain in Tactical.
+    // 6. The three bands add back up flat: low + mid + high = the input, at every frequency (±0.1 dB).
+    {
+        double worst = 0, worstF = 0;
+        for (double f : { 30.0, 80.0, 150.0, 300.0, 700.0, 1500.0, 2000.0, 3000.0, 6000.0, 12000.0, 18000.0 })
+        {
+            vgl::ThreeBandSplit sp; sp.prepare(sr);
+            const size_t n = (size_t)sr;
+            std::vector<float> y(n);
+            for (size_t i = 0; i < n; ++i)
+            {
+                float lo, mi, hi;
+                sp.split((float)std::sin(2 * kPi * f * i / sr), 0, lo, mi, hi);
+                y[i] = lo + mi + hi;
+            }
+            const double g = rmsDb(y, n / 2, n) + 3.0103;   // a sine of amplitude 1 is -3.01 dB RMS
+            if (std::fabs(g) > std::fabs(worst)) { worst = g; worstF = f; }
+        }
+        std::printf("three-band sum: largest deviation %.3f dB (at %.0f Hz)\n", worst, worstF);
+        CHECK(std::fabs(worst) < 0.1, "bands do not add up flat: %.3f dB at %.0f Hz", worst, worstF);
+    }
+
+    // 7. Footsteps lift: a quiet high sound (3 kHz) comes out louder than an equally quiet mid sound (500 Hz)
+    //    in Tactical; near silence (-85 dBFS, hiss) is not lifted; Comfort lifts less than Tactical.
+    {
+        auto gainAt = [&](int mode, double f, float amp) {
+            const size_t n = (size_t)(sr * 1.5);
+            std::vector<float> l(n), r(n);
+            for (size_t i = 0; i < n; ++i) l[i] = r[i] = amp * (float)std::sin(2 * kPi * f * i / sr);
+            const double in = rmsDb(l, n / 2, n);
+            Chain ch; ch.prepare(sr, mode, 0.5f, -1.0f);
+            ch.run(l, r);
+            return rmsDb(l, n / 2, n) - in;
+        };
+        const float quiet = 0.0056f, hiss = 0.0000562f;   // -45 and -85 dBFS
+        const double tacHi = gainAt(2, 3000, quiet), tacMid = gainAt(2, 500, quiet);
+        const double comHi = gainAt(1, 3000, quiet), comMid = gainAt(1, 500, quiet);
+        const double hissHi = gainAt(2, 3000, hiss), hissMid = gainAt(2, 500, hiss);
+        std::printf("quiet steps lift: Tactical %+.1f dB over mid sounds, Comfort %+.1f dB, hiss %+.1f dB\n",
+                    tacHi - tacMid, comHi - comMid, hissHi - hissMid);
+        CHECK(tacHi - tacMid >= 5.0, "Tactical lifts quiet high sounds only %.1f dB", tacHi - tacMid);
+        CHECK(comHi - comMid > 0.5 && comHi - comMid < tacHi - tacMid, "Comfort lift %.1f dB out of range", comHi - comMid);
+        CHECK(std::fabs(hissHi - hissMid) < 0.5, "hiss at -85 dBFS was lifted by %.1f dB", hissHi - hissMid);
+    }
+
+    // 8. Speed of the whole chain in Tactical.
     {
         Chain ch; ch.prepare(48000, 2, 0.5f, -1.0f);
         std::vector<float> l(512), r(512);

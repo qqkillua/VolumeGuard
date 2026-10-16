@@ -87,7 +87,7 @@ int main()
             lim.prepare(sr, 2);
             lim.setCeilingDb(-1.0f);
             const int lat = lim.latencySamples();
-            CHECK(lat == (int)std::lround(sr * 0.005) - 1, "sr=%.0f: latency %d", sr, lat);
+            CHECK(lat == (int)std::lround(sr * 0.005) - 1 + vgl::LookaheadLimiter::kTpHalf, "sr=%.0f: latency %d", sr, lat);
             const size_t n = (size_t)sr;
             Stereo in; in.l.resize(n); in.r.resize(n);
             for (size_t i = 0; i < n; ++i)
@@ -140,6 +140,170 @@ int main()
             float maxErr = 0;
             for (int i = lat; i < 4096; ++i) maxErr = std::max(maxErr, std::fabs(ol[i] - l[i - lat]));
             CHECK(maxErr < 1e-5f, "sr=%.0f: bypass changed the signal, max error %g", sr, maxErr);
+        }
+    }
+
+    // 6. Auto release: one short shot is released faster than the Release setting; a run of shots is
+    //    released slower (less pumping between them); the ceiling holds either way.
+    {
+        const double sr = 48000;
+        // gain (dB) the limiter applies to every sample, Release 100 ms
+        auto gains = [&](bool autoRel, const std::vector<float>& x) {
+            vgl::LookaheadLimiter lim;
+            lim.prepare(sr, 1); lim.setCeilingDb(-1.0f); lim.setReleaseMs(100.0f); lim.setAutoRelease(autoRel);
+            std::vector<float> g(x.size());
+            float pk = 0;
+            for (size_t i = 0; i < x.size(); ++i)
+            {
+                float v = x[i], o = 0;
+                const float* in[1] = { &v };
+                float* out[1] = { &o };
+                lim.process(in, out, 1, 1);
+                g[i] = lim.takeGainReductionDb();
+                pk = std::max(pk, std::fabs(o));
+            }
+            CHECK(pk <= vgl::dbToGain(-1.0f) * 1.000001f, "auto release %d: peak %.5f over the ceiling", (int)autoRel, pk);
+            CHECK(lim.clampCount() == 0, "auto release %d: safety clamp acted", (int)autoRel);
+            return g;
+        };
+        auto quietTone = [&](size_t i) { return 0.1f * (float)std::sin(2 * 3.14159265358979 * 300 * i / sr); };
+
+        // a) one 10 ms shot (+12 dB over the ceiling), then quiet: time until the gain is back above -1 dB
+        const size_t n = (size_t)(sr * 1.5), shotEnd = (size_t)(sr * 0.51);
+        std::vector<float> x(n);
+        for (size_t i = 0; i < n; ++i) x[i] = (i >= (size_t)(sr * 0.5) && i < shotEnd) ? 4.0f * ((i / 24) % 2 ? 1.0f : -1.0f) : quietTone(i);
+        double backMs[2] = { 0, 0 };
+        for (int a = 0; a < 2; ++a)
+        {
+            const std::vector<float> g = gains(a == 1, x);
+            size_t k = shotEnd;
+            while (k < n && g[k] < -1.0f) ++k;
+            backMs[a] = (k - shotEnd) * 1000.0 / sr;
+        }
+
+        // b) a burst of fire: 20 ms shots every 60 ms for 3 s; how far the gain swings between the shots
+        //    in the last 1.5 s, and how long it takes to come back fully after the burst
+        const size_t m = (size_t)(sr * 6), fireEnd = (size_t)(sr * 3);
+        std::vector<float> y(m);
+        for (size_t i = 0; i < m; ++i)
+        {
+            const double t = i / sr, ph = std::fmod(t, 0.06);
+            y[i] = (i < fireEnd && ph < 0.02) ? 4.0f * (float)std::sin(2 * 3.14159265358979 * 150 * t) : quietTone(i);
+        }
+        double swing[2] = { 0, 0 }, recoverS[2] = { 0, 0 };
+        for (int a = 0; a < 2; ++a)
+        {
+            const std::vector<float> g = gains(a == 1, y);
+            float lo = 0, hi = -200;
+            for (size_t i = (size_t)(sr * 1.5); i < fireEnd; ++i) { lo = std::min(lo, g[i]); hi = std::max(hi, g[i]); }
+            swing[a] = hi - lo;
+            size_t k = m - 1;
+            while (k > fireEnd && g[k] > -0.1f) --k;
+            recoverS[a] = (k - fireEnd) / sr;
+        }
+        std::printf("auto release: one shot back in %.0f ms (fixed %.0f ms); during fire the gain swings %.1f dB (fixed %.1f dB); "
+                    "after fire back to 0 dB in %.2f s (fixed %.2f s)\n",
+                    backMs[1], backMs[0], swing[1], swing[0], recoverS[1], recoverS[0]);
+        CHECK(backMs[1] < backMs[0] * 0.7, "auto release is not faster after one shot (%.0f vs %.0f ms)", backMs[1], backMs[0]);
+        CHECK(swing[1] < swing[0] * 0.6, "auto release does not reduce pumping (%.1f vs %.1f dB)", swing[1], swing[0]);
+        CHECK(recoverS[1] < 2.0, "auto release takes %.2f s to come back after the fire", recoverS[1]);
+    }
+
+    // 7. True peak: sounds whose samples stay under the ceiling but whose wave goes over it between the
+    //    samples (what a DAC or a resampler would play). Measured with a long 16× reconstruction.
+    {
+        const double sr = 48000, pi = 3.14159265358979;
+        // the loudest point of the rebuilt wave: 16 points between every two samples, 64-tap windowed sinc
+        auto truePeak = [&](const std::vector<float>& x, size_t from) {
+            const int half = 32, over = 16;
+            double pk = 0;
+            for (size_t n = from + half; n + half < x.size(); ++n)
+                for (int k = 0; k < over; ++k)
+                {
+                    const double f = k / double(over);
+                    double v = 0;
+                    for (int j = -half + 1; j <= half; ++j)
+                    {
+                        const double d = f - j;
+                        const double s = std::fabs(d) < 1e-12 ? 1.0 : std::sin(pi * d) / (pi * d);
+                        const double w = 0.5 + 0.5 * std::cos(pi * d / half);
+                        v += x[n + j] * s * w;
+                    }
+                    pk = std::max(pk, std::fabs(v));
+                }
+            return pk;
+        };
+        struct Case { const char* name; int type; };
+        const Case cases[] = {
+            { "12 kHz sine, samples at 45 deg", 0 },        // samples ±0.707, wave ±1.0 (+3 dB)
+            { "hard-clipped 1 kHz sine at -1.5 dB", 1 },    // clipped game audio: overshoot between samples
+            { "noise up to 18 kHz, peaks at +3 dB", 2 },
+        };
+        // noise like real audio: nothing above 18 kHz (game sound is filtered when it is made or resampled),
+        // scaled so its sample peak is exactly 1
+        std::vector<float> noise((size_t)(sr * 0.3));
+        {
+            std::mt19937 rng(11);
+            std::uniform_real_distribution<double> u(-1.0, 1.0);
+            const int half = 64;
+            std::vector<double> w(noise.size() + 2 * half);
+            for (double& v : w) v = u(rng);
+            double pk = 0;
+            for (size_t i = 0; i < noise.size(); ++i)
+            {
+                double v = 0;
+                for (int j = -half; j <= half; ++j)
+                {
+                    const double fc = 18000.0 / sr, d = j;
+                    const double s = j == 0 ? 2 * fc : std::sin(2 * pi * fc * d) / (pi * d);
+                    v += w[i + half + j] * s * (0.42 + 0.5 * std::cos(pi * d / half) + 0.08 * std::cos(2 * pi * d / half));
+                }
+                noise[i] = (float)v;
+                pk = std::max(pk, std::fabs(v));
+            }
+            for (float& v : noise) v = (float)(v / pk);
+        }
+        auto make = [&](int type, size_t i, std::mt19937& rng) {
+            const float clip = vgl::dbToGain(-1.5f);
+            if (type == 0) return (float)std::sin(2 * pi * 12000 * i / sr + pi / 4);
+            if (type == 1) return std::max(-clip, std::min(clip, (float)(3.0 * std::sin(2 * pi * 1000 * i / sr + 0.2))));
+            (void)rng;
+            return noise[i] * vgl::dbToGain(3.0f);
+        };
+        const float ceilingDb = -1.0f, ceil = vgl::dbToGain(ceilingDb);
+        for (const Case& cs : cases)
+        {
+            double tpOn = 0, tpOff = 0, inTp = 0, inSample = 0;
+            for (int on = 0; on < 2; ++on)
+            {
+                const size_t n = (size_t)(sr * 0.3);
+                std::vector<float> l(n), r(n);
+                std::mt19937 rng(11);
+                for (size_t i = 0; i < n; ++i) l[i] = r[i] = make(cs.type, i, rng);
+                if (on) { inTp = truePeak(l, 0); for (float v : l) inSample = std::max(inSample, (double)std::fabs(v)); }
+                vgl::LookaheadLimiter lim;
+                lim.prepare(sr, 2); lim.setCeilingDb(ceilingDb); lim.setTruePeak(on == 1);
+                const float* ins[2] = { l.data(), r.data() };
+                float* outs[2] = { l.data(), r.data() };
+                lim.process(ins, outs, 2, (int)n);
+                (on ? tpOn : tpOff) = truePeak(l, (size_t)(sr * 0.1));
+            }
+            std::printf("true peak, %s: input samples %.2f dB, wave %.2f dB; output wave %.2f dB (True peak off: %.2f dB), ceiling %.1f\n",
+                        cs.name, vgl::gainToDb((float)inSample), vgl::gainToDb((float)inTp),
+                        vgl::gainToDb((float)tpOn), vgl::gainToDb((float)tpOff), ceilingDb);
+            CHECK(tpOn <= ceil * vgl::dbToGain(0.1f), "%s: true peak %.2f dB over the ceiling", cs.name, vgl::gainToDb((float)tpOn));
+        }
+        // the first case must actually show the problem with True peak off, or the test proves nothing
+        {
+            const size_t n = (size_t)(sr * 0.3);
+            std::vector<float> l(n), r(n);
+            for (size_t i = 0; i < n; ++i) l[i] = r[i] = (float)std::sin(2 * pi * 12000 * i / sr + pi / 4);
+            vgl::LookaheadLimiter lim;
+            lim.prepare(sr, 2); lim.setCeilingDb(ceilingDb); lim.setTruePeak(false);
+            const float* ins[2] = { l.data(), r.data() };
+            float* outs[2] = { l.data(), r.data() };
+            lim.process(ins, outs, 2, (int)n);
+            CHECK(truePeak(l, (size_t)(sr * 0.1)) > ceil * vgl::dbToGain(1.0f), "test signal has no intersample peak");
         }
     }
 

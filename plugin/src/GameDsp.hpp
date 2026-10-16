@@ -3,9 +3,10 @@
 // Copyright (c) 2026 Nikita Bainov (qqkillua). MIT License.
 //
 // Signal path (both channels always get the same gain, so the direction of sounds is not changed):
-//   input ─┬─ low band  (< 150 Hz: engines, explosions, rumble) ── compressor ─┐
-//          └─ high band (≥ 150 Hz: shots, steps, voices)       ── compressor ─┴─ sum × make-up gain → limiter
-// The split is a 4th-order Linkwitz-Riley crossover: both bands add back up to a flat response.
+//   input ─┬─ low  (< 150 Hz: engines, explosions, rumble)     ── compressor ─────────────────┐
+//          ├─ mid  (150 Hz–2 kHz: body of shots, voices)       ── compressor ─────────────────┤
+//          └─ high (> 2 kHz: footsteps, reloads, doors, crack) ── compressor × quiet lift ────┴─ sum × make-up → limiter
+// The split is 4th-order Linkwitz-Riley at 150 Hz and 2 kHz: the bands add back up to a flat response.
 #pragma once
 
 #include <algorithm>
@@ -96,21 +97,97 @@ private:
     float thr_ = 0, ratio_ = 1, thrT_ = 0, ratioT_ = 1, knee_ = 6, att_ = 0, rel_ = 0, env_ = 0, minGrDb_ = 0;
 };
 
+/// Splits stereo sound into three bands that add back up flat (4th-order Linkwitz-Riley at 150 Hz and 2 kHz):
+///   low  < 150 Hz       engines, explosions, rumble
+///   mid  150 Hz–2 kHz   body of shots, voices
+///   high > 2 kHz        footsteps, reloads, doors, the crack of a shot
+/// The low band also goes through the 2 kHz all-pass, so all three stay in phase.
+class ThreeBandSplit
+{
+public:
+    static constexpr double kLowHz = 150.0, kHighHz = 2000.0;
+
+    void prepare(double fs)
+    {
+        const double q = 0.70710678118654752;   // Butterworth; two in a row = Linkwitz-Riley 4th order
+        lpA1_.lowpass(fs, kLowHz, q); lpA2_.lowpass(fs, kLowHz, q);
+        hpA1_.highpass(fs, kLowHz, q); hpA2_.highpass(fs, kLowHz, q);
+        lpB1_.lowpass(fs, kHighHz, q); lpB2_.lowpass(fs, kHighHz, q);
+        hpB1_.highpass(fs, kHighHz, q); hpB2_.highpass(fs, kHighHz, q);
+        apL1_.lowpass(fs, kHighHz, q); apL2_.lowpass(fs, kHighHz, q);
+        apH1_.highpass(fs, kHighHz, q); apH2_.highpass(fs, kHighHz, q);
+        reset();
+    }
+
+    void reset()
+    {
+        for (Biquad* b : { &lpA1_, &lpA2_, &hpA1_, &hpA2_, &lpB1_, &lpB2_, &hpB1_, &hpB2_, &apL1_, &apL2_, &apH1_, &apH2_ })
+            b->reset();
+    }
+
+    /// One sample of channel ch (0 or 1).
+    inline void split(float x, int ch, float& low, float& mid, float& high)
+    {
+        const float lo = lpA2_.process(lpA1_.process(x, ch), ch);
+        const float rest = hpA2_.process(hpA1_.process(x, ch), ch);
+        mid = lpB2_.process(lpB1_.process(rest, ch), ch);
+        high = hpB2_.process(hpB1_.process(rest, ch), ch);
+        // the same phase turn the 2 kHz split gives to mid + high
+        low = apL2_.process(apL1_.process(lo, ch), ch) + apH2_.process(apH1_.process(lo, ch), ch);
+    }
+
+private:
+    Biquad lpA1_, lpA2_, hpA1_, hpA2_, lpB1_, lpB2_, hpB1_, hpB2_, apL1_, apL2_, apH1_, apH2_;
+};
+
+/// Lifts QUIET sounds in a band (upward compression): below `liftBelowDb` the band gets louder, by 0.6 dB per dB
+/// it is below, up to `maxDb`. Very quiet sound (under `gateDb`, the noise floor) is not lifted,
+/// and the lift fades in over the first 10 dB above the gate, so hiss is never pumped up.
+class QuietLift
+{
+public:
+    void setup(double fs, float liftBelowDb, float maxDb, float gateDb = -72.0f)
+    {
+        belowT_ = liftBelowDb;
+        maxT_ = std::max(0.0f, maxDb);
+        gate_ = gateDb;
+        att_ = (float)std::exp(-1.0 / (fs * 0.003));    // 3 ms: a loud sound stops the lift at once
+        rel_ = (float)std::exp(-1.0 / (fs * 0.150));
+    }
+    void reset() { env_ = 0.0f; }
+    void snap() { below_ = belowT_; max_ = maxT_; }
+    inline void glide(float k) { below_ += (belowT_ - below_) * k; max_ += (maxT_ - max_) * k; }
+
+    inline float gain(float l, float r)
+    {
+        const float d = std::max(std::fabs(l), std::fabs(r));
+        env_ = d > env_ ? d + (env_ - d) * att_ : d + (env_ - d) * rel_;
+        if (max_ <= 0.01f || env_ < 1e-6f) return 1.0f;
+        const float x = 20.0f * std::log10(env_);
+        if (x <= gate_) return 1.0f;
+        float lift = std::min(max_, std::max(0.0f, (below_ - x) * 0.6f));
+        lift *= std::min(1.0f, (x - gate_) / 10.0f);
+        maxLiftDb_ = std::max(maxLiftDb_, lift);
+        return std::pow(10.0f, lift / 20.0f);
+    }
+
+    float takeLiftDb() { const float v = maxLiftDb_; maxLiftDb_ = 0.0f; return v; }
+
+private:
+    float below_ = -40, max_ = 0, belowT_ = -40, maxT_ = 0, gate_ = -72, att_ = 0, rel_ = 0, env_ = 0, maxLiftDb_ = 0;
+};
+
 class GameProcessor
 {
 public:
     enum Mode { kOff = 0, kComfort = 1, kTactical = 2 };
 
-    static constexpr double kCrossoverHz = 150.0;
+    static constexpr double kCrossoverHz = ThreeBandSplit::kLowHz;
 
     void prepare(double sampleRate)
     {
         fs_ = sampleRate > 0 ? sampleRate : 48000.0;
-        const double q = 0.70710678118654752;   // Butterworth; two in a row = Linkwitz-Riley 4th order
-        lp1_.lowpass(fs_, kCrossoverHz, q);
-        lp2_.lowpass(fs_, kCrossoverHz, q);
-        hp1_.highpass(fs_, kCrossoverHz, q);
-        hp2_.highpass(fs_, kCrossoverHz, q);
+        split_.prepare(fs_);
         glideK_ = (float)(1.0 - std::exp(-1.0 / (fs_ * 0.020)));
         configure();
         reset();
@@ -119,15 +196,15 @@ public:
     /// Clears the filters and jumps straight to the current settings (no glide): call before sound starts.
     void reset()
     {
-        lp1_.reset(); lp2_.reset(); hp1_.reset(); hp2_.reset();
-        low_.reset(); high_.reset();
+        split_.reset();
+        low_.reset(); mid_.reset(); high_.reset(); lift_.reset();
         snap();
     }
 
     /// Jump to the current settings without gliding (the next sound starts with them).
     void snap()
     {
-        low_.snap(); high_.snap();
+        low_.snap(); mid_.snap(); high_.snap(); lift_.snap();
         makeup_ = makeupT_;
         mix_ = mode_ != kOff ? 1.0f : 0.0f;
     }
@@ -157,39 +234,42 @@ public:
             if (mix_ != 0.0f)
             {
                 mix_ = 0.0f;
-                lp1_.reset(); lp2_.reset(); hp1_.reset(); hp2_.reset();
-                low_.reset(); high_.reset();
+                split_.reset();
+                low_.reset(); mid_.reset(); high_.reset(); lift_.reset();
             }
             return;   // off: the signal is untouched
         }
         const float k = glideK_;
         for (int i = 0; i < frames; ++i)
         {
-            low_.glide(k);
-            high_.glide(k);
+            low_.glide(k); mid_.glide(k); high_.glide(k); lift_.glide(k);
             makeup_ += (makeupT_ - makeup_) * k;
             mix_ += (wantMix - mix_) * k;
             if (std::fabs(mix_ - wantMix) < 1e-5f) mix_ = wantMix;
-            const float lowL = lp2_.process(lp1_.process(l[i], 0), 0);
-            const float lowR = lp2_.process(lp1_.process(r[i], 1), 1);
-            const float highL = hp2_.process(hp1_.process(l[i], 0), 0);
-            const float highR = hp2_.process(hp1_.process(r[i], 1), 1);
+            float lowL, midL, highL, lowR, midR, highR;
+            split_.split(l[i], 0, lowL, midL, highL);
+            split_.split(r[i], 1, lowR, midR, highR);
             const float gLow = low_.gain(lowL, lowR);
-            const float gHigh = high_.gain(highL, highR);
-            // 4th-order Linkwitz-Riley bands are in phase and add up flat (checked: ±0.00 dB, 50 Hz…5 kHz)
-            const float yl = (lowL * gLow + highL * gHigh) * makeup_;
-            const float yr = (lowR * gLow + highR * gHigh) * makeup_;
+            const float gMid = mid_.gain(midL, midR);
+            // the footsteps band: loud sounds pressed down, quiet ones lifted (both channels the same)
+            const float gHigh = high_.gain(highL, highR) * lift_.gain(highL, highR);
+            const float yl = (lowL * gLow + midL * gMid + highL * gHigh) * makeup_;
+            const float yr = (lowR * gLow + midR * gMid + highR * gHigh) * makeup_;
             if (mix_ >= 1.0f) { l[i] = yl; r[i] = yr; }
             else { l[i] += (yl - l[i]) * mix_; r[i] += (yr - r[i]) * mix_; }
         }
     }
 
-    /// Strongest reduction (dB, ≤ 0) of the main band since the last call, for the meter.
+    /// Strongest reduction (dB, ≤ 0) since the last call, for the meter.
     float takeReductionDb()
     {
-        const float lo = low_.takeReductionDb(), hi = high_.takeReductionDb();
-        return std::min(hi, lo * 0.5f);   // rumble counts half: it is heard less than the shots
+        const float lo = low_.takeReductionDb(), mi = mid_.takeReductionDb(), hi = high_.takeReductionDb();
+        lift_.takeLiftDb();
+        return std::min(std::min(mi, hi), lo * 0.5f);   // rumble counts half: it is heard less than the shots
     }
+
+    /// Largest lift of quiet high sounds (dB, ≥ 0) since the last call.
+    float takeLiftDb() { return lift_.takeLiftDb(); }
 
 private:
     void configure()
@@ -198,16 +278,24 @@ private:
         if (mode_ == kComfort)
         {
             low_.setup(fs_, -16.0f - 10.0f * a, 3.0f, 10.0f, 200.0f);
+            mid_.setup(fs_, -20.0f - 10.0f * a, 2.5f, 8.0f, 250.0f);
             high_.setup(fs_, -20.0f - 10.0f * a, 2.5f, 8.0f, 250.0f);
+            lift_.setup(fs_, -36.0f, 4.0f * a);             // a little more detail in quiet scenes
             makeupT_ = dbToGainLocal(6.0f * a);
         }
         else if (mode_ == kTactical)
         {
             low_.setup(fs_, -26.0f - 10.0f * a, 8.0f, 3.0f, 150.0f);
+            mid_.setup(fs_, -22.0f - 14.0f * a, 6.0f, 1.5f, 120.0f);
             high_.setup(fs_, -22.0f - 14.0f * a, 6.0f, 1.5f, 120.0f);
+            lift_.setup(fs_, -30.0f, 4.0f + 8.0f * a);      // footsteps: up to +8 dB at 50 %, +12 dB at 100 %
             makeupT_ = dbToGainLocal(4.0f + 10.0f * a);
         }
-        else makeupT_ = 1.0f;
+        else
+        {
+            lift_.setup(fs_, -40.0f, 0.0f);
+            makeupT_ = 1.0f;
+        }
     }
 
     static float dbToGainLocal(float db) { return std::pow(10.0f, db / 20.0f); }
@@ -215,8 +303,9 @@ private:
     double fs_ = 48000.0;
     int mode_ = kOff;
     float amount_ = 0.5f, makeup_ = 1.0f, makeupT_ = 1.0f, mix_ = 0.0f, glideK_ = 0.001f;
-    Biquad lp1_, lp2_, hp1_, hp2_;
-    BandCompressor low_, high_;
+    ThreeBandSplit split_;
+    BandCompressor low_, mid_, high_;
+    QuietLift lift_;
 };
 
 } // namespace vgl
