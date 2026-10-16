@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <audiopolicy.h>
 #include <avrt.h>
 #include <mmreg.h>
 #include <propidl.h>
@@ -41,6 +42,8 @@ const IID kIID_IAudioRenderClient = { 0xF294ACFC, 0x3146, 0x4483, { 0xA7, 0xBF, 
 const IID kIID_IAudioCaptureClient = { 0xC8ADBD64, 0xE71E, 0x48A0, { 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17 } };
 const GUID kSubtypeFloat = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
 const GUID kSubtypePcm = { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
+const IID kIID_IAudioSessionManager2 = { 0x77AA99A0, 0x1BD6, 0x484F, { 0x8B, 0xC7, 0x2C, 0x65, 0x4C, 0x9A, 0x9B, 0x6F } };
+const IID kIID_IAudioSessionControl2 = { 0xBFB7FF88, 0x7239, 0x4FC9, { 0x8F, 0xA2, 0x07, 0xC9, 0x50, 0xBE, 0x9C, 0x6D } };
 const PROPERTYKEY kPKEY_FriendlyName = { { 0xA45C254E, 0xDF1C, 0x4EFD, { 0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0 } }, 14 };
 
 template <class T>
@@ -728,9 +731,214 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
     return TRUE;
 }
 
+// ---------------------------------------------------------------------------------------------------------
+// Which device an app plays to — what "Settings → System → Sound → Volume mixer → Output device" sets per app.
+// Windows has no public API for it. The interface below is the one the Settings page itself uses (also used
+// by the open-source EarTrumpet): the activation factory of "Windows.Media.Internal.AudioPolicyConfig".
+// Its IID changed in Windows build 21390 (21H2); the method layout did not, so both IIDs are tried.
+// Vtable: IUnknown (3) + IInspectable (3) + 19 other methods, then
+//   [25] SetPersistedDefaultAudioEndpoint(UINT32 pid, EDataFlow, ERole, HSTRING deviceInterfacePath)
+//   [26] GetPersistedDefaultAudioEndpoint(UINT32 pid, EDataFlow, ERole, HSTRING* deviceInterfacePath)
+// The device is given as its interface path: \\?\SWD#MMDEVAPI#<endpoint id>#{e6327cad-…} (render endpoints).
+// Windows remembers the choice for the app (by its exe), so it also holds the next time the game starts.
+
+typedef void* HStr;
+typedef HRESULT(WINAPI* RoGetActivationFactoryFn)(HStr, REFIID, void**);
+typedef HRESULT(WINAPI* WindowsCreateStringFn)(const wchar_t*, UINT32, HStr*);
+typedef HRESULT(WINAPI* WindowsDeleteStringFn)(HStr);
+typedef const wchar_t*(WINAPI* WindowsGetStringRawBufferFn)(HStr, UINT32*);
+typedef HRESULT(STDMETHODCALLTYPE* SetPersistedFn)(void*, UINT32, EDataFlow, ERole, HStr);
+typedef HRESULT(STDMETHODCALLTYPE* GetPersistedFn)(void*, UINT32, EDataFlow, ERole, HStr*);
+
+const wchar_t kMmdevPrefix[] = L"\\\\?\\SWD#MMDEVAPI#";
+const wchar_t kRenderSuffix[] = L"#{e6327cad-dcec-4949-ae8a-991e976a79d2}";
+
+struct PolicyConfig
+{
+    RoGetActivationFactoryFn getFactory = nullptr;
+    WindowsCreateStringFn createString = nullptr;
+    WindowsDeleteStringFn deleteString = nullptr;
+    WindowsGetStringRawBufferFn rawBuffer = nullptr;
+    IUnknown* factory = nullptr;
+
+    // in the caller's COM apartment; returns S_OK or why not
+    HRESULT open()
+    {
+        HMODULE combase = LoadLibraryW(L"combase.dll");
+        if (!combase) return HRESULT_FROM_WIN32(GetLastError());
+        getFactory = (RoGetActivationFactoryFn)(void*)GetProcAddress(combase, "RoGetActivationFactory");
+        createString = (WindowsCreateStringFn)(void*)GetProcAddress(combase, "WindowsCreateString");
+        deleteString = (WindowsDeleteStringFn)(void*)GetProcAddress(combase, "WindowsDeleteString");
+        rawBuffer = (WindowsGetStringRawBufferFn)(void*)GetProcAddress(combase, "WindowsGetStringRawBuffer");
+        if (!getFactory || !createString || !deleteString || !rawBuffer) return E_NOTIMPL;   // Windows 7
+        static const wchar_t cls[] = L"Windows.Media.Internal.AudioPolicyConfig";
+        HStr name = nullptr;
+        HRESULT hr = createString(cls, (UINT32)(sizeof cls / sizeof cls[0] - 1), &name);
+        if (FAILED(hr)) return hr;
+        static const IID iids[2] = {
+            { 0xab3d4648, 0xe242, 0x459f, { 0xb0, 0x2f, 0x54, 0x1c, 0x70, 0x30, 0x63, 0x24 } },   // build 21390 and later
+            { 0x2a59116d, 0x6c4f, 0x45e0, { 0xa7, 0x4f, 0x70, 0x7e, 0x3f, 0xef, 0x92, 0x58 } },   // Windows 10 before 21H2
+        };
+        for (const IID& iid : iids)
+        {
+            hr = getFactory(name, iid, reinterpret_cast<void**>(&factory));
+            if (SUCCEEDED(hr) && factory) break;
+            factory = nullptr;
+        }
+        deleteString(name);
+        return factory ? S_OK : (FAILED(hr) ? hr : E_NOINTERFACE);
+    }
+
+    ~PolicyConfig() { if (factory) factory->Release(); }
+
+    void** vtable() const { return *reinterpret_cast<void***>(factory); }
+
+    HRESULT set(UINT32 pid, const wchar_t* endpointId)
+    {
+        HStr path = nullptr;
+        if (endpointId && *endpointId)
+        {
+            const std::wstring s = std::wstring(kMmdevPrefix) + endpointId + kRenderSuffix;
+            const HRESULT hr = createString(s.c_str(), (UINT32)s.size(), &path);
+            if (FAILED(hr)) return hr;
+        }
+        // null = back to the default device. Both roles, as the Settings page does.
+        const SetPersistedFn fn = (SetPersistedFn)vtable()[25];
+        HRESULT hr = fn(factory, pid, eRender, eMultimedia, path);
+        if (SUCCEEDED(hr)) hr = fn(factory, pid, eRender, eConsole, path);
+        if (path) deleteString(path);
+        return hr;
+    }
+
+    std::wstring get(UINT32 pid)
+    {
+        HStr path = nullptr;
+        const GetPersistedFn fn = (GetPersistedFn)vtable()[26];
+        if (FAILED(fn(factory, pid, eRender, eMultimedia, &path)) || !path) return std::wstring();
+        UINT32 len = 0;
+        const wchar_t* raw = rawBuffer(path, &len);
+        std::wstring s = raw ? std::wstring(raw, len) : std::wstring();
+        deleteString(path);
+        const std::wstring pre(kMmdevPrefix), suf(kRenderSuffix);
+        if (s.compare(0, pre.size(), pre) == 0) s.erase(0, pre.size());
+        if (s.size() >= suf.size() && _wcsicmp(s.c_str() + s.size() - suf.size(), suf.c_str()) == 0) s.erase(s.size() - suf.size());
+        return s;
+    }
+};
+
+int copyOut(const std::wstring& out, wchar_t* buffer, int capacity)
+{
+    const int need = (int)out.size() + 1;
+    if (buffer && capacity >= need) wmemcpy(buffer, out.c_str(), (size_t)need);
+    return need;
+}
+
+std::wstring processPath(DWORD pid)
+{
+    std::wstring path;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return path;
+    wchar_t buf[MAX_PATH * 2];
+    DWORD len = (DWORD)(sizeof buf / sizeof buf[0]);
+    if (QueryFullProcessImageNameW(h, 0, buf, &len)) path.assign(buf, len);
+    CloseHandle(h);
+    return path;
+}
+
 extern "C" {
 
 VG_API int vg_version(void) { return VG_API_VERSION; }
+
+VG_API int vg_list_apps(wchar_t* buffer, int capacity)
+{
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    std::wstring out;
+    {
+        const DWORD self = GetCurrentProcessId();
+        std::vector<DWORD> seen;
+        Com<IMMDeviceEnumerator> en;
+        Com<IMMDeviceCollection> list;
+        if (SUCCEEDED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, kIID_IMMDeviceEnumerator, en.putVoid()))
+            && SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, list.put())))
+        {
+            UINT count = 0;
+            list->GetCount(&count);
+            for (UINT i = 0; i < count; ++i)
+            {
+                Com<IMMDevice> dev;
+                if (FAILED(list->Item(i, dev.put()))) continue;
+                LPWSTR id = nullptr;
+                if (FAILED(dev->GetId(&id)) || !id) continue;
+                const std::wstring devId = id;
+                CoTaskMemFree(id);
+                Com<IAudioSessionManager2> mgr;
+                Com<IAudioSessionEnumerator> sessions;
+                if (FAILED(dev->Activate(kIID_IAudioSessionManager2, CLSCTX_ALL, nullptr, mgr.putVoid()))
+                    || FAILED(mgr->GetSessionEnumerator(sessions.put())))
+                    continue;
+                int n = 0;
+                sessions->GetCount(&n);
+                for (int k = 0; k < n; ++k)
+                {
+                    Com<IAudioSessionControl> ctl;
+                    Com<IAudioSessionControl2> ctl2;
+                    if (FAILED(sessions->GetSession(k, ctl.put()))
+                        || FAILED(ctl->QueryInterface(kIID_IAudioSessionControl2, ctl2.putVoid())))
+                        continue;
+                    AudioSessionState state = AudioSessionStateExpired;
+                    DWORD pid = 0;
+                    ctl2->GetState(&state);
+                    if (state == AudioSessionStateExpired || FAILED(ctl2->GetProcessId(&pid)) || pid == 0 || pid == self)
+                        continue;   // gone, system sounds, or VolumeGuard's own output
+                    bool dup = false;
+                    for (DWORD s : seen) dup = dup || s == pid;
+                    if (dup) continue;
+                    seen.push_back(pid);
+                    std::wstring path = processPath(pid);
+                    if (path.empty()) continue;
+                    for (wchar_t& c : path) if (c == L'\t' || c == L'\n') c = L' ';
+                    wchar_t num[16];
+                    swprintf(num, 16, L"%lu", (unsigned long)pid);
+                    out += num;
+                    out += L'\t';
+                    out += path;
+                    out += L'\t';
+                    out += devId;
+                    out += state == AudioSessionStateActive ? L"\t1\n" : L"\t0\n";
+                }
+            }
+        }
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    return copyOut(out, buffer, capacity);
+}
+
+VG_API int vg_route_app(unsigned int pid, const wchar_t* deviceId)
+{
+    if (pid == 0) return VG_ERR_ARGS;
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    HRESULT hr;
+    {
+        PolicyConfig pc;
+        hr = pc.open();
+        if (SUCCEEDED(hr)) hr = pc.set(pid, deviceId);
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    logLine("route app pid %u to %s: hr 0x%08lX", pid, deviceId && *deviceId ? "a device" : "default", (unsigned long)hr);
+    return SUCCEEDED(hr) ? VG_OK : (int)hr;
+}
+
+VG_API int vg_app_route(unsigned int pid, wchar_t* buffer, int capacity)
+{
+    const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    std::wstring out;
+    {
+        PolicyConfig pc;
+        if (SUCCEEDED(pc.open())) out = pc.get(pid);
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    return copyOut(out, buffer, capacity);
+}
 
 VG_API int vg_list_devices(wchar_t* buffer, int capacity)
 {

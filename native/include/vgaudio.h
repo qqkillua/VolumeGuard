@@ -20,7 +20,7 @@ extern "C" {
 #define VG_API __declspec(dllimport)
 #endif
 
-#define VG_API_VERSION 2
+#define VG_API_VERSION 3
 
 /* results */
 #define VG_OK              0
@@ -79,6 +79,15 @@ VG_API void vg_set_params(int mode, float amountPercent, float ceilingDb, float 
 /* size = sizeof(vg_status), so newer DLLs can extend the struct. Returns VG_OK. */
 VG_API int  vg_get_status(vg_status* status, int size);
 
+/* API 3: per-app output device (the "Output device" of an app in Windows' volume mixer).
+ * Apps that play sound now, one per line: "pid\texe path\tdevice id\tactive(0/1)\n". Same size rules as above. */
+VG_API int  vg_list_apps(wchar_t* buffer, int capacity);
+/* Send app pid to device id (as listed by vg_list_devices); NULL or "" = back to the Windows default.
+ * Windows remembers it for that app. Returns VG_OK or a failure HRESULT (negative). Uses an undocumented
+ * Windows interface (Windows 10 1803+); on older systems it fails and the app should open Settings instead. */
+VG_API int  vg_route_app(unsigned int pid, const wchar_t* deviceId);
+/* The device app pid is sent to ("" = the default). Returns the wchar_t count needed, like vg_list_devices. */
+VG_API int  vg_app_route(unsigned int pid, wchar_t* buffer, int capacity);
 /* The last error as text (English, for the log / tooltip). Returns its length. */
 VG_API int  vg_last_error(wchar_t* buffer, int capacity);
 

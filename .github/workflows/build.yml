@@ -99,9 +99,13 @@ jobs:
             [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl)] public static extern int vg_version();
             [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int vg_list_devices(StringBuilder b, int c);
             [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int vg_start(string a, string b);
+            [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int vg_list_apps(StringBuilder b, int c);
+            [DllImport(@"$dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)] public static extern int vg_route_app(uint pid, string id);
           }
           "@
-          if ([Vg]::vg_version() -ne 2) { throw "vg_version via P/Invoke" }
+          if ([Vg]::vg_version() -ne 3) { throw "vg_version via P/Invoke" }
+          if ([Vg]::vg_list_apps($null, 0) -lt 1) { throw "vg_list_apps via P/Invoke" }
+          if ([Vg]::vg_route_app(0, $null) -ne -1) { throw "vg_route_app via P/Invoke" }
           if ([Vg]::vg_start("same", "same") -ne -2) { throw "vg_start via P/Invoke" }
           "::notice title=vgaudio::DLL loads in .NET (64-bit), API version $([Vg]::vg_version()), $([Vg]::vg_list_devices($null, 0)) chars of device list"
 

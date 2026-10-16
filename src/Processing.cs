@@ -49,12 +49,42 @@ namespace VolumeGuard
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
         public static extern int vg_last_error(StringBuilder buffer, int capacity);
+
+        // API 3: per-app output device
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+        public static extern int vg_list_apps(StringBuilder buffer, int capacity);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+        public static extern int vg_route_app(uint pid, string deviceId);
+
+        [DllImport(Dll, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Unicode)]
+        public static extern int vg_app_route(uint pid, StringBuilder buffer, int capacity);
+    }
+
+    /// An app that plays sound right now, and the device it plays to.
+    class AudioApp
+    {
+        public int Pid;
+        public string Exe = "", Title = "", DeviceId = "";
+        public bool Active;
     }
 
     class AudioDevice
     {
         public string Id, Name;
         public bool IsDefault;
+    }
+
+    static class AppNames
+    {
+        /// "TslGame" → the description in the exe ("PUBG: BATTLEGROUNDS"), or the file name.
+        public static string Title(string path, string exe)
+        {
+            string title = null;
+            try { title = FileVersionInfo.GetVersionInfo(path).FileDescription; } catch { }
+            if (string.IsNullOrEmpty(title) || title.Trim().Length == 0) title = exe;
+            return title.Trim();
+        }
     }
 
     /// Keeps vgaudio.dll running (or stopped) according to the settings. Starting can take a moment
@@ -93,7 +123,7 @@ namespace VolumeGuard
             }
             try
             {
-                if (VgNative.vg_version() != 2)
+                if (VgNative.vg_version() != 3)
                 {
                     UnavailableReason = "vgaudio.dll другой версии — скачайте полный архив релиза заново.";
                     return;
@@ -206,6 +236,71 @@ namespace VolumeGuard
             }
             catch { }
             return null;
+        }
+
+        /// Apps playing sound on any device (not VolumeGuard itself). One entry per process.
+        public List<AudioApp> ListApps()
+        {
+            var list = new List<AudioApp>();
+            if (demo)
+            {
+                list.Add(new AudioApp { Pid = 100, Exe = "tslgame", Title = "PUBG: BATTLEGROUNDS", DeviceId = "phones", Active = true });
+                list.Add(new AudioApp { Pid = 200, Exe = "discord", Title = "Discord", DeviceId = "phones", Active = true });
+                list.Add(new AudioApp { Pid = 300, Exe = "chrome", Title = "Google Chrome", DeviceId = "phones" });
+                return list;
+            }
+            if (!Available) return list;
+            try
+            {
+                int need = VgNative.vg_list_apps(null, 0);
+                var sb = new StringBuilder(Math.Max(need, 1) + 512);
+                VgNative.vg_list_apps(sb, sb.Capacity);
+                foreach (var line in sb.ToString().Split(new[] { '\n' }))
+                {
+                    var p = line.Split(new[] { '\t' });
+                    int pid;
+                    if (p.Length < 4 || !int.TryParse(p[0], out pid)) continue;
+                    string exe = Path.GetFileNameWithoutExtension(p[1]);
+                    if (exe.Length == 0) continue;
+                    list.Add(new AudioApp { Pid = pid, Exe = exe.ToLowerInvariant(), Title = AppNames.Title(p[1], exe), DeviceId = p[2], Active = p[3] == "1" });
+                }
+            }
+            catch { }
+            list.Sort((a, b) => a.Active != b.Active ? (a.Active ? -1 : 1) : string.Compare(a.Title, b.Title, StringComparison.CurrentCultureIgnoreCase));
+            return list;
+        }
+
+        /// Sends the app to a device ("" = back to the Windows default). 0 = done, otherwise an HRESULT.
+        public int RouteApp(int pid, string deviceId)
+        {
+            if (demo) return 0;
+            if (!Available) return -1;
+            try { return VgNative.vg_route_app((uint)pid, string.IsNullOrEmpty(deviceId) ? null : deviceId); }
+            catch { return -6; }
+        }
+
+        /// The device Windows was told to use for this app ("" = the default device).
+        public string AppRoute(int pid)
+        {
+            if (demo || !Available) return "";
+            try
+            {
+                var sb = new StringBuilder(512);
+                int need = VgNative.vg_app_route((uint)pid, sb, sb.Capacity);
+                if (need > sb.Capacity) { sb = new StringBuilder(need + 16); VgNative.vg_app_route((uint)pid, sb, sb.Capacity); }
+                return sb.ToString();
+            }
+            catch { return ""; }
+        }
+
+        /// Windows Settings → Volume mixer, where every app's output device can be chosen by hand.
+        public static void OpenAppVolumeSettings()
+        {
+            try { Process.Start("ms-settings:apps-volume"); }
+            catch
+            {
+                try { Process.Start("sndvol.exe"); } catch { }
+            }
         }
 
         public static bool CableInstalled(List<AudioDevice> devices)
@@ -414,6 +509,9 @@ namespace VolumeGuard
         readonly Label amountVal = new Label(), ceilingVal = new Label(), gainVal = new Label();
         readonly LevelMeter meter = new LevelMeter();
         readonly Label status = new Label();
+        readonly FlatButton routeBtn = new FlatButton();
+        readonly Label routeInfo = new Label();
+        readonly ToggleSwitch autoSw = new ToggleSwitch();
         readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         List<AudioDevice> devices = new List<AudioDevice>();
         bool filling;
@@ -491,16 +589,37 @@ namespace VolumeGuard
             srcBox.SelectedIndexChanged += delegate { OnDeviceChosen(srcBox, true); };
             outBox.SelectedIndexChanged += delegate { OnDeviceChosen(outBox, false); };
 
+            // send the game to the source device right from here (what Windows' volume mixer does)
+            routeBtn.Text = "Направить игру сюда ▾";
+            routeBtn.Font = Theme.Font(9f);
+            routeBtn.Location = new Point(x + Theme.D(92), y);
+            routeBtn.FitWidth();
+            routeBtn.Click += delegate { ShowRouteMenu(); };
+            Controls.Add(routeBtn);
             var how = new LinkLabel
             {
-                Text = "Устройство для игры выбирается в Windows: Громкость приложений →",
-                AutoSize = false, Location = new Point(x + Theme.D(92), y),
-                LinkColor = Theme.Accent, ActiveLinkColor = Theme.Text, VisitedLinkColor = Theme.Accent
+                Text = "или вручную: Громкость приложений →",
+                AutoSize = false, Location = new Point(routeBtn.Right + Theme.D(10), y + Theme.D(7)),
+                LinkColor = Theme.Accent, ActiveLinkColor = Theme.Text, VisitedLinkColor = Theme.Accent, Font = Theme.Font(8f)
             };
             int linkFrom = how.Text.IndexOf("Громкость", StringComparison.Ordinal);
             how.LinkArea = new LinkArea(linkFrom, how.Text.Length - linkFrom);
-            how.LinkClicked += delegate { OpenAppVolumeSettings(); };
-            y = Para(how, w - Theme.D(92)) + Theme.D(14);
+            how.LinkClicked += delegate { Processing.OpenAppVolumeSettings(); };
+            Para(how, w - (how.Left - x));
+            y = routeBtn.Bottom + Theme.D(6);
+            routeInfo.ForeColor = Theme.Sub;
+            routeInfo.Font = Theme.Font(8f);
+            routeInfo.Location = new Point(x + Theme.D(92), y);
+            routeInfo.Text = "Выберите игру — она станет играть в устройство «Игра играет в», Windows это запомнит. " +
+                             "Обработка будет включаться сама, пока игра запущена.";
+            y = Para(routeInfo, w - Theme.D(92)) + Theme.D(4);
+            autoSw.BackColor = Theme.Bg;
+            autoSw.Font = Theme.Font(9f);
+            autoSw.Location = new Point(x + Theme.D(92), y);
+            autoSw.CheckedChanged += delegate { s.ProcAuto = autoSw.Checked; s.Dirty = true; };
+            Controls.Add(autoSw);
+            SyncAuto();
+            y = autoSw.Bottom + Theme.D(14);
 
             Controls.Add(new Label { Text = "Режим", ForeColor = Theme.Sub, Location = new Point(x, y + Theme.D(6)), AutoSize = true });
             int bx = x + Theme.D(92), bw = (w - Theme.D(92) - Theme.D(12)) / 3;
@@ -562,6 +681,7 @@ namespace VolumeGuard
             FillDevices();
             bool on = proc.Available;
             foreach (Control c in Controls) if (c != status && c != intro && c != title && c != beta) c.Enabled = on;
+            SyncAuto();
 
             timer.Interval = 50;
             timer.Tick += delegate { OnTick(); };
@@ -701,13 +821,95 @@ namespace VolumeGuard
             }
         }
 
-        static void OpenAppVolumeSettings()
+        /// Called by the main window when the processing was switched by a hotkey or by the game starting.
+        public void SyncFromSettings()
         {
-            try { Process.Start("ms-settings:apps-volume"); }
-            catch
+            onSw.Checked = s.ProcOn;
+            SyncMode();
+            SyncAuto();
+        }
+
+        void SyncAuto()
+        {
+            bool known = s.ProcAutoApp.Length > 0;
+            // the game is the one last sent here with the button above
+            autoSw.Text = known
+                ? "Включать, пока запущена " + Short(s.ProcAutoTitle.Length > 0 ? s.ProcAutoTitle : s.ProcAutoApp, 22)
+                : "Включать при запуске игры";
+            autoSw.FitWidth();
+            autoSw.Checked = known && s.ProcAuto;
+            autoSw.Enabled = proc.Available && known;
+        }
+
+        static string Short(string title, int max = 28)
+        {
+            return title.Length > max ? title.Substring(0, max - 1) + "…" : title;
+        }
+
+        void ShowRouteMenu()
+        {
+            var menu = new ContextMenuStrip { ShowImageMargin = false, ShowCheckMargin = true };
+            menu.Closed += delegate { BeginInvoke(new Action(menu.Dispose)); };
+            var names = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var d in devices) names[d.Id] = d.Name;
+            string srcName;
+            if (!names.TryGetValue(s.ProcSource, out srcName)) srcName = "";
+            List<AudioApp> apps = proc.ListApps();
+            if (apps.Count == 0)
+                menu.Items.Add(new ToolStripMenuItem("Сейчас ни одно приложение не выводит звук — запустите игру") { Enabled = false });
+            foreach (var a in apps)
             {
-                try { Process.Start("sndvol.exe"); } catch { }
+                var app = a;
+                string now;
+                if (!names.TryGetValue(app.DeviceId, out now)) now = "?";
+                bool here = app.DeviceId == s.ProcSource && s.ProcSource.Length > 0;
+                var item = new ToolStripMenuItem(Short(app.Title) + "   — играет в " + Short(now)) { Checked = here };
+                var to = new ToolStripMenuItem(srcName.Length > 0 ? "Направить в «" + Short(srcName) + "» (обработка)" : "Сначала выберите, куда играет игра")
+                {
+                    Enabled = srcName.Length > 0 && s.ProcSource != s.ProcOutput
+                };
+                to.Click += delegate { Route(app, s.ProcSource, srcName); };
+                var back = new ToolStripMenuItem("Вернуть на устройство по умолчанию");
+                back.Click += delegate { Route(app, "", ""); };
+                item.DropDownItems.Add(to);
+                item.DropDownItems.Add(back);
+                menu.Items.Add(item);
             }
+            menu.Items.Add(new ToolStripSeparator());
+            var manual = new ToolStripMenuItem("Открыть «Громкость приложений» Windows");
+            manual.Click += delegate { Processing.OpenAppVolumeSettings(); };
+            menu.Items.Add(manual);
+            menu.Show(routeBtn, new Point(0, routeBtn.Height));
+        }
+
+        void Route(AudioApp app, string deviceId, string deviceName)
+        {
+            int r = proc.RouteApp(app.Pid, deviceId);
+            if (r != 0)
+            {
+                routeInfo.ForeColor = Theme.Warn;
+                routeInfo.Text = "Windows не дал переключить (код 0x" + r.ToString("X8") + "). Выберите устройство вручную: «Громкость приложений».";
+                Processing.OpenAppVolumeSettings();
+                return;
+            }
+            routeInfo.ForeColor = Theme.Sub;
+            if (deviceId.Length == 0)
+            {
+                routeInfo.Text = Short(app.Title) + " снова играет в устройство по умолчанию.";
+                return;
+            }
+            routeInfo.Text = Short(app.Title) + " теперь играет в «" + Short(deviceName) + "». Если звук не переключился — перезапустите игру.";
+            s.ProcAutoApp = app.Exe;
+            s.ProcAutoTitle = app.Title;
+            s.Dirty = true;
+            // the game now plays into a device nobody listens to: without the processing it would be silent
+            if (!s.ProcOn)
+            {
+                s.ProcOn = true;
+                onSw.Checked = true;
+                proc.Apply();
+            }
+            SyncAuto();
         }
 
         void OnTick()

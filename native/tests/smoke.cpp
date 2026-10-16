@@ -20,6 +20,9 @@ typedef void (*FnStop)(void);
 typedef void (*FnParams)(int, float, float, float, float, int);
 typedef int (*FnStatus)(vg_status*, int);
 typedef int (*FnError)(wchar_t*, int);
+typedef int (*FnApps)(wchar_t*, int);
+typedef int (*FnRoute)(unsigned int, const wchar_t*);
+typedef int (*FnGetRoute)(unsigned int, wchar_t*, int);
 
 int main()
 {
@@ -32,7 +35,10 @@ int main()
     FnParams params = (FnParams)GetProcAddress(dll, "vg_set_params");
     FnStatus status = (FnStatus)GetProcAddress(dll, "vg_get_status");
     FnError error = (FnError)GetProcAddress(dll, "vg_last_error");
-    if (!version || !list || !start || !stop || !params || !status || !error)
+    FnApps apps = (FnApps)GetProcAddress(dll, "vg_list_apps");
+    FnRoute route = (FnRoute)GetProcAddress(dll, "vg_route_app");
+    FnGetRoute getRoute = (FnGetRoute)GetProcAddress(dll, "vg_app_route");
+    if (!version || !list || !start || !stop || !params || !status || !error || !apps || !route || !getRoute)
     {
         std::printf("::error title=vgaudio smoke test::an exported function is missing\n");
         return 1;
@@ -58,6 +64,23 @@ int main()
         pos = nl + 1;
     }
     std::printf("playback devices: %d\n", (int)ids.size());
+
+    // apps that play sound and their output device (API 3)
+    {
+        const int needApps = apps(nullptr, 0);
+        std::vector<wchar_t> a((size_t)needApps + 1);
+        CHECK(apps(a.data(), (int)a.size()) == needApps, "vg_list_apps size changed between calls");
+        int lines = 0;
+        for (wchar_t c : a) lines += c == L'\n';
+        std::printf("apps playing sound: %d\n", lines);
+        CHECK(route(0, nullptr) == VG_ERR_ARGS, "pid 0 was not refused");
+        wchar_t cur[512];
+        const int n = getRoute(GetCurrentProcessId(), cur, 512);
+        CHECK(n >= 1, "vg_app_route returned %d", n);
+        // back to the default device for this test program: harmless, and shows whether the interface exists here
+        const int r = route(GetCurrentProcessId(), nullptr);
+        std::printf("per-app routing on this Windows: %s (0x%08X)\n", r == VG_OK ? "available" : "not available", (unsigned)r);
+    }
 
     // argument checks
     CHECK(start(L"x", L"x") == VG_ERR_SAME, "same device was not refused");

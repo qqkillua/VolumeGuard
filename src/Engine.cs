@@ -103,6 +103,11 @@ namespace VolumeGuard
         public string ProcSource = "", ProcOutput = "";
         public int ProcMode = 1;
         public float ProcAmount = 50f, ProcCeiling = -1f, ProcGain = 0f;
+        /// Turn the processing on while this game runs (exe name without .exe, lower case) and off when it exits.
+        public bool ProcAuto = true;
+        public string ProcAutoApp = "", ProcAutoTitle = "";
+        /// Ctrl+Alt+P processing on/off, Ctrl+Alt+M next mode, Ctrl+Alt+L limiter on/off.
+        public bool Hotkeys = true;
         public Dictionary<string, AppModel> Apps = new Dictionary<string, AppModel>(StringComparer.OrdinalIgnoreCase);
         public bool Dirty;
         /// The audio thread and the window share the models: whoever enumerates Apps / Sessions holds this.
@@ -184,6 +189,13 @@ namespace VolumeGuard
                             else if (p[1] == "trayhint") s.TrayHintShown = p[2] == "1";
                             else if (p[1] == "sessionMeterAfterVolume") s.SessionMeterPost = p[2] == "1";
                             else if (p[1] == "masterMeterPost") s.MasterMeterPost = p[2] == "1";
+                            else if (p[1] == "hotkeys") s.Hotkeys = p[2] == "1";
+                            else if (p[1] == "procauto" && p.Length >= 5)
+                            {
+                                s.ProcAuto = p[2] == "1";
+                                s.ProcAutoApp = p[3].Trim().ToLowerInvariant();
+                                s.ProcAutoTitle = p[4];
+                            }
                             break;
                         case "proc":
                             if (p.Length < 8) break;
@@ -239,6 +251,8 @@ namespace VolumeGuard
                     sb.AppendLine("opt|trayhint|" + B(TrayHintShown));
                     sb.AppendLine("opt|sessionMeterAfterVolume|" + B(SessionMeterPost));
                     sb.AppendLine("opt|masterMeterPost|" + B(MasterMeterPost));
+                    sb.AppendLine("opt|hotkeys|" + B(Hotkeys));
+                    sb.AppendLine(string.Join("|", new[] { "opt", "procauto", B(ProcAuto), Clean(ProcAutoApp), Clean(ProcAutoTitle) }));
                     sb.AppendLine(string.Join("|", new[] { "proc", B(ProcOn), Clean(ProcSource), Clean(ProcOutput), ProcMode.ToString(IC), F(ProcAmount), F(ProcCeiling), F(ProcGain) }));
                     sb.AppendLine(string.Join("|", new[] { "master", F(Master.UserVol), B(Master.LimitOn), F(Master.LimitDb), B(Master.Pending) }));
                     foreach (var a in Apps.Values)

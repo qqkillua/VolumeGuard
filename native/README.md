@@ -12,7 +12,7 @@
 
 | Файл | Что внутри |
 |---|---|
-| `include/vgaudio.h` | C API для VolumeGuard.exe (`vg_start`, `vg_stop`, `vg_set_params`, `vg_get_status`, `vg_list_devices`) |
+| `include/vgaudio.h` | C API для VolumeGuard.exe (`vg_start`, `vg_stop`, `vg_set_params`, `vg_get_status`, `vg_list_devices`; с API 3 — `vg_list_apps`, `vg_route_app`, `vg_app_route`: устройство вывода отдельного приложения) |
 | `src/Engine.cpp` | WASAPI: устройства, потоки, MMCSS «Pro Audio», переподключение, `audio.log` |
 | `src/Bridge.hpp` | Кольцевой буфер, ресемплер с подстройкой под часы, преобразование форматов (float/16/24/32 бит, 1–8 каналов) |
 | `src/Processor.hpp` | Обёртка над цепочкой обработки плагина (`plugin/src/ChainDsp.hpp`): те же звук и плавная смена настроек |

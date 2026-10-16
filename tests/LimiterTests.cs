@@ -188,6 +188,18 @@ namespace VolumeGuard.Tests
                     Check(!float.IsNaN(a.UserVol) && !float.IsNaN(a.LimitDb) && !float.IsNaN(a.Env), "NaN in " + a.Key);
             }
 
+            // 9. 2.7 settings: hotkeys and the game that switches the processing on.
+            {
+                var s = new Settings();
+                Check(s.Hotkeys && s.ProcAuto && s.ProcAutoApp == "", "defaults: hotkeys on, auto on, no game");
+                s.ParseLines(new[] { "opt|hotkeys|0", "opt|procauto|1|TslGame|PUBG: BATTLEGROUNDS" });
+                Check(!s.Hotkeys, "hotkeys off should load");
+                Check(s.ProcAuto && s.ProcAutoApp == "tslgame" && s.ProcAutoTitle == "PUBG: BATTLEGROUNDS",
+                      "auto game: " + s.ProcAutoApp + " / " + s.ProcAutoTitle);
+                s.ParseLines(new[] { "opt|procauto|0" });   // too short: ignored
+                Check(s.ProcAuto && s.ProcAutoApp == "tslgame", "a short procauto line must be ignored");
+            }
+
             if (failures > 0) { Console.WriteLine(failures + " check(s) failed"); Environment.Exit(1); }
             Console.WriteLine("all limiter checks passed");
         }

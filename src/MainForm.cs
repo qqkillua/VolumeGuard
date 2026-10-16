@@ -38,7 +38,12 @@ namespace VolumeGuard
         readonly Stopwatch clock = Stopwatch.StartNew();
         List<KeyValuePair<string, string>> devices = new List<KeyValuePair<string, string>>();
         Icon iconOn, iconOff;
-        double lastT, lastRefresh, lastReopen, lastSave, lastUi;
+        double lastT, lastRefresh, lastReopen, lastSave, lastUi, lastAutoCheck;
+        // auto processing: the game was running at the last check; the processing was switched on by us
+        bool gameWasRunning, autoEnabled;
+        bool hotkeysRegistered;
+        readonly ToggleSwitch hotkeysSw = new ToggleSwitch();
+        const int HkProcessing = 1, HkMode = 2, HkLimiter = 3;
         bool exiting, fillingDevices;
 
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -56,7 +61,7 @@ namespace VolumeGuard
             ForeColor = Theme.Text;
             Font = Theme.Font(9f);
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(Theme.D(500), Theme.D(806));
+            ClientSize = new Size(Theme.D(500), Theme.D(832));
             MinimumSize = new Size(Theme.D(420), Theme.D(460));
             iconOn = MakeIcon(true);
             iconOff = MakeIcon(false);
@@ -140,12 +145,13 @@ namespace VolumeGuard
             };
 
             // footer
-            var footer = new Panel { Dock = DockStyle.Bottom, Height = Theme.D(104), BackColor = Theme.Card };
+            var footer = new Panel { Dock = DockStyle.Bottom, Height = Theme.D(130), BackColor = Theme.Card };
             autostartSw.Text = "Запускать вместе с Windows";
             traySw.Text = "Сворачивать в трей при закрытии";
             antiClickSw.Text = "Без щелчка в начале громкого звука";
             int fy = Theme.D(10);
-            foreach (var sw in new[] { antiClickSw, autostartSw, traySw })
+            hotkeysSw.Text = "Горячие клавиши: Ctrl+Alt+P обработка, M режим, L лимитер";
+            foreach (var sw in new[] { antiClickSw, autostartSw, traySw, hotkeysSw })
             {
                 sw.BackColor = Theme.Card;
                 sw.Font = Theme.Font(9f);
@@ -160,12 +166,14 @@ namespace VolumeGuard
             antiClickSw.Checked = s.AntiClick;
             antiClickSw.CheckedChanged += delegate { s.AntiClick = antiClickSw.Checked; s.Dirty = true; };
             traySw.CheckedChanged += delegate { s.Tray = traySw.Checked; s.Dirty = true; };
+            hotkeysSw.Checked = s.Hotkeys;
+            hotkeysSw.CheckedChanged += delegate { s.Hotkeys = hotkeysSw.Checked; s.Dirty = true; UpdateHotkeys(); };
             statusLabel.ForeColor = Theme.Warn;
             statusLabel.BackColor = Theme.Card;
             statusLabel.AutoSize = false;
             statusLabel.TextAlign = ContentAlignment.MiddleRight;
             statusLabel.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
-            statusLabel.SetBounds(footer.Width - Theme.D(220), Theme.D(72), Theme.D(206), Theme.D(24));
+            statusLabel.SetBounds(footer.Width - Theme.D(220), Theme.D(98), Theme.D(206), Theme.D(24));
             footer.Controls.Add(statusLabel);
 
             // app list
@@ -264,6 +272,12 @@ namespace VolumeGuard
             {
                 lastSave = now;
                 s.Save();
+            }
+
+            if (now - lastAutoCheck > 2.0)
+            {
+                lastAutoCheck = now;
+                CheckAutoProcessing();
             }
 
             bool procOn = s.ProcOn && processing.Available;
@@ -435,6 +449,118 @@ namespace VolumeGuard
 
         public void OpenProcessing() { ShowProcessing(); }
 
+        // ---------- processing that follows the game, hotkeys ----------
+
+        /// Every 2 s: switch the processing on when the chosen game starts, and off when it exits (only if it
+        /// was switched on here; a manual choice is left alone).
+        void CheckAutoProcessing()
+        {
+            if (demo || !processing.Available || !s.ProcAuto || s.ProcAutoApp.Length == 0)
+            {
+                gameWasRunning = false;
+                autoEnabled = false;
+                return;
+            }
+            if (!s.ProcOn) autoEnabled = false;
+            bool running = false;
+            try
+            {
+                foreach (var p in Process.GetProcessesByName(s.ProcAutoApp)) { running = true; p.Dispose(); }
+            }
+            catch { }
+            string game = s.ProcAutoTitle.Length > 0 ? s.ProcAutoTitle : s.ProcAutoApp;
+            if (running && !gameWasRunning && !s.ProcOn && s.ProcSource.Length > 0 && s.ProcOutput.Length > 0)
+            {
+                SetProcessing(true);
+                autoEnabled = true;
+                Notify("Обработка звука включена", game + " запущена");
+            }
+            else if (!running && gameWasRunning && autoEnabled)
+            {
+                if (s.ProcOn) { SetProcessing(false); Notify("Обработка звука выключена", game + " закрыта"); }
+                autoEnabled = false;
+            }
+            gameWasRunning = running;
+        }
+
+        void SetProcessing(bool on)
+        {
+            if (s.ProcOn == on) return;
+            s.ProcOn = on;
+            s.Dirty = true;
+            processing.Apply();
+            if (procForm != null && !procForm.IsDisposed) procForm.SyncFromSettings();
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            UpdateHotkeys();
+        }
+
+        void UpdateHotkeys()
+        {
+            if (demo || !IsHandleCreated) return;
+            if (hotkeysRegistered)
+            {
+                foreach (int id in new[] { HkProcessing, HkMode, HkLimiter }) Native.UnregisterHotKey(Handle, id);
+                hotkeysRegistered = false;
+            }
+            if (!s.Hotkeys) return;
+            const uint mods = Native.MOD_CONTROL | Native.MOD_ALT | Native.MOD_NOREPEAT;
+            var failed = new List<string>();
+            if (!Native.RegisterHotKey(Handle, HkProcessing, mods, (uint)Keys.P)) failed.Add("Ctrl+Alt+P");
+            if (!Native.RegisterHotKey(Handle, HkMode, mods, (uint)Keys.M)) failed.Add("Ctrl+Alt+M");
+            if (!Native.RegisterHotKey(Handle, HkLimiter, mods, (uint)Keys.L)) failed.Add("Ctrl+Alt+L");
+            hotkeysRegistered = true;
+            if (failed.Count > 0) Log.Line("hotkeys already taken by another program: " + string.Join(", ", failed.ToArray()));
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == Native.WM_HOTKEY) { OnHotkey(m.WParam.ToInt32()); return; }
+            base.WndProc(ref m);
+        }
+
+        static readonly string[] ProcModeNames = { "только лимитер", "Comfort", "Tactical" };
+
+        void OnHotkey(int id)
+        {
+            switch (id)
+            {
+                case HkProcessing:
+                    if (!processing.Available) { Notify("Обработка звука недоступна", processing.UnavailableReason); return; }
+                    if (!s.ProcOn && (s.ProcSource.Length == 0 || s.ProcOutput.Length == 0))
+                    {
+                        Notify("Обработка звука", "Сначала выберите устройства в окне «Обработка».");
+                        return;
+                    }
+                    autoEnabled = false;   // a manual choice: the game exiting does not undo it
+                    SetProcessing(!s.ProcOn);
+                    Notify(s.ProcOn ? "Обработка звука включена" : "Обработка звука выключена",
+                           s.ProcOn ? "Режим: " + ProcModeNames[Math.Max(0, Math.Min(2, s.ProcMode))] : "Звук игры идёт напрямую.");
+                    break;
+                case HkMode:
+                    s.ProcMode = (Math.Max(0, Math.Min(2, s.ProcMode)) + 1) % 3;
+                    s.Dirty = true;
+                    processing.SendParams();
+                    if (procForm != null && !procForm.IsDisposed) procForm.SyncFromSettings();
+                    Notify("Режим обработки: " + ProcModeNames[s.ProcMode], s.ProcOn ? "Обработка включена." : "Обработка сейчас выключена (Ctrl+Alt+P).");
+                    break;
+                case HkLimiter:
+                    SetEnabled(!s.Enabled);
+                    Notify(s.Enabled ? "Лимитер включён" : "Лимитер выключен", s.Enabled ? "Лимиты приложений снова действуют." : "Громкость приложений больше не ограничивается.");
+                    break;
+            }
+        }
+
+        /// A short notification next to the tray icon.
+        void Notify(string title, string text)
+        {
+            if (demo || !tray.Visible) return;
+            try { tray.ShowBalloonTip(1500, title, string.IsNullOrEmpty(text) ? " " : text, ToolTipIcon.None); } catch { }
+        }
+
         /// A label and a row of buttons of which one is selected.
         static void AddSegments(Panel row, ToolTip tips, string label, int y, string[] names, string[] hints, Func<int> get, Action<int> set)
         {
@@ -513,6 +639,8 @@ namespace VolumeGuard
                 return;
             }
             timer.Stop();
+            if (hotkeysRegistered)
+                foreach (int id in new[] { HkProcessing, HkMode, HkLimiter }) Native.UnregisterHotKey(Handle, id);
             if (!demo) { try { Native.timeEndPeriod(1); } catch { } }
             try
             {
