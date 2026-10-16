@@ -100,6 +100,12 @@ namespace VolumeGuard
             // how the limiter behaves: return speed and peak / loudness mode
             var optRow = new Panel { Dock = DockStyle.Top, Height = Theme.D(112), BackColor = Theme.Bg };
             var tips = new ToolTip { AutoPopDelay = 15000, InitialDelay = 300 };
+            // the two kinds of protection, said plainly where you choose between them
+            tips.SetToolTip(procBtn,
+                "Лимиты в этом окне убавляют громкость приложений через Windows: это быстро и без задержки, " +
+                "но начало внезапного громкого звука (~10 мс) может проскочить.\r\n" +
+                "«Обработка звука» пропускает звук игры через VolumeGuard и видит его на 5 мс вперёд: " +
+                "ни один пик не громче потолка, но звук идёт с задержкой ~20–50 мс.");
             AddSegments(optRow, tips, "Возврат громкости", 2,
                 new[] { "Быстро", "Средне", "Медленно" },
                 new[] { "Громкость возвращается примерно за 0,6 с после громкого звука",
