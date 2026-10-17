@@ -23,9 +23,12 @@
 #include <propidl.h>
 #include <propsys.h>
 
+#include <xmmintrin.h>
+
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -79,9 +82,122 @@ double nowSec()
 
 // ---------------------------------------------------------------------------------------------------------
 // audio.log in %APPDATA%\VolumeGuard (next to settings.txt and crash.log)
+//
+// logLine never touches the disk: it copies the line into a small fixed queue (no allocation) and a writer
+// thread appends it to the file. The audio thread logs too (gaps, a low output queue), and before 2.8.5 it
+// opened and wrote the file itself: a slow disk (an antivirus scan, a roaming profile) could stall it right
+// when it was reporting a problem. The lock is held only for a copy. A full queue drops the line (counted).
 
-CRITICAL_SECTION gLogLock;
-std::wstring gLogPath;
+CRITICAL_SECTION gLogLock;   // the queue below, and Engine::error_
+
+constexpr int kLogSlots = 64, kLogLineMax = 1200;
+char gLogQueue[kLogSlots][kLogLineMax];
+int gLogLen[kLogSlots];
+int gLogHead = 0, gLogCount = 0;
+unsigned gLogDropped = 0;
+bool gLogWriting = false;            // the writer has lines out of the queue that are not on disk yet
+HANDLE gLogWake = nullptr;           // auto-reset: lines are waiting
+CONDITION_VARIABLE gLogIdle;         // queue empty and nothing being written (logFlush)
+INIT_ONCE gLogOnce = INIT_ONCE_STATIC_INIT;
+
+std::wstring logPath()
+{
+    wchar_t appdata[MAX_PATH];
+    const DWORD len = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return std::wstring();
+    std::wstring dir = std::wstring(appdata) + L"\\VolumeGuard";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir + L"\\audio.log";
+}
+
+void appendToLog(const std::wstring& path, const char* text, DWORD size)
+{
+    // keep it small: start over after 512 KB
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    const bool big = GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow > 512 * 1024);
+    HANDLE h = CreateFileW(path.c_str(), big ? GENERIC_WRITE : FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, big ? CREATE_ALWAYS : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    WriteFile(h, text, size, &w, nullptr);
+    CloseHandle(h);
+}
+
+char gLogBatch[kLogSlots * kLogLineMax + 64];   // the writer thread's (or, at process exit, logDrainAtExit's)
+
+/// Copies the queued lines, and a note about dropped ones, into gLogBatch; returns the byte count and, in
+/// lines, how many to remove from the queue once they are in the file. Lock held. The lines stay queued while
+/// they are being written: if the process exits in the middle, logDrainAtExit still finds them.
+DWORD copyQueuedLocked(int& lines)
+{
+    DWORD size = 0;
+    lines = gLogCount;
+    for (int k = 0, i = gLogHead; k < gLogCount; ++k, i = (i + 1) % kLogSlots)
+    {
+        memcpy(gLogBatch + size, gLogQueue[i], (size_t)gLogLen[i]);
+        size += (DWORD)gLogLen[i];
+    }
+    if (gLogDropped)
+    {
+        size += (DWORD)snprintf(gLogBatch + size, 64, "(%u log lines dropped: too many at once)\r\n", gLogDropped);
+        gLogDropped = 0;
+    }
+    return size;
+}
+
+void popQueuedLocked(int lines)
+{
+    gLogHead = (gLogHead + lines) % kLogSlots;
+    gLogCount -= lines;
+}
+
+DWORD WINAPI logWriter(LPVOID)
+{
+    const std::wstring path = logPath();
+    for (;;)
+    {
+        WaitForSingleObject(gLogWake, INFINITE);
+        for (;;)
+        {
+            int lines = 0;
+            EnterCriticalSection(&gLogLock);
+            const DWORD size = copyQueuedLocked(lines);
+            gLogWriting = size > 0;
+            if (!gLogWriting) WakeAllConditionVariable(&gLogIdle);
+            LeaveCriticalSection(&gLogLock);
+            if (size == 0) break;
+            if (!path.empty()) appendToLog(path, gLogBatch, size);
+            EnterCriticalSection(&gLogLock);
+            popQueuedLocked(lines);
+            LeaveCriticalSection(&gLogLock);
+        }
+    }
+}
+
+/// Process exit (the other threads, the writer too, are already gone): write what is still queued, so the
+/// last lines before an exit without vg_stop are not lost. A line the writer had just written when it was
+/// stopped can appear twice; none goes missing. TryEnter: a thread killed holding the lock never releases it.
+void logDrainAtExit()
+{
+    if (!gLogWake || !TryEnterCriticalSection(&gLogLock)) return;
+    int lines = 0;
+    const DWORD size = copyQueuedLocked(lines);
+    popQueuedLocked(lines);
+    LeaveCriticalSection(&gLogLock);
+    if (size == 0) return;
+    const std::wstring path = logPath();
+    if (!path.empty()) appendToLog(path, gLogBatch, size);
+}
+
+BOOL CALLBACK startLogWriter(PINIT_ONCE, PVOID, PVOID*)
+{
+    InitializeConditionVariable(&gLogIdle);
+    gLogWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HANDLE t = gLogWake ? CreateThread(nullptr, 0, logWriter, nullptr, 0, nullptr) : nullptr;
+    if (t) CloseHandle(t);
+    else if (gLogWake) { CloseHandle(gLogWake); gLogWake = nullptr; }
+    return TRUE;
+}
 
 void logLine(const char* fmt, ...)
 {
@@ -93,34 +209,35 @@ void logLine(const char* fmt, ...)
 
     SYSTEMTIME t;
     GetLocalTime(&t);
-    char line[1200];
+    char line[kLogLineMax];
     const int n = snprintf(line, sizeof line, "%04d-%02d-%02d %02d:%02d:%02d.%03d  %s\r\n", t.wYear, t.wMonth, t.wDay,
                            t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, msg);
+    InitOnceExecuteOnce(&gLogOnce, startLogWriter, nullptr, nullptr);
+    if (!gLogWake) return;   // no writer thread: nothing can be logged
     EnterCriticalSection(&gLogLock);
-    if (gLogPath.empty())
+    if (gLogCount < kLogSlots)
     {
-        wchar_t appdata[MAX_PATH];
-        const DWORD len = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
-        if (len > 0 && len < MAX_PATH)
-        {
-            std::wstring dir = std::wstring(appdata) + L"\\VolumeGuard";
-            CreateDirectoryW(dir.c_str(), nullptr);
-            gLogPath = dir + L"\\audio.log";
-        }
+        const int slot = (gLogHead + gLogCount) % kLogSlots;
+        const int len = std::max(0, std::min(n, kLogLineMax - 1));
+        memcpy(gLogQueue[slot], line, (size_t)len);
+        gLogLen[slot] = len;
+        ++gLogCount;
     }
-    if (!gLogPath.empty())
+    else ++gLogDropped;
+    LeaveCriticalSection(&gLogLock);
+    SetEvent(gLogWake);
+}
+
+/// Waits (up to timeoutMs) until every line logged so far is in the file. Not for the audio thread.
+void logFlush(DWORD timeoutMs)
+{
+    if (!gLogWake) return;
+    const ULONGLONG until = GetTickCount64() + timeoutMs;
+    EnterCriticalSection(&gLogLock);
+    while (gLogCount > 0 || gLogDropped > 0 || gLogWriting)
     {
-        // keep it small: start over after 512 KB
-        WIN32_FILE_ATTRIBUTE_DATA fa;
-        const bool big = GetFileAttributesExW(gLogPath.c_str(), GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow > 512 * 1024);
-        HANDLE h = CreateFileW(gLogPath.c_str(), big ? GENERIC_WRITE : FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                               nullptr, big ? CREATE_ALWAYS : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h != INVALID_HANDLE_VALUE)
-        {
-            DWORD w;
-            WriteFile(h, line, (DWORD)std::max(0, std::min(n, (int)sizeof line - 1)), &w, nullptr);
-            CloseHandle(h);
-        }
+        const ULONGLONG now = GetTickCount64();
+        if (now >= until || !SleepConditionVariableCS(&gLogIdle, &gLogLock, (DWORD)(until - now))) break;
     }
     LeaveCriticalSection(&gLogLock);
 }
@@ -260,6 +377,7 @@ public:
             stopLocked();
         }
         LeaveCriticalSection(&lock_);
+        if (result != VG_OK) logFlush(500);   // why it failed is in the file before the app shows the error
         return result;
     }
 
@@ -268,6 +386,7 @@ public:
         EnterCriticalSection(&lock_);
         stopLocked();
         LeaveCriticalSection(&lock_);
+        logFlush(500);   // the app may exit right after: get "stopped" and what came before it into the file
     }
 
     void setParams(const vga::Params& p)
@@ -364,6 +483,10 @@ private:
 
     void engineMain()
     {
+        // Flush denormals to zero (FTZ, bit 15) and read them as zero (DAZ, bit 6) on this thread: filter states
+        // and envelopes fading out in long silence would otherwise reach denormal floats, which the CPU handles
+        // many times slower. The DSP code flushes its own envelopes too (the plugin's host decides this there).
+        _mm_setcsr(_mm_getcsr() | 0x8040);
         const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         timeBeginPeriod(1);
         bool first = true;
@@ -1021,6 +1144,10 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
     else if (reason == DLL_PROCESS_DETACH && reserved == nullptr)
     {
         // FreeLibrary: the app should call vg_stop first; threads cannot be joined safely from here.
+    }
+    else if (reason == DLL_PROCESS_DETACH)
+    {
+        logDrainAtExit();   // process exit: the log writer thread is already gone
     }
     return TRUE;
 }

@@ -8,12 +8,16 @@
 //   2. need    = gain that would bring this peak down to the ceiling (1 if it is already below)
 //   3. hold    = smallest "need" over the last L samples (sliding minimum)
 //   4. release = hold, but allowed to rise only slowly (one-pole, release time)
-//   5. gain    = average of "release" over the last L samples (box filter, a smooth fade-in)
+//   5. gain    = "release" averaged twice: over A samples, and that over B samples, A + B = L + 1
+//                (two box filters in a row: an S-shaped fade-in with no corners)
 //   6. output  = input delayed by L-1 samples × gain
-// Every value averaged in step 5 at the moment a peak leaves the delay line already "knew" that
-// peak (step 3), so the gain applied to it is at most the gain it needs: the ceiling is never exceeded.
-// The fade-in over L samples avoids clicks. L = lookahead (5 ms by default); latency = L-1 samples,
-// plus kTpHalf samples for the true peak interpolator (always, so switching True peak does not change it).
+// The two averages together reach back A + B - 2 = L - 1 samples, exactly the delay, so every value they
+// take in at the moment a peak leaves the delay line already "knew" that peak (step 3): the gain applied
+// to it is at most the gain it needs, and the ceiling is never exceeded. A single box over L samples
+// (VolumeGuard 2.8.4 and earlier) fades in along a straight line whose corners add a little distortion,
+// most audible on bass; two boxes round those corners off at the same latency.
+// L = lookahead (5 ms by default); latency = L-1 samples, plus kTpHalf samples for the true peak
+// interpolator (always, so switching True peak does not change it).
 //
 // Auto release (on by default): the release time adapts to the sound. A single short peak (a shot) is
 // released twice as fast as the Release setting, so the quiet sounds after it come back quickly; when the
@@ -50,6 +54,7 @@ public:
         delay_.assign((size_t)channels_ * (size_t)Dmax_, 0.0f);
         ceilDelay_.assign((size_t)Dmax_, ceiling_);
         box_.assign((size_t)Lmax_, 1.0f);
+        box2_.assign((size_t)Lmax_, 1.0);
         dqVal_.assign((size_t)Lmax_ + 1, 1.0f);
         dqIdx_.assign((size_t)Lmax_ + 1, 0);
         setReleaseMs(releaseMs_);
@@ -77,8 +82,10 @@ public:
         std::fill(ceilDelay_.begin(), ceilDelay_.end(), ceiling_);
         clamps_ = 0;
         std::fill(box_.begin(), box_.end(), 1.0f);
-        boxSum_ = (double)L_;   // only the first L_ entries are in use
-        boxPos_ = 0;
+        std::fill(box2_.begin(), box2_.end(), 1.0);
+        boxSum_ = (double)A_;   // only the first A_ / B_ entries are in use
+        box2Sum_ = (double)B_;
+        boxPos_ = box2Pos_ = 0;
         sinceResum_ = 0;
         dPos_ = 0;
         dqHead_ = dqCount_ = 0;
@@ -106,6 +113,8 @@ public:
     /// Release adapts to the sound (see the top of the file). On by default.
     void setAutoRelease(bool on) { autoRelease_ = on; }
     bool autoRelease() const { return autoRelease_; }
+    /// How busy the limiter has been lately, 0…1 (what auto release goes by). For tests.
+    float busy() const { return busy_; }
 
     static constexpr float kFastFactor = 0.5f, kSlowFactor = 3.0f;
 
@@ -187,24 +196,30 @@ public:
                 // grows while reducing; short pauses (< 100 ms, the gaps of automatic fire) keep it; longer quiet forgets it
                 if (hold < kBusyBelow) { sinceBusy_ = 0; busy_ += (1.0f - busy_) * busyUp_; }
                 else if (sinceBusy_ < busyGap_) ++sinceBusy_;
-                else busy_ -= busy_ * busyDown_;
+                else if ((busy_ -= busy_ * busyDown_) < 1e-20f) busy_ = 0.0f;   // no denormals in long quiet
                 // the release TIME goes from fast to slow (interpolating the coefficients would lean to fast)
                 coef = std::exp(-1.0f / std::max(1.0f, relFastS_ + (relSlowS_ - relFastS_) * busy_));
             }
             rel_ = hold < rel_ ? hold : hold + (rel_ - hold) * coef;
 
-            // 5. box filter (running sum, recomputed now and then so rounding errors cannot build up)
+            // 5. two box filters (running sums, recomputed now and then so rounding errors cannot build up)
             boxSum_ += (double)rel_ - (double)box_[(size_t)boxPos_];
             box_[(size_t)boxPos_] = rel_;
-            if (++boxPos_ == L_) boxPos_ = 0;
+            if (++boxPos_ == A_) boxPos_ = 0;
+            const double avg = boxSum_ / (double)A_;
+            box2Sum_ += avg - box2_[(size_t)box2Pos_];
+            box2_[(size_t)box2Pos_] = avg;
+            if (++box2Pos_ == B_) box2Pos_ = 0;
             if (++sinceResum_ >= 65536)
             {
                 sinceResum_ = 0;
-                double s = 0.0;
-                for (int k = 0; k < L_; ++k) s += box_[(size_t)k];
+                double s = 0.0, s2 = 0.0;
+                for (int k = 0; k < A_; ++k) s += box_[(size_t)k];
+                for (int k = 0; k < B_; ++k) s2 += box2_[(size_t)k];
                 boxSum_ = s;
+                box2Sum_ = s2;
             }
-            const float gain = std::min(1.0f, (float)(boxSum_ / (double)L_));
+            const float gain = std::min(1.0f, (float)(box2Sum_ / (double)B_));
             minGain_ = std::min(minGain_, gain);
 
             // 6. delay and apply. The clamp uses the ceiling that was in force when this sample's gain was
@@ -269,10 +284,12 @@ private:
         ms = std::max(kMinLookaheadMs, std::min(kMaxLookaheadMs, std::isfinite(ms) ? ms : 5.0));
         L_ = std::max(2, std::min(Lmax_, (int)std::lround(sr_ * ms / 1000.0)));
         D_ = L_ - 1;
+        A_ = (L_ + 1) / 2;   // the two boxes: A + B = L + 1, both ≥ 1 and ≤ L
+        B_ = L_ + 1 - A_;
     }
 
     double sr_ = 48000.0;
-    int channels_ = 2, L_ = 240, D_ = 239, Lmax_ = 480, Dmax_ = 479;
+    int channels_ = 2, L_ = 240, D_ = 239, A_ = 120, B_ = 121, Lmax_ = 480, Dmax_ = 479;
     float ceiling_ = dbToGain(-1.0f), inGain_ = 1.0f, releaseMs_ = 100.0f, relCoef_ = 0.0f;
 
     std::vector<float> delay_, ceilDelay_;
@@ -294,8 +311,9 @@ private:
     float relFastS_ = 1.0f, relSlowS_ = 1.0f, busy_ = 0.0f, busyUp_ = 0.0f, busyDown_ = 0.0f;
     int sinceBusy_ = 1 << 30, busyGap_ = 4800;
     std::vector<float> box_;
-    double boxSum_ = 0.0;
-    int boxPos_ = 0, sinceResum_ = 0;
+    std::vector<double> box2_;
+    double boxSum_ = 0.0, box2Sum_ = 0.0;
+    int boxPos_ = 0, box2Pos_ = 0, sinceResum_ = 0;
 
     float minGain_ = 1.0f;
     float inPeak_ = 0.0f, outPeak_ = 0.0f;

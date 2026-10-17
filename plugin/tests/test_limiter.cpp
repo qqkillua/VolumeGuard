@@ -338,6 +338,70 @@ int main()
     }
     std::printf("lookahead 1..10 ms: ceiling and latency right at 44.1 / 48 / 96 kHz\n");
 
+    // 9. The gain comes down along an S-curve, without corners: a level step on DC, so output / delayed input
+    //    is the gain itself. One box filter over L samples makes a straight ramp whose slope jumps at both ends
+    //    by (drop / L) per sample; two boxes in a row bend gently. At every lookahead the gain still reaches the
+    //    needed value by the time the loud part comes out (the ceiling holds).
+    for (double ms : { 1.0, 5.0, 10.0 })
+    {
+        const double sr = 48000.0;
+        LookaheadLimiter lim;
+        lim.prepare(sr, 2, ms);
+        lim.setCeilingDb(-6.0f);
+        lim.setTruePeak(false);
+        lim.setAutoRelease(false);
+        lim.setReleaseMs(1000.0f);
+        const size_t n = (size_t)(sr * 0.2), step = n / 2;
+        Stereo in; in.l.assign(n, 0.25f); in.r.assign(n, 0.25f);
+        for (size_t i = step; i < n; ++i) in.l[i] = in.r[i] = 1.0f;
+        Stereo out = run(lim, in, 5, false);
+        const size_t lat = (size_t)lim.latencySamples();
+        std::vector<double> g;
+        for (size_t i = lat; i < n; ++i) g.push_back(out.l[i] / in.l[i - lat]);
+        double bend = 0.0, lowest = 1.0;
+        for (size_t i = 1; i + 1 < g.size(); ++i)
+        {
+            bend = std::max(bend, std::fabs(g[i + 1] - 2.0 * g[i] + g[i - 1]));
+            lowest = std::min(lowest, g[i]);
+        }
+        const double drop = 1.0 - vgl::dbToGain(-6.0f);
+        const double L = std::lround(sr * ms / 1000.0);
+        CHECK(bend < 0.1 * drop / L, "lookahead %.0f ms: the gain bends by %.6f per sample (one box: %.6f)", ms, bend, drop / L);
+        CHECK(peakOf(out) <= vgl::dbToGain(-6.0f) * 1.000001f, "lookahead %.0f ms: step went over the ceiling", ms);
+        CHECK(lim.clampCount() == 0, "lookahead %.0f ms: safety clamp acted %llu times", ms, (unsigned long long)lim.clampCount());
+        CHECK(lowest >= vgl::dbToGain(-6.0f) * 0.9999, "lookahead %.0f ms: gain went lower than needed (%.4f)", ms, lowest);
+        if (ms == 5.0)
+            std::printf("gain fade-in at 5 ms: largest bend %.7f per sample (one box filter: %.5f), no corners\n", bend, drop / L);
+    }
+
+    // 10. No denormals in long quiet: after limiting, minutes of digital silence must not leave the auto release
+    //     state as a denormal float (it would stop decaying there and slow every sample down).
+    {
+        LookaheadLimiter lim;
+        lim.prepare(48000, 2);
+        lim.setCeilingDb(-6.0f);
+        std::vector<float> l(4800), r(4800);
+        const float* ins[2] = { l.data(), r.data() };
+        float* outs[2] = { l.data(), r.data() };
+        for (int b = 0; b < 10; ++b)   // 1 s of loud sound: the limiter is busy
+        {
+            for (int i = 0; i < 4800; ++i) l[i] = r[i] = (float)std::sin(i * 0.05);
+            lim.process(ins, outs, 2, 4800);
+        }
+        CHECK(lim.busy() > 0.5f, "busy after 1 s of limiting: %.3f", lim.busy());
+        int denormalBlocks = 0;
+        for (int b = 0; b < 10 * 240; ++b)   // 4 minutes of silence
+        {
+            std::fill(l.begin(), l.end(), 0.0f);
+            std::fill(r.begin(), r.end(), 0.0f);
+            lim.process(ins, outs, 2, 4800);
+            if (std::fpclassify(lim.busy()) == FP_SUBNORMAL) ++denormalBlocks;
+        }
+        CHECK(denormalBlocks == 0, "auto release state was a denormal in %d of 2400 blocks of silence", denormalBlocks);
+        CHECK(lim.busy() == 0.0f, "auto release state after 4 min of silence: %g", lim.busy());
+        std::printf("4 min of silence after limiting: no denormals\n");
+    }
+
     // 5. Speed: 60 s of stereo at 48 kHz.
     {
         LookaheadLimiter lim;

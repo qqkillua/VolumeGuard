@@ -75,6 +75,7 @@ public:
     {
         const float d = std::max(std::fabs(l), std::fabs(r));
         env_ = d > env_ ? d + (env_ - d) * att_ : d + (env_ - d) * rel_;
+        if (env_ < 1e-20f) env_ = 0.0f;                      // no denormals in long silence
         if (env_ < 1e-6f) return 1.0f;                       // below -120 dBFS: nothing to do
         const float x = 20.0f * std::log10(env_);
         const float over = x - thr_;
@@ -92,6 +93,7 @@ public:
     }
 
     float takeReductionDb() { const float v = minGrDb_; minGrDb_ = 0.0f; return v; }
+    float envelope() const { return env_; }
 
 private:
     float thr_ = 0, ratio_ = 1, thrT_ = 0, ratioT_ = 1, knee_ = 6, att_ = 0, rel_ = 0, env_ = 0, minGrDb_ = 0;
@@ -162,6 +164,7 @@ public:
     {
         const float d = std::max(std::fabs(l), std::fabs(r));
         env_ = d > env_ ? d + (env_ - d) * att_ : d + (env_ - d) * rel_;
+        if (env_ < 1e-20f) env_ = 0.0f;   // no denormals in long silence
         if (max_ <= 0.01f || env_ < 1e-6f) return 1.0f;
         const float x = 20.0f * std::log10(env_);
         if (x <= gate_) return 1.0f;
@@ -172,6 +175,7 @@ public:
     }
 
     float takeLiftDb() { const float v = maxLiftDb_; maxLiftDb_ = 0.0f; return v; }
+    float envelope() const { return env_; }
 
 private:
     float below_ = -40, max_ = 0, belowT_ = -40, maxT_ = 0, gate_ = -72, att_ = 0, rel_ = 0, env_ = 0, maxLiftDb_ = 0;

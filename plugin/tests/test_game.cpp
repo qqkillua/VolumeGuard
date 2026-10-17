@@ -202,6 +202,30 @@ int main()
         CHECK(std::fabs(hissHi - hissMid) < 0.5, "hiss at -85 dBFS was lifted by %.1f dB", hissHi - hissMid);
     }
 
+    // 9. No denormals in long silence: the envelopes fade towards zero, and a float fading by a factor this
+    //    close to 1 gets stuck as a denormal (multiplying it no longer changes it) — every sample after that
+    //    is many times slower on most CPUs. They must jump to exactly 0 instead.
+    {
+        vgl::BandCompressor comp;
+        comp.setup(48000, -20.0f, 3.0f, 10.0f, 250.0f);
+        comp.snap();
+        vgl::QuietLift lift;
+        lift.setup(48000, -30.0f, 8.0f);
+        lift.snap();
+        int denormal = 0;
+        for (int i = 0; i < 48000 * 60; ++i)   // 0.1 s of sound, then a minute of digital silence
+        {
+            const float x = i < 4800 ? 0.5f : 0.0f;
+            comp.gain(x, x);
+            lift.gain(x, x);
+            if (std::fpclassify(comp.envelope()) == FP_SUBNORMAL || std::fpclassify(lift.envelope()) == FP_SUBNORMAL) ++denormal;
+        }
+        CHECK(denormal == 0, "envelopes were denormal for %d samples of silence", denormal);
+        CHECK(comp.envelope() == 0.0f && lift.envelope() == 0.0f, "envelopes after a minute of silence: %g, %g",
+              comp.envelope(), lift.envelope());
+        std::printf("a minute of silence: no denormals in the envelopes\n");
+    }
+
     // 8. Speed of the whole chain in Tactical.
     {
         Chain ch; ch.prepare(48000, 2, 0.5f, -1.0f);
