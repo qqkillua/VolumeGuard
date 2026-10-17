@@ -53,7 +53,7 @@ protected:
     const char* getMaker() const override { return "qqkillua"; }
     const char* getHomePage() const override { return "https://github.com/qqkillua/VolumeGuard"; }
     const char* getLicense() const override { return "MIT"; }
-    uint32_t getVersion() const override { return d_version(1, 4, 0); }
+    uint32_t getVersion() const override { return d_version(1, 4, 1); }
     int64_t getUniqueId() const override { return d_cconst('V', 'G', 'L', 'm'); }
 
     void initAudioPort(bool input, uint32_t index, AudioPort& port) override
