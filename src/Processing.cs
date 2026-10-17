@@ -354,6 +354,20 @@ namespace VolumeGuard
             lock (sync) { try { VgNative.vg_stop(); } catch { } }
         }
 
+        /// Why the last start failed (when StartResult != 0).
+        public string StartErrorText()
+        {
+            switch (startResult)
+            {
+                case 0: return "";
+                case VgNative.ErrSame: return "Источник и наушники должны быть разными устройствами.";
+                case VgNative.ErrSource: return "Не открылось устройство-источник. Оно подключено и включено?";
+                case VgNative.ErrOutput: return "Не открылось устройство для наушников. Оно подключено и включено?";
+                case VgNative.ErrFormat: return "Устройство использует необычный формат звука. Поставьте 16 или 24 бит в его свойствах.";
+                default: return "Не удалось запустить: " + startError;
+            }
+        }
+
         /// One line for the window: what the engine is doing right now.
         public string Describe(VgStatus st, out bool problem)
         {
@@ -363,18 +377,7 @@ namespace VolumeGuard
             if (s.ProcSource.Length == 0 || s.ProcOutput.Length == 0) { problem = true; return "Выберите оба устройства."; }
             if (s.ProcSource == s.ProcOutput) { problem = true; return "Источник и наушники должны быть разными устройствами."; }
             if (starting) return "Запуск…";
-            if (startResult != 0)
-            {
-                problem = true;
-                switch (startResult)
-                {
-                    case VgNative.ErrSame: return "Источник и наушники должны быть разными устройствами.";
-                    case VgNative.ErrSource: return "Не открылось устройство-источник. Оно подключено и включено?";
-                    case VgNative.ErrOutput: return "Не открылось устройство для наушников. Оно подключено и включено?";
-                    case VgNative.ErrFormat: return "Устройство использует необычный формат звука. Поставьте 16 или 24 бит в его свойствах.";
-                    default: return "Не удалось запустить: " + startError;
-                }
-            }
+            if (startResult != 0) { problem = true; return StartErrorText(); }
             switch (st.State)
             {
                 case VgNative.StateRunning:

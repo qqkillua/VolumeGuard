@@ -35,6 +35,7 @@ namespace VolumeGuard
         public float LimitDb = -12f;    // max output peak, dBFS
         public bool Muted;
         public bool Pending;            // we lowered its volume and Windows may have remembered that
+        public double LoweredAt;        // runtime: engine clock when it was last lowered (see Settings.PendingStep)
 
         // runtime
         public Icon Icon;
@@ -60,6 +61,7 @@ namespace VolumeGuard
         public bool LimitOn;
         public float LimitDb = -12f;
         public bool Pending;
+        public double LoweredAt;
         public float R = 1f;            // our reduction factor, linear (1 = none)
         public float Env;
         public float Ms;
@@ -131,6 +133,91 @@ namespace VolumeGuard
             get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "VolumeGuard"); }
         }
         public static string FilePath { get { return Path.Combine(Dir, "settings.txt"); } }
+        /// Tests point this at a temporary folder.
+        public static string DirOverride;
+        static string Folder { get { return DirOverride ?? Dir; } }
+        static string MainFile { get { return Path.Combine(Folder, "settings.txt"); } }
+        static string BackupFile { get { return Path.Combine(Folder, "settings.bak"); } }
+        const string Header = "# VolumeGuard settings";
+
+        // ---- crash safety ---------------------------------------------------------------------------------
+        // When VolumeGuard lowers an app (or the device) it marks it Pending, so that after a crash, a kill from
+        // Task Manager or a power cut the next start puts the user's volume back. Until 2.8.3 that mark reached the
+        // disk up to 5 s later; dying inside those seconds made the next start take the lowered volume for the
+        // user's own. Now the mark is saved at once, on a thread of its own (never the audio thread or the window),
+        // and it is cleared only after the volume has been back for 10 s, so a burst of shots means one save.
+
+        public const double PendingClearSec = 10.0;
+
+        /// Updates a Pending mark. Returns 1 when it was just raised (save now), 2 when cleared, 0 otherwise.
+        public static int PendingStep(ref bool pending, ref double loweredAt, bool lowered, double now)
+        {
+            if (lowered)
+            {
+                loweredAt = now;
+                if (pending) return 0;
+                pending = true;
+                return 1;
+            }
+            if (pending && now - loweredAt >= PendingClearSec) { pending = false; return 2; }
+            return 0;
+        }
+
+        /// Applies PendingStep's result: marks the settings dirty and asks for an immediate save when raised.
+        public void OnPendingStep(int r)
+        {
+            if (r == 0) return;
+            Dirty = true;
+            if (r == 1) SaveNow();
+        }
+
+        readonly object saveLock = new object();
+        readonly AutoResetEvent saveWake = new AutoResetEvent(false);
+        volatile bool saveUrgent, saverStop;
+        Thread saver;
+
+        /// Starts the thread that writes settings.txt: at once when asked (SaveNow), otherwise every 5 s if changed.
+        public void StartSaver()
+        {
+            if (saver != null) return;
+            saver = new Thread(SaverLoop) { IsBackground = true, Name = "VolumeGuard settings" };
+            saver.Start();
+        }
+
+        public void StopSaver()
+        {
+            saverStop = true;
+            saveWake.Set();
+            if (saver != null) saver.Join(3000);
+            saver = null;
+        }
+
+        /// Non-blocking; safe from any thread, the audio thread included.
+        public void SaveNow()
+        {
+            saveUrgent = true;
+            saveWake.Set();
+        }
+
+        void SaverLoop()
+        {
+            DateTime last = DateTime.MinValue;
+            bool retry = false;
+            while (!saverStop)
+            {
+                saveWake.WaitOne(retry ? 200 : 1000);   // a file held for a moment (antivirus): try again soon
+                if (saverStop) break;
+                bool urgent = saveUrgent || retry;
+                saveUrgent = false;
+                retry = false;
+                if (urgent || (Dirty && (DateTime.UtcNow - last).TotalSeconds >= 5.0))
+                {
+                    bool ok = Save();
+                    last = DateTime.UtcNow;
+                    retry = urgent && !ok;
+                }
+            }
+        }
 
         public AppModel GetApp(string key, string title)
         {
@@ -160,19 +247,42 @@ namespace VolumeGuard
             var s = new Settings();
             try
             {
-                string path = FilePath;
-                if (!File.Exists(path))
+                string path = MainFile;
+                if (!File.Exists(path) && !File.Exists(BackupFile) && DirOverride == null)
                 {
                     // first run after the rename: pick up settings saved under the old name
                     string old = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SoundLockPlus", "settings.txt");
                     if (!File.Exists(old)) return s;
-                    path = old;
                     s.Dirty = true;
+                    s.ParseLines(File.ReadAllLines(old, Encoding.UTF8));
+                    return s;
                 }
-                s.ParseLines(File.ReadAllLines(path, Encoding.UTF8));
+                // a damaged settings.txt (cut short or zero-filled by a power cut) falls back to the previous one
+                string[] main = ReadValid(path), bak = main == null ? ReadValid(BackupFile) : null;
+                if (main != null) s.ParseLines(main);
+                else if (bak != null) { s.ParseLines(bak); s.Dirty = true; s.LoadedFromBackup = true; }
+                else if (File.Exists(path)) s.ParseLines(File.ReadAllLines(path, Encoding.UTF8));
             }
             catch { }
             return s;
+        }
+
+        /// settings.txt was damaged and the previous copy was loaded (for the log).
+        public bool LoadedFromBackup;
+
+        /// The file's lines if it is a whole settings file (starts with the header, no zero bytes), else null.
+        static string[] ReadValid(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return null;
+                string text = File.ReadAllText(path, Encoding.UTF8);
+                if (text.IndexOf('\0') >= 0) return null;
+                var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+                if (lines.Length == 0 || lines[0].Trim() != Header) return null;
+                return lines;
+            }
+            catch { return null; }
         }
 
         /// Reads the lines of settings.txt into this object. One bad line does not spoil the others.
@@ -247,16 +357,22 @@ namespace VolumeGuard
             }
         }
 
-        public void Save()
+        /// Writes settings.txt now; false if it could not (it is tried again later).
+        public bool Save()
+        {
+            lock (saveLock) return SaveLocked();
+        }
+
+        bool SaveLocked()
         {
             try
             {
-                Directory.CreateDirectory(Dir);
+                Directory.CreateDirectory(Folder);
                 var sb = new StringBuilder();
                 Monitor.Enter(Sync);   // only while reading the models; the file is written after
                 try
                 {
-                    sb.AppendLine("# VolumeGuard settings");
+                    sb.AppendLine(Header);
                     sb.AppendLine("opt|enabled|" + B(Enabled));
                     sb.AppendLine("opt|device|" + Clean(DeviceId));
                     sb.AppendLine("opt|tray|" + B(Tray));
@@ -279,12 +395,33 @@ namespace VolumeGuard
                     Dirty = false;
                 }
                 finally { Monitor.Exit(Sync); }
-                string tmp = FilePath + ".tmp";
-                File.WriteAllText(tmp, sb.ToString(), Encoding.UTF8);
-                File.Copy(tmp, FilePath, true);
-                File.Delete(tmp);
+                // Write a new file and swap it in: settings.txt is always either the old or the new one, never half of
+                // each; the one before stays as settings.bak. WriteThrough + Flush(true): on disk before the swap.
+                string file = MainFile, tmp = file + ".tmp";
+                byte[] bytes = new UTF8Encoding(true).GetPreamble();
+                byte[] body = Encoding.UTF8.GetBytes(sb.ToString());
+                using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
+                {
+                    fs.Write(bytes, 0, bytes.Length);
+                    fs.Write(body, 0, body.Length);
+                    fs.Flush(true);
+                }
+                if (!File.Exists(file)) File.Move(tmp, file);
+                else
+                {
+                    try { File.Replace(tmp, file, BackupFile, true); }
+                    catch (Exception ex)
+                    {
+                        // some file systems / antivirus hooks refuse Replace: fall back to copying
+                        if (!(ex is IOException || ex is UnauthorizedAccessException || ex is PlatformNotSupportedException)) throw;
+                        File.Copy(file, BackupFile, true);
+                        File.Copy(tmp, file, true);
+                        File.Delete(tmp);
+                    }
+                }
+                return true;
             }
-            catch { Dirty = true; }   // try again later
+            catch { Dirty = true; return false; }   // try again later
         }
     }
 
@@ -441,6 +578,41 @@ namespace VolumeGuard
         }
     }
 
+    /// Windows tells us at once when a sound stream is created or an output device comes, goes or changes
+    /// (2.8.4). Before, a new stream was found by the once-a-second scan, so a freshly started app could play
+    /// up to a second unlimited, and devices were checked every 5 s. The callbacks come on Windows' threads:
+    /// they only raise a flag and wake the audio thread, which scans as before (the 1 s scan stays as a safety net).
+    [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+    sealed class AudioEvents : IMMNotificationClient, IAudioSessionNotification
+    {
+        public volatile bool Sessions, Devices;
+        public volatile Action Wake;
+        public int SessionEvents, DeviceEvents;   // counters for the log
+
+        void Kick(bool devices)
+        {
+            try
+            {
+                if (devices) { Devices = true; Interlocked.Increment(ref DeviceEvents); }
+                else { Sessions = true; Interlocked.Increment(ref SessionEvents); }
+                var w = Wake;
+                if (w != null) w();
+            }
+            catch { }
+        }
+
+        public int OnSessionCreated(IntPtr newSession) { Kick(false); return 0; }
+        public int OnDeviceStateChanged(string deviceId, int newState) { Kick(true); return 0; }
+        public int OnDeviceAdded(string deviceId) { Kick(true); return 0; }
+        public int OnDeviceRemoved(string deviceId) { Kick(true); return 0; }
+        public int OnDefaultDeviceChanged(EDataFlow flow, ERole role, string deviceId)
+        {
+            if (flow == EDataFlow.eRender && role == ERole.eMultimedia) Kick(true);
+            return 0;
+        }
+        public int OnPropertyValueChanged(string deviceId, PropertyKey key) { return 0; }
+    }
+
     class AudioEngine : IEngine
     {
         // (attack, level and memory coefficients are recomputed every step from dt and the settings)
@@ -449,6 +621,8 @@ namespace VolumeGuard
         const int DEVICE_STATE_ACTIVE = 1;
 
         readonly Settings s;
+        readonly AudioEvents events = new AudioEvents();
+        bool deviceEventsOn;
         IMMDeviceEnumerator en;
         IMMDevice dev;
         string devId;
@@ -476,6 +650,38 @@ namespace VolumeGuard
         public string DeviceName { get; private set; }
 
         public AudioEngine(Settings s) { this.s = s; }
+
+        /// Called (from any thread) when Windows reports a new stream or a device change.
+        public Action Wake { set { events.Wake = value; } }
+        /// A Windows event is waiting for a scan.
+        public bool EventsPending { get { return events.Sessions || events.Devices; } }
+
+        void WatchDevices()
+        {
+            if (deviceEventsOn) return;
+            try { deviceEventsOn = En.RegisterEndpointNotificationCallback(events) == 0; }
+            catch { }
+            if (deviceEventsOn) Log.Line("device events on");
+        }
+
+        /// On the audio thread, when the engine is done for good.
+        public void StopEvents()
+        {
+            events.Wake = null;
+            if (deviceEventsOn) { try { En.UnregisterEndpointNotificationCallback(events); } catch { } deviceEventsOn = false; }
+            Log.Line("Windows events seen: " + events.SessionEvents + " new streams, " + events.DeviceEvents + " device changes");
+        }
+
+        void WatchSessions(IAudioSessionManager2 m)
+        {
+            try { m.RegisterSessionNotification(events); } catch { }
+        }
+
+        void UnwatchSessions(IAudioSessionManager2 m)
+        {
+            if (m == null) return;
+            try { m.UnregisterSessionNotification(events); } catch { }
+        }
 
         IMMDeviceEnumerator En
         {
@@ -533,6 +739,7 @@ namespace VolumeGuard
                     }
                     catch { dev = null; }
                 }
+                WatchDevices();
                 if (dev == null) dev = En.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eMultimedia);
                 devId = dev.GetId();
                 DeviceName = FriendlyName(dev);
@@ -543,6 +750,7 @@ namespace VolumeGuard
                 epMeter = (IAudioMeterInformation)dev.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero);
                 iid = typeof(IAudioSessionManager2).GUID;
                 mgr = (IAudioSessionManager2)dev.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero);
+                WatchSessions(mgr);
 
                 float inc;
                 epv.GetVolumeRange(out minDb, out maxDb, out inc);
@@ -583,8 +791,9 @@ namespace VolumeGuard
         {
             foreach (var a in s.Apps.Values) { a.Sessions.Clear(); a.Adopted = false; a.Active = false; }
             sessions.Clear();
-            foreach (var m in otherMgrs.Values) Release(m, null);
+            foreach (var m in otherMgrs.Values) { UnwatchSessions(m); Release(m, null); }
             otherMgrs.Clear();
+            UnwatchSessions(mgr);
             otherNames.Clear();
             lastDeviceScan = DateTime.MinValue;
             epv = null; epMeter = null; mgr = null; dev = null; devId = null;
@@ -633,6 +842,9 @@ namespace VolumeGuard
         public bool RefreshSessions()
         {
             if (mgr == null) return false;
+            // take the events before scanning: one that comes during the scan asks for another
+            events.Sessions = false;
+            if (events.Devices) { events.Devices = false; lastDeviceScan = DateTime.MinValue; }
 
             // follow the Windows default device when "По умолчанию" is selected
             if (string.IsNullOrEmpty(s.DeviceId))
@@ -677,7 +889,9 @@ namespace VolumeGuard
                         now.Add(id);
                         if (otherMgrs.ContainsKey(id)) continue;
                         Guid iid = typeof(IAudioSessionManager2).GUID;
-                        otherMgrs[id] = (IAudioSessionManager2)d.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero);
+                        var om = (IAudioSessionManager2)d.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero);
+                        otherMgrs[id] = om;
+                        WatchSessions(om);
                         otherNames[id] = FriendlyName(d);
                     }
                     catch { }
@@ -688,6 +902,7 @@ namespace VolumeGuard
             catch { return; }
             foreach (var id in otherMgrs.Keys.Where(k => !now.Contains(k)).ToList())
             {
+                UnwatchSessions(otherMgrs[id]);
                 Release(otherMgrs[id], null);
                 otherMgrs.Remove(id);
                 otherNames.Remove(id);
@@ -1015,8 +1230,7 @@ namespace VolumeGuard
             m.OutLevel = inLevel * userAmp * m.R;
             if (m.OutLevel > m.DisplayPeak) m.DisplayPeak = m.OutLevel;
             m.Limiting = m.R < 0.97f;
-            bool pend = m.R < 0.99f || duckDb < -0.1f;
-            if (pend != m.Pending) { m.Pending = pend; s.Dirty = true; }
+            s.OnPendingStep(Settings.PendingStep(ref m.Pending, ref m.LoweredAt, m.R < 0.99f || duckDb < -0.1f, clock));
         }
 
         void TickApp(AppModel a, float decay, float rel, bool full)
@@ -1094,8 +1308,7 @@ namespace VolumeGuard
             a.OutLevel = Math.Max(inPeak * a.Gain, shownPeak);
             if (a.OutLevel > a.DisplayPeak) a.DisplayPeak = a.OutLevel;
             a.Limiting = a.Gain < a.UserVol * 0.97f;
-            bool pend = a.Gain < a.UserVol - 0.01f;
-            if (pend != a.Pending) { a.Pending = pend; s.Dirty = true; }
+            s.OnPendingStep(Settings.PendingStep(ref a.Pending, ref a.LoweredAt, a.Gain < a.UserVol - 0.01f, clock));
         }
 
         public void SetAppVolume(AppModel a, float v)

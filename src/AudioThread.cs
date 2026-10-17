@@ -33,6 +33,7 @@ namespace VolumeGuard
         {
             this.s = s;
             inner = new AudioEngine(s);
+            inner.Wake = () => wake.Set();   // Windows reported a new stream / device change
             thread = new Thread(Run) { Name = "VolumeGuard limiter", IsBackground = true, Priority = ThreadPriority.Highest };
             thread.SetApartmentState(ApartmentState.MTA);
             thread.Start();
@@ -54,7 +55,7 @@ namespace VolumeGuard
         /// The audio thread ticks by itself.
         public void Tick(float dt) { }
 
-        /// The audio thread refreshes the sessions every second; this tells the window whether the list changed.
+        /// The audio thread refreshes the sessions every second (and at once on a Windows event); this tells the window whether the list changed.
         public bool RefreshSessions()
         {
             bool c = changed;
@@ -70,7 +71,7 @@ namespace VolumeGuard
         /// Puts all volumes back and ends the thread (on exit).
         public void Stop()
         {
-            Close();
+            Call(() => { inner.Close(); inner.StopEvents(); return true; });
             quit = true;
             wake.Set();
             thread.Join(2000);
@@ -141,7 +142,9 @@ namespace VolumeGuard
                     {
                         inner.Tick(dt, full);   // every step advances the limiter by the time since the previous one
                         needFast = inner.NeedsFastSteps;
-                        if (now - lastRefresh >= 1.0)
+                        // every second, and right away (at most every 20 ms) when Windows reports a new stream or
+                        // a device change — a new app is limited from its first sounds, not up to a second later
+                        if (now - lastRefresh >= 1.0 || (inner.EventsPending && now - lastRefresh >= 0.02))
                         {
                             lastRefresh = now;
                             if (inner.IsOpen && inner.RefreshSessions()) changed = true;

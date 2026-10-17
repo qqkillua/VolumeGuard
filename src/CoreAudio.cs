@@ -28,8 +28,25 @@ namespace VolumeGuard
         IMMDeviceCollection EnumAudioEndpoints(EDataFlow dataFlow, int stateMask);
         IMMDevice GetDefaultAudioEndpoint(EDataFlow dataFlow, ERole role);
         IMMDevice GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id);
-        [PreserveSig] int RegisterEndpointNotificationCallback(IntPtr client);
-        [PreserveSig] int UnregisterEndpointNotificationCallback(IntPtr client);
+        [PreserveSig] int RegisterEndpointNotificationCallback(IMMNotificationClient client);
+        [PreserveSig] int UnregisterEndpointNotificationCallback(IMMNotificationClient client);
+    }
+
+    // Implemented by VolumeGuard (AudioEvents): Windows calls these on its own threads.
+    [ComImport, Guid("7991EEC9-7E89-4D85-8390-6C703CEC60C0"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMNotificationClient
+    {
+        [PreserveSig] int OnDeviceStateChanged([MarshalAs(UnmanagedType.LPWStr)] string deviceId, int newState);
+        [PreserveSig] int OnDeviceAdded([MarshalAs(UnmanagedType.LPWStr)] string deviceId);
+        [PreserveSig] int OnDeviceRemoved([MarshalAs(UnmanagedType.LPWStr)] string deviceId);
+        [PreserveSig] int OnDefaultDeviceChanged(EDataFlow flow, ERole role, [MarshalAs(UnmanagedType.LPWStr)] string deviceId);
+        [PreserveSig] int OnPropertyValueChanged([MarshalAs(UnmanagedType.LPWStr)] string deviceId, PropertyKey key);
+    }
+
+    [ComImport, Guid("641DD20B-4D41-49CC-ABA3-174B9477BB08"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioSessionNotification
+    {
+        [PreserveSig] int OnSessionCreated(IntPtr newSession);   // not kept: the next scan opens it properly
     }
 
     [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -101,8 +118,8 @@ namespace VolumeGuard
         [PreserveSig] int GetSimpleAudioVolume(IntPtr sessionGuid, int flags, out IntPtr volume);
         // IAudioSessionManager2
         IAudioSessionEnumerator GetSessionEnumerator();
-        [PreserveSig] int RegisterSessionNotification(IntPtr notify);
-        [PreserveSig] int UnregisterSessionNotification(IntPtr notify);
+        [PreserveSig] int RegisterSessionNotification(IAudioSessionNotification notify);
+        [PreserveSig] int UnregisterSessionNotification(IAudioSessionNotification notify);
         [PreserveSig] int RegisterDuckNotification(IntPtr sessionId, IntPtr notify);
         [PreserveSig] int UnregisterDuckNotification(IntPtr notify);
     }

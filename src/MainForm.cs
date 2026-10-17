@@ -38,9 +38,12 @@ namespace VolumeGuard
         readonly Stopwatch clock = Stopwatch.StartNew();
         List<KeyValuePair<string, string>> devices = new List<KeyValuePair<string, string>>();
         Icon iconOn, iconOff;
-        double lastT, lastRefresh, lastReopen, lastSave, lastUi, lastAutoCheck;
+        double lastT, lastRefresh, lastReopen, lastUi, lastAutoCheck;
         // auto processing: the game was running at the last check; the processing was switched on by us
         bool gameWasRunning, autoEnabled;
+        // "processing on" is told only once the engine has really started (2.8.4): the text, and since when
+        string startNotice;
+        double startNoticeSince;
         bool hotkeysRegistered;
         double nextUpdateCheck = 15.0;   // seconds after start, then daily
         Version newerVersion;
@@ -280,12 +283,6 @@ namespace VolumeGuard
                 }
             }
 
-            if (s.Dirty && now - lastSave > 5.0 && !demo)
-            {
-                lastSave = now;
-                s.Save();
-            }
-
             if (now >= nextUpdateCheck && !demo)
             {
                 nextUpdateCheck = now + 24 * 3600;
@@ -293,11 +290,12 @@ namespace VolumeGuard
                     Updates.CheckAsync(v => { try { BeginInvoke(new Action(() => OnNewerVersion(v))); } catch { } });
             }
 
-            if (now - lastAutoCheck > 2.0)
+            if (now - lastAutoCheck > 1.0)
             {
                 lastAutoCheck = now;
                 CheckAutoProcessing();
             }
+            if (startNotice != null) CheckStartNotice(now);
 
             bool procOn = s.ProcOn && processing.Available;
             if (procBtn.Selected != procOn) procBtn.Selected = procOn;
@@ -502,7 +500,7 @@ namespace VolumeGuard
             {
                 SetProcessing(true);
                 autoEnabled = true;
-                Notify("Обработка звука включена", game + " запущена");
+                NotifyWhenStarted(game + " запущена");
             }
             else if (!running && gameWasRunning && autoEnabled)
             {
@@ -566,8 +564,8 @@ namespace VolumeGuard
                     }
                     autoEnabled = false;   // a manual choice: the game exiting does not undo it
                     SetProcessing(!s.ProcOn);
-                    Notify(s.ProcOn ? "Обработка звука включена" : "Обработка звука выключена",
-                           s.ProcOn ? "Режим: " + ProcModeNames[Math.Max(0, Math.Min(2, s.ProcMode))] : "Звук игры идёт напрямую.");
+                    if (s.ProcOn) NotifyWhenStarted("Режим: " + ProcModeNames[Math.Max(0, Math.Min(2, s.ProcMode))]);
+                    else { startNotice = null; Notify("Обработка звука выключена", "Звук игры идёт напрямую."); }
                     break;
                 case HkMode:
                     s.ProcMode = (Math.Max(0, Math.Min(2, s.ProcMode)) + 1) % 3;
@@ -600,6 +598,30 @@ namespace VolumeGuard
         }
 
         /// A short notification next to the tray icon.
+        void NotifyWhenStarted(string text)
+        {
+            startNotice = text;
+            startNoticeSince = lastT;
+        }
+
+        /// The engine starts on a worker thread: say "on" when it runs, or why it did not start.
+        void CheckStartNotice(double now)
+        {
+            if (!s.ProcOn) { startNotice = null; return; }
+            if (processing.Starting)
+            {
+                if (now - startNoticeSince > 10.0)
+                {
+                    Notify("Обработка звука запускается…", "Это дольше обычного. Подробности — в окне «Обработка».");
+                    startNotice = null;
+                }
+                return;
+            }
+            if (processing.StartResult == 0) Notify("Обработка звука включена", startNotice);
+            else Notify("Обработка звука не запустилась", processing.StartErrorText() + " Если игра выведена в кабель, её сейчас не слышно — откройте окно «Обработка».");
+            startNotice = null;
+        }
+
         void Notify(string title, string text, bool update = false)
         {
             if (demo || !tray.Visible) return;
@@ -696,7 +718,7 @@ namespace VolumeGuard
             }
             catch { }
             processing.Shutdown();   // stop the audio threads before the DLL is unloaded
-            if (!demo) s.Save();
+            if (!demo) { s.StopSaver(); s.Save(); }
             tray.Visible = false;
             base.OnFormClosing(e);
         }
@@ -842,6 +864,11 @@ namespace VolumeGuard
 
             if (!demo) MainForm.MigrateAutostart();
             Settings s = demo ? DemoSettings() : Settings.Load();
+            if (!demo)
+            {
+                if (s.LoadedFromBackup) Log.Line("settings.txt was damaged: loaded the previous copy (settings.bak)");
+                s.StartSaver();   // settings.txt is written on its own thread (at once when a volume is lowered)
+            }
             IEngine eng = demo ? (IEngine)new FakeEngine(s) : new ThreadedEngine(s);
             var form = new MainForm(s, eng, hidden && !demo, demo);
             if (demo && args.Contains("--processing")) form.Shown += delegate { form.OpenProcessing(); };

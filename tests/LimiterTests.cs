@@ -17,6 +17,12 @@ namespace VolumeGuard.Tests
             if (!ok) { failures++; Console.WriteLine("FAIL: " + what); }
         }
 
+        /// A line for the GitHub summary as well as the console.
+        static void Notice(string title, string text)
+        {
+            Console.WriteLine(Environment.GetEnvironmentVariable("GITHUB_ACTIONS") == "true" ? "::notice title=" + title + "::" + text : text);
+        }
+
         static float Lin(float db) { return Db.ToLin(db); }
         static float DbOf(float lin) { return Db.FromLin(lin); }
 
@@ -235,6 +241,100 @@ namespace VolumeGuard.Tests
                 Check(!Updates.IsNewer(new Version(2, 8), new Version(2, 8, 0, 0)), "2.8 is not newer than 2.8.0.0");
                 Check(!Updates.IsNewer(null, new Version(2, 8)), "no tag: nothing newer");
                 Check(Updates.NewestIn("garbage") == null, "garbage json");
+            }
+
+            // 12. Crash safety (2.8.4): the "we lowered it" mark is raised at once and saved at once, cleared only after
+            //     the volume has been back for 10 s; settings.txt is swapped in whole and a damaged one falls back
+            //     to settings.bak.
+            {
+                bool pend = false; double at = 0;
+                Check(Settings.PendingStep(ref pend, ref at, true, 0.0) == 1 && pend, "lowering raises the mark and asks for a save");
+                Check(Settings.PendingStep(ref pend, ref at, true, 0.5) == 0, "still lowered: nothing new to save");
+                Check(Settings.PendingStep(ref pend, ref at, false, 5.0) == 0 && pend, "back for 4.5 s: the mark stays");
+                Check(Settings.PendingStep(ref pend, ref at, true, 6.0) == 0 && pend, "lowered again within 10 s: no new save");
+                Check(Settings.PendingStep(ref pend, ref at, false, 15.9) == 0 && pend, "9.9 s back: the mark stays");
+                Check(Settings.PendingStep(ref pend, ref at, false, 16.1) == 2 && !pend, "10 s back: the mark is cleared");
+                Check(Settings.PendingStep(ref pend, ref at, true, 17.0) == 1 && pend, "lowered again: raised and saved again");
+
+                string dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "vg-test-" + Guid.NewGuid().ToString("N"));
+                System.IO.Directory.CreateDirectory(dir);
+                Settings.DirOverride = dir;
+                try
+                {
+                    string main = System.IO.Path.Combine(dir, "settings.txt"), bak = System.IO.Path.Combine(dir, "settings.bak");
+                    var s = new Settings();
+                    var g = s.GetApp("tslgame", "PUBG");
+                    g.UserVol = 0.8f; g.LimitOn = true; g.LimitDb = -14f;
+                    s.Save();   // the state before the game got loud
+                    s.StartSaver();
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    lock (s.Sync) { g.Gain = 0.3f; s.OnPendingStep(Settings.PendingStep(ref g.Pending, ref g.LoweredAt, true, 1.0)); }
+                    // "VolumeGuard is killed" right now: what does the next start read?
+                    bool seen = false;
+                    while (sw.ElapsedMilliseconds < 2000 && !seen)
+                    {
+                        System.Threading.Thread.Sleep(5);
+                        AppModel l;
+                        seen = Settings.Load().Apps.TryGetValue("tslgame", out l) && l.Pending && Math.Abs(l.UserVol - 0.8f) < 1e-4f;
+                    }
+                    s.StopSaver();
+                    Notice("Crash safety", "the lowered mark was on disk after " + sw.ElapsedMilliseconds + " ms (before 2.8.4: up to 5 s)");
+                    Check(seen && sw.ElapsedMilliseconds < 500, "the mark must reach the disk at once, took " + sw.ElapsedMilliseconds + " ms");
+                    Check(System.IO.File.Exists(bak), "the previous settings stay as settings.bak");
+                    Check(!System.IO.File.Exists(main + ".tmp"), "no temporary file left behind");
+
+                    // a power cut left settings.txt zero-filled / cut short: the previous copy loads
+                    long len = new System.IO.FileInfo(main).Length;
+                    System.IO.File.WriteAllBytes(main, new byte[len]);
+                    var z = Settings.Load();
+                    AppModel zl;
+                    Check(z.LoadedFromBackup && z.Apps.TryGetValue("tslgame", out zl) && Math.Abs(zl.UserVol - 0.8f) < 1e-4f && zl.LimitDb == -14f,
+                          "zero-filled settings.txt must fall back to settings.bak");
+                    System.IO.File.WriteAllText(main, "# VolumeGuard settings\r\napp|tslg");   // cut in the middle: header is there
+                    var c = Settings.Load();
+                    Check(!c.LoadedFromBackup, "a file with the header is read as it is (bad lines are skipped)");
+                    System.IO.File.WriteAllText(main, "app|tslgame|PUBG|0.8");   // header lost
+                    Check(Settings.Load().LoadedFromBackup, "a file without the header falls back to settings.bak");
+                    System.IO.File.Delete(bak);
+                    System.IO.File.WriteAllText(main, "app|other|Other|0.4|1|-10|0|0|0");
+                    AppModel ol;
+                    Check(Settings.Load().Apps.TryGetValue("other", out ol) && Math.Abs(ol.UserVol - 0.4f) < 1e-4f,
+                          "with no backup a headerless file is still read");
+                }
+                finally
+                {
+                    Settings.DirOverride = null;
+                    try { System.IO.Directory.Delete(dir, true); } catch { }
+                }
+            }
+
+            // 13. Windows events (on Windows only): Windows accepts our callbacks for device changes and new streams.
+            if (Environment.OSVersion.Platform == PlatformID.Win32NT)
+            {
+                IMMDeviceEnumerator en = null;
+                try
+                {
+                    en = (IMMDeviceEnumerator)Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")));
+                }
+                catch (Exception ex) { Notice("Windows events", "no audio service here (" + ex.Message + "), not checked"); }
+                if (en != null)
+                {
+                    var ev = new AudioEvents();
+                    Check(en.RegisterEndpointNotificationCallback(ev) == 0, "device events: register failed");
+                    Check(en.UnregisterEndpointNotificationCallback(ev) == 0, "device events: unregister failed");
+                    IMMDevice d = null;
+                    try { d = en.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eMultimedia); } catch { }
+                    if (d == null) Notice("Windows events", "device callbacks accepted; no output device here for stream callbacks");
+                    else
+                    {
+                        Guid iid = typeof(IAudioSessionManager2).GUID;
+                        var m = (IAudioSessionManager2)d.Activate(ref iid, 0x17, IntPtr.Zero);
+                        m.GetSessionEnumerator();
+                        Check(m.RegisterSessionNotification(ev) == 0, "stream events: register failed");
+                        Check(m.UnregisterSessionNotification(ev) == 0, "stream events: unregister failed");
+                        Notice("Windows events", "device and stream callbacks accepted");
+                    }
+                }
             }
 
             // 11. Soak: one hour of game-like sound per mode — calm, footsteps, shots, bursts, explosions, silence —
