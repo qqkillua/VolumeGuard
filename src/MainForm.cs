@@ -856,6 +856,7 @@ namespace VolumeGuard
             bool demo = args.Contains("--demo");
             bool hidden = args.Contains("--tray");
             if (!demo) { try { Native.SetProcessDPIAware(); } catch { } }
+            if (!demo) Native.KeepResident();
 
             bool created = true;
             Mutex mutex = null;

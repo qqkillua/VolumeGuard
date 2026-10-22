@@ -21,20 +21,26 @@ namespace vgl {
 class Chain
 {
 public:
-    void prepare(double sampleRate)
+    static constexpr int kMaxChannels = LookaheadLimiter::kMaxChannels;
+
+    /// channels: 2 for the plugin; the app's engine also runs 3…8 (surround, 2.8.7). Every channel gets the
+    /// same gain at every moment (Game mode and limiter are linked), so the balance between them is kept.
+    void prepare(double sampleRate, int channels = 2)
     {
         sr_ = sampleRate > 0 ? sampleRate : 48000.0;
-        lim_.prepare(sr_, 2, lookMs_);
+        nch_ = std::max(1, std::min(kMaxChannels, channels));
+        lim_.prepare(sr_, nch_, lookMs_);
         lim_.setInputGainDb(0.0f);            // the input gain is applied here, before the Game mode
         game_.prepare(sr_);
         k_ = (float)(1.0 - std::exp(-1.0 / (sr_ * 0.020)));
         rampStep_ = (float)(1.0 / std::max(1.0, sr_ * 0.002));
         // room for the longest lookahead, so changing it never allocates
         const int dmax = (int)std::lround(sr_ * LookaheadLimiter::kMaxLookaheadMs / 1000.0) + LookaheadLimiter::kTpHalf + 4;
-        dry_.assign((size_t)(2 * std::max(1, dmax)), 0.0f);
+        dry_.assign((size_t)(nch_ * std::max(1, dmax)), 0.0f);
         dryPos_ = 0;
         reset();
     }
+    int channels() const { return nch_; }
 
     /// Clears the signal history; the next block starts directly with the current settings.
     void reset()
@@ -81,6 +87,15 @@ public:
     /// Stereo; in and out may be the same buffers. Any number of frames.
     void process(const float* inL, const float* inR, float* outL, float* outR, int frames)
     {
+        const float* in[2] = { inL, inR };
+        float* out[2] = { outL, outR };
+        process(in, out, frames);
+    }
+
+    /// channels() channels; in and out may be the same buffers. Any number of frames.
+    void process(const float* const* in, float* const* out, int frames)
+    {
+        const int nch = nch_;
         if (snap_)
         {
             gain_ = gainT_;
@@ -101,50 +116,52 @@ public:
             // dry copy (for bypass) and input gain
             for (int i = 0; i < n; ++i)
             {
-                const float l = inL[pos + i], r = inR[pos + i];
-                dryIn_[0][i] = l;
-                dryIn_[1][i] = r;
                 gain_ += (gainT_ - gain_) * k_;
-                wet_[0][i] = l * gain_;
-                wet_[1][i] = r * gain_;
-                inPeak_ = std::max(inPeak_, std::max(std::fabs(wet_[0][i]), std::fabs(wet_[1][i])));
+                for (int c = 0; c < nch; ++c)
+                {
+                    const float x = in[c][pos + i];
+                    dryIn_[c][i] = x;
+                    wet_[c][i] = x * gain_;
+                    inPeak_ = std::max(inPeak_, std::fabs(wet_[c][i]));
+                }
             }
-            game_.process(wet_[0], wet_[1], n);
+            float* wet[kMaxChannels];
+            for (int c = 0; c < nch; ++c) wet[c] = wet_[c];
+            game_.process(wet, nch, n);
             if (game_.mode() != GameProcessor::kOff) gameGrDb_ = std::min(gameGrDb_, game_.takeReductionDb());
-            const float* in[2] = { wet_[0], wet_[1] };
-            float* out[2] = { wet_[0], wet_[1] };
-            lim_.process(in, out, 2, n);
+            lim_.process(wet, wet, nch, n);
             lim_.takeInputPeak();
             // bypass cross-fade against the dry signal delayed by the limiter's latency
             for (int i = 0; i < n; ++i)
             {
-                float dl = dryIn_[0][i], dr = dryIn_[1][i];
+                float dry[kMaxChannels];
+                for (int c = 0; c < nch; ++c) dry[c] = dryIn_[c][i];
                 if (d > 0)
                 {
-                    float& sl = dry_[(size_t)dryPos_ * 2];
-                    float& sr = dry_[(size_t)dryPos_ * 2 + 1];
-                    std::swap(dl, sl);
-                    std::swap(dr, sr);
+                    for (int c = 0; c < nch; ++c) std::swap(dry[c], dry_[(size_t)dryPos_ * (size_t)nch + (size_t)c]);
                     if (++dryPos_ == d) dryPos_ = 0;
                 }
                 mix_ += (mixT_ - mix_) * k_;
                 if (std::fabs(mix_ - mixT_) < 1e-5f) mix_ = mixT_;
-                float yl, yr;
-                if (mix_ <= 0.0f) { yl = wet_[0][i]; yr = wet_[1][i]; }
-                else if (mix_ >= 1.0f) { yl = dl; yr = dr; }
-                else { yl = wet_[0][i] + (dl - wet_[0][i]) * mix_; yr = wet_[1][i] + (dr - wet_[1][i]) * mix_; }
-                if (switch_ != kSteady)
+                float w = 1.0f;
+                const bool switching = switch_ != kSteady;
+                if (switching)
                 {
                     if (switch_ == kFadingOut) switchGain_ = std::max(0.0f, switchGain_ - rampStep_);
                     else if (switch_ == kWaiting) { switchGain_ = 0.0f; if (--waitLeft_ <= 0) switch_ = kFadingIn; }
                     else if ((switchGain_ += rampStep_) >= 1.0f) { switchGain_ = 1.0f; switch_ = kSteady; }
-                    const float w = 0.5f - 0.5f * std::cos(3.14159265f * switchGain_);   // raised cosine
-                    yl *= w;
-                    yr *= w;
+                    w = 0.5f - 0.5f * std::cos(3.14159265f * switchGain_);   // raised cosine
                 }
-                outL[pos + i] = yl;
-                outR[pos + i] = yr;
-                outPeak_ = std::max(outPeak_, std::max(std::fabs(yl), std::fabs(yr)));
+                for (int c = 0; c < nch; ++c)
+                {
+                    float y;
+                    if (mix_ <= 0.0f) y = wet_[c][i];
+                    else if (mix_ >= 1.0f) y = dry[c];
+                    else y = wet_[c][i] + (dry[c] - wet_[c][i]) * mix_;
+                    if (switching) y *= w;
+                    out[c][pos + i] = y;
+                    outPeak_ = std::max(outPeak_, std::fabs(y));
+                }
             }
         }
     }
@@ -177,6 +194,7 @@ private:
     int waitLeft_ = 0;
 
     double sr_ = 48000.0;
+    int nch_ = 2;
     LookaheadLimiter lim_;
     GameProcessor game_;
     float k_ = 0.001f, gain_ = 1.0f, gainT_ = 1.0f, mix_ = 0.0f, mixT_ = 0.0f;
@@ -184,8 +202,8 @@ private:
     bool snap_ = true;
     std::vector<float> dry_;
     int dryPos_ = 0;
-    float dryIn_[2][kChunk];
-    float wet_[2][kChunk];
+    float dryIn_[kMaxChannels][kChunk];
+    float wet_[kMaxChannels][kChunk];
 };
 
 } // namespace vgl

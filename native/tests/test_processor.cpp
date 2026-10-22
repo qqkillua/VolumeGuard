@@ -128,6 +128,80 @@ int main()
         CHECK(worst < 0.04, "declick left a step of %.3f", worst);
     }
 
+    // 6. Surround (2.8.7): an 8-channel processor whose front pair carries a stereo sound and the rest silence gives
+    //    exactly the stereo processor's output on the front pair, and silence elsewhere — in every mode.
+    for (int mode = 0; mode < 3; ++mode)
+    {
+        vga::Processor p2, p8;
+        p2.prepare(sr, 2);
+        p8.prepare(sr, 8);
+        vga::Params prm; prm.mode = mode; prm.amount = 70; prm.inputGainDb = 12; prm.ceilingDb = -2;
+        p2.setParams(prm);
+        p8.setParams(prm);
+        std::mt19937 rng(5);
+        std::normal_distribution<float> nd(0.0f, 0.3f);
+        const int block = 480, blocks = 200;
+        std::vector<float> l(block), r(block), ch8(8 * block);
+        float* c8[8];
+        for (int c = 0; c < 8; ++c) c8[c] = ch8.data() + (size_t)c * block;
+        double diff = 0, rest = 0;
+        for (int b = 0; b < blocks; ++b)
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                l[i] = nd(rng) * (b % 9 == 0 ? 3.0f : 1.0f);
+                r[i] = 0.5f * nd(rng);
+                for (int c = 0; c < 8; ++c) c8[c][i] = c == 0 ? l[i] : c == 1 ? r[i] : 0.0f;
+            }
+            p2.process(l.data(), r.data(), block);
+            p8.process(c8, block);
+            for (int i = 0; i < block; ++i)
+            {
+                diff = std::max(diff, (double)std::max(std::fabs(l[i] - c8[0][i]), std::fabs(r[i] - c8[1][i])));
+                for (int c = 2; c < 8; ++c) rest = std::max(rest, (double)std::fabs(c8[c][i]));
+            }
+        }
+        CHECK(diff == 0.0, "mode %d: 8-channel front pair differs from stereo by %g", mode, diff);
+        CHECK(rest == 0.0, "mode %d: silent channels became %g", mode, rest);
+    }
+
+    // 7. Surround: loud sound on all 8 channels, +24 dB, every mode: no channel goes over the ceiling, and all
+    //    channels get the same gain (a quiet rear channel is lowered exactly as much as the loud front).
+    for (int mode = 0; mode < 3; ++mode)
+    {
+        vga::Processor p;
+        p.prepare(sr, 8);
+        vga::Params prm; prm.mode = mode; prm.amount = 100; prm.inputGainDb = 24; prm.ceilingDb = -3;
+        p.setParams(prm);
+        const int block = 333, blocks = 300;
+        std::vector<float> buf(8 * block);
+        float* c8[8];
+        for (int c = 0; c < 8; ++c) c8[c] = buf.data() + (size_t)c * block;
+        double peak = 0, ratioErr = 0;
+        const float ceil = vgl::dbToGain(-3.0f);
+        for (int b = 0; b < blocks; ++b)
+        {
+            for (int i = 0; i < block; ++i)
+            {
+                const double t = (double)(b * block + i) / sr;
+                const float front = 0.8f * (float)std::sin(2 * 3.14159265358979 * 220 * t);
+                for (int c = 0; c < 8; ++c) c8[c][i] = c == 7 ? 0.1f * front : front;   // rear right: same sound, 18 dB quieter
+            }
+            p.process(c8, block);
+            for (int i = 0; i < block; ++i)
+            {
+                for (int c = 0; c < 8; ++c) peak = std::max(peak, (double)std::fabs(c8[c][i]));
+                // away from zero crossings: there the Game mode's band filters round both channels a little
+                // differently (up to ~3e-4 of the ratio, the same in the stereo code before 2.8.7)
+                if (b > 20 && std::fabs(c8[0][i]) > 0.3f) ratioErr = std::max(ratioErr, std::fabs(c8[7][i] / c8[0][i] - 0.1));
+            }
+        }
+        CHECK(peak <= ceil * 1.000001, "8 channels, mode %d: peak %.5f over the ceiling %.5f", mode, peak, ceil);
+        CHECK(ratioErr < 1e-4, "8 channels, mode %d: the quiet channel got a different gain (ratio off by %g)", mode, ratioErr);
+        CHECK(p.clampCount() == 0, "8 channels, mode %d: safety clamp acted %llu times", mode, (unsigned long long)p.clampCount());
+    }
+    std::printf("surround: 8-channel front pair bit-identical to stereo in all modes; ceiling and linked gain hold on 8 channels\n");
+
     if (failures) { std::printf("%d check(s) failed\n", failures); return 1; }
     std::printf("all processor checks passed\n");
     return 0;

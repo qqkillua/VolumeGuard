@@ -42,12 +42,14 @@ struct Params
 class Processor
 {
 public:
-    void prepare(double sampleRate)
+    /// channels: 2, or up to 8 for surround (every channel gets the same gain).
+    void prepare(double sampleRate, int channels = 2)
     {
-        chain_.prepare(sampleRate);
+        chain_.prepare(sampleRate, channels);
         apply(params_);
         chain_.reset();   // start directly with the current settings
     }
+    int channels() const { return chain_.channels(); }
 
     void setParams(const Params& p)
     {
@@ -63,6 +65,8 @@ public:
 
     /// In place, any number of frames.
     void process(float* l, float* r, int frames) { chain_.process(l, r, l, r, frames); }
+    /// In place, channels() channels.
+    void process(float* const* ch, int frames) { chain_.process(ch, ch, frames); }
 
     /// Meter values since the previous call.
     float takeInputPeak() { return chain_.takeInputPeak(); }

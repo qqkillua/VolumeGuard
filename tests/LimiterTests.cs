@@ -241,6 +241,12 @@ namespace VolumeGuard.Tests
                 Check(!Updates.IsNewer(new Version(2, 8), new Version(2, 8, 0, 0)), "2.8 is not newer than 2.8.0.0");
                 Check(!Updates.IsNewer(null, new Version(2, 8)), "no tag: nothing newer");
                 Check(Updates.NewestIn("garbage") == null, "garbage json");
+                // a pre-release is not offered (2.8.7); GitHub puts "prerelease" after "tag_name" in each release
+                string pre = "[{\"tag_name\":\"v2.9.0\",\"name\":\"x\",\"draft\":false,\"prerelease\":true,\"assets\":[]}," +
+                             "{\"tag_name\":\"v2.8.7\",\"draft\":false,\"prerelease\":false}," +
+                             "{\"tag_name\":\"v2.8.6\",\"prerelease\": false}]";
+                v = Updates.NewestIn(pre);
+                Check(v != null && v.ToString() == "2.8.7", "a pre-release must be skipped, got " + v);
             }
 
             // 12. Crash safety (2.8.4): the "we lowered it" mark is raised at once and saved at once, cleared only after

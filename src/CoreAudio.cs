@@ -216,18 +216,32 @@ namespace VolumeGuard
         }
 
         [DllImport("kernel32.dll")]
-        public static extern bool SetProcessWorkingSetSize(IntPtr process, IntPtr minSize, IntPtr maxSize);
+        static extern bool SetProcessWorkingSetSizeEx(IntPtr process, IntPtr minSize, IntPtr maxSize, uint flags);
 
-        /// Gives unused memory back to Windows (used when the window goes to the tray).
-        public static void TrimMemory()
+        const uint QUOTA_LIMITS_HARDWS_MIN_ENABLE = 1, QUOTA_LIMITS_HARDWS_MAX_DISABLE = 8;
+
+        /// Memory Windows may not take from VolumeGuard even when it runs short (2.8.7). The limiter thread wakes every
+        /// 2–10 ms; when its pages had been taken (a game using most of the memory), each wake read them back from
+        /// disk. VolumeGuard uses ~35 MB; this keeps the most used part in RAM. A failure (no privilege) changes nothing.
+        public const int KeepResidentMb = 24;
+
+        public static void KeepResident()
         {
             try
             {
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-                SetProcessWorkingSetSize(GetCurrentProcess(), (IntPtr)(-1), (IntPtr)(-1));
+                SetProcessWorkingSetSizeEx(GetCurrentProcess(), (IntPtr)(KeepResidentMb << 20), (IntPtr)(1024 << 20),
+                                           QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
             }
             catch { }
+        }
+
+        /// Gives unused managed memory back (when the window goes to the tray). Before 2.8.7 it also waited for the
+        /// finalizers and emptied the whole working set: the wait could hang the window on a finalizer releasing a
+        /// Windows audio object (the audio service not responding), and emptying the working set threw out the
+        /// limiter thread's pages too (an explicit trim ignores KeepResident), which then came back from disk.
+        public static void TrimMemory()
+        {
+            try { GC.Collect(); } catch { }
         }
 
         public static string ProcessPath(int pid)

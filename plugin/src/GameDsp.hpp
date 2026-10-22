@@ -14,12 +14,15 @@
 
 namespace vgl {
 
+/// Channels the Game mode can process at once (the plugin uses 2; the app up to 7.1).
+constexpr int kGameMaxChannels = 8;
+
 class Biquad
 {
 public:
     void lowpass(double fs, double f, double q) { set(fs, f, q, true); }
     void highpass(double fs, double f, double q) { set(fs, f, q, false); }
-    void reset() { z1_[0] = z1_[1] = z2_[0] = z2_[1] = 0.0f; }
+    void reset() { for (int c = 0; c < kGameMaxChannels; ++c) z1_[c] = z2_[c] = 0.0f; }
 
     inline float process(float x, int ch)
     {
@@ -48,7 +51,7 @@ private:
     }
 
     float b0_ = 1, b1_ = 0, b2_ = 0, a1_ = 0, a2_ = 0;
-    float z1_[2] = { 0, 0 }, z2_[2] = { 0, 0 };
+    float z1_[kGameMaxChannels] = {}, z2_[kGameMaxChannels] = {};
 };
 
 /// Stereo-linked feed-forward compressor working on a peak envelope, soft knee.
@@ -71,9 +74,11 @@ public:
     inline void glide(float k) { thr_ += (thrT_ - thr_) * k; ratio_ += (ratioT_ - ratio_) * k; }
 
     /// Gain for this sample (linear, ≤ 1) from the louder of the two channels.
-    inline float gain(float l, float r)
+    inline float gain(float l, float r) { return gainFor(std::max(std::fabs(l), std::fabs(r))); }
+
+    /// Gain for this sample from the loudest channel's level d (≥ 0): links any number of channels.
+    inline float gainFor(float d)
     {
-        const float d = std::max(std::fabs(l), std::fabs(r));
         env_ = d > env_ ? d + (env_ - d) * att_ : d + (env_ - d) * rel_;
         if (env_ < 1e-20f) env_ = 0.0f;                      // no denormals in long silence
         if (env_ < 1e-6f) return 1.0f;                       // below -120 dBFS: nothing to do
@@ -160,9 +165,10 @@ public:
     void snap() { below_ = belowT_; max_ = maxT_; }
     inline void glide(float k) { below_ += (belowT_ - below_) * k; max_ += (maxT_ - max_) * k; }
 
-    inline float gain(float l, float r)
+    inline float gain(float l, float r) { return gainFor(std::max(std::fabs(l), std::fabs(r))); }
+
+    inline float gainFor(float d)
     {
-        const float d = std::max(std::fabs(l), std::fabs(r));
         env_ = d > env_ ? d + (env_ - d) * att_ : d + (env_ - d) * rel_;
         if (env_ < 1e-20f) env_ = 0.0f;   // no denormals in long silence
         if (max_ <= 0.01f || env_ < 1e-6f) return 1.0f;
@@ -232,6 +238,14 @@ public:
     /// the amount glides the settings over ~20 ms, so neither clicks.
     void process(float* l, float* r, int frames)
     {
+        float* ch[2] = { l, r };
+        process(ch, 2, frames);
+    }
+
+    /// The same for 1…kGameMaxChannels channels: every channel gets the same gains (from the loudest one).
+    void process(float* const* ch, int nch, int frames)
+    {
+        nch = std::max(1, std::min(kGameMaxChannels, nch));
         const float wantMix = mode_ != kOff ? 1.0f : 0.0f;
         if (mode_ == kOff && mix_ <= 1e-4f)
         {
@@ -244,23 +258,31 @@ public:
             return;   // off: the signal is untouched
         }
         const float k = glideK_;
+        float lo[kGameMaxChannels], mi[kGameMaxChannels], hi[kGameMaxChannels];
         for (int i = 0; i < frames; ++i)
         {
             low_.glide(k); mid_.glide(k); high_.glide(k); lift_.glide(k);
             makeup_ += (makeupT_ - makeup_) * k;
             mix_ += (wantMix - mix_) * k;
             if (std::fabs(mix_ - wantMix) < 1e-5f) mix_ = wantMix;
-            float lowL, midL, highL, lowR, midR, highR;
-            split_.split(l[i], 0, lowL, midL, highL);
-            split_.split(r[i], 1, lowR, midR, highR);
-            const float gLow = low_.gain(lowL, lowR);
-            const float gMid = mid_.gain(midL, midR);
-            // the footsteps band: loud sounds pressed down, quiet ones lifted (both channels the same)
-            const float gHigh = high_.gain(highL, highR) * lift_.gain(highL, highR);
-            const float yl = (lowL * gLow + midL * gMid + highL * gHigh) * makeup_;
-            const float yr = (lowR * gLow + midR * gMid + highR * gHigh) * makeup_;
-            if (mix_ >= 1.0f) { l[i] = yl; r[i] = yr; }
-            else { l[i] += (yl - l[i]) * mix_; r[i] += (yr - r[i]) * mix_; }
+            float dLo = 0.0f, dMi = 0.0f, dHi = 0.0f;
+            for (int c = 0; c < nch; ++c)
+            {
+                split_.split(ch[c][i], c, lo[c], mi[c], hi[c]);
+                dLo = std::max(dLo, std::fabs(lo[c]));
+                dMi = std::max(dMi, std::fabs(mi[c]));
+                dHi = std::max(dHi, std::fabs(hi[c]));
+            }
+            const float gLow = low_.gainFor(dLo);
+            const float gMid = mid_.gainFor(dMi);
+            // the footsteps band: loud sounds pressed down, quiet ones lifted (all channels the same)
+            const float gHigh = high_.gainFor(dHi) * lift_.gainFor(dHi);
+            for (int c = 0; c < nch; ++c)
+            {
+                const float y = (lo[c] * gLow + mi[c] * gMid + hi[c] * gHigh) * makeup_;
+                if (mix_ >= 1.0f) ch[c][i] = y;
+                else ch[c][i] += (y - ch[c][i]) * mix_;
+            }
         }
     }
 

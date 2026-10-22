@@ -22,11 +22,10 @@ static double worstJump(vgl::Chain& ch, double sr, double seconds, float amp, co
     std::vector<float> l(block), r(block);
     double prev = 0, worst = 0, ph = 0;
     const double w = 2 * kPi * 200.0 / sr;
-    long n = 0;
     for (double t = 0; t < seconds; t += block / sr)
     {
         change(t);
-        for (int i = 0; i < block; ++i, ++n) { l[i] = r[i] = amp * (float)std::sin(ph); ph += w; }
+        for (int i = 0; i < block; ++i) { l[i] = r[i] = amp * (float)std::sin(ph); ph += w; }
         ch.process(l.data(), r.data(), l.data(), r.data(), block);
         for (int i = 0; i < block; ++i)
         {

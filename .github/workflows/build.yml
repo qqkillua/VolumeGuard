@@ -53,6 +53,8 @@ jobs:
           path: |
             native/build/vgaudio.dll
             native/build/vgaudio-smoke.exe
+            native/build/vgaudio-hang.dll
+            native/build/vgaudio-hang-test.exe
 
   build:
     needs: native
@@ -111,6 +113,21 @@ jobs:
           if ([Vg]::vg_start("same", "same") -ne -2) { throw "vg_start via P/Invoke" }
           "::notice title=vgaudio::DLL loads in .NET (64-bit), API version $([Vg]::vg_version()), $([Vg]::vg_list_devices($null, 0)) chars of device list"
 
+      # A Windows audio call that never returns (the audio service hung) must not hang vg_start / vg_stop, and
+      # with them closing VolumeGuard (2.8.6). Test build of the engine whose first audio call "hangs" 16 s.
+      - name: Hang test vgaudio.dll
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory hangtest | Out-Null
+          Copy-Item native-bin/vgaudio-hang.dll, native-bin/vgaudio-hang-test.exe hangtest/
+          Push-Location hangtest
+          $out = ./vgaudio-hang-test.exe
+          $code = $LASTEXITCODE
+          Pop-Location
+          $out
+          if ($code -ne 0) { throw "vgaudio hang test failed" }
+          "::notice title=Hang test::$($out | Select-String 'hung audio call')"
+
       # Product name and version are part of the signing policy: make sure the exe carries the right ones.
       - name: Check product name and version
         id: ver
@@ -124,8 +141,10 @@ jobs:
           if ($info.ProductVersion -ne $want) { throw "ProductVersion is '$($info.ProductVersion)', VERSION file says '$want' (update src/AssemblyInfo.cs)" }
           if (-not $info.FileVersion.StartsWith($want)) { throw "FileVersion is '$($info.FileVersion)', VERSION file says '$want'" }
           if ("${{ github.ref }}" -like "refs/tags/v*") { $tag = "${{ github.ref_name }}" } else { $tag = "v$want" }
-          $release = ("${{ github.ref }}" -like "refs/tags/v*") -or
+          $prerelease = "${{ github.event_name }}" -eq "push" -and "$env:COMMIT_MESSAGE".Contains('[prerelease]')
+          $release = ("${{ github.ref }}" -like "refs/tags/v*") -or $prerelease -or
                      ("${{ github.event_name }}" -eq "push" -and "$env:COMMIT_MESSAGE".Contains('[release]'))
+          "prerelease=$($prerelease.ToString().ToLower())" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "release=$($release.ToString().ToLower())" >> $env:GITHUB_OUTPUT
           Write-Host "VolumeGuard $want, release: $release"
@@ -199,12 +218,15 @@ jobs:
 
       # A release is published for a pushed v* tag, or for a push to main whose
       # commit message contains [release] (the version is taken from the VERSION file).
+      # [prerelease] publishes it as a pre-release: the app's update check skips those, so a version can be
+      # tried for a few days before everyone is told about it (then mark it a normal release on GitHub).
       - name: Publish release
         if: steps.ver.outputs.release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.tag }}
           target_commitish: ${{ github.sha }}
+          prerelease: ${{ steps.ver.outputs.prerelease == 'true' }}
           name: VolumeGuard ${{ steps.ver.outputs.tag }}
           body_path: .github/release-notes.md
           files: VolumeGuard.zip

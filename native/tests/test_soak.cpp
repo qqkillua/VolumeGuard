@@ -52,8 +52,7 @@ int main()
     std::deque<float> queue;
     for (int i = 0; i < (int)pacer.targetFrames(); ++i) queue.push_back(0.0f);
     std::vector<float> lr((size_t)capFrames * 2), l(4096), r(4096), tail;
-    uint64_t sample = 0, written = 0, lastWritten = 0, pulls = 0;
-    double srcPos = 0;                        // source clock, in its own frames
+    uint64_t sample = 0, written = 0, lastWritten = 0;
     double srcIdeal = capFrames / rate;       // when the next packet is due on the source's own (drifting) clock
     double tCap = capFrames / rate, tPull = 0.0013 + period / rate, tPoll = 0.001, lastPoll = 0, quietUntil = 0;
     int held = 0, glitches = 0, glitchesNearEvents = 0, lateHiccups = 0;
@@ -97,7 +96,6 @@ int main()
                 }
                 held = 0;
             }
-            srcPos += capFrames;
             const double srcRate = rate * (1 + ppmAt(t) * 1e-6);
             // the clock drifts, the delivery jitters around it (±0.25 ms, not adding up)
             srcIdeal += capFrames / srcRate;
@@ -117,7 +115,6 @@ int main()
                 if (!std::isfinite(v)) nan = true;
                 if (t > hour - 1.0) tail.push_back(v);
             }
-            ++pulls;
             tPull += period / rate + (u(rng) - 0.5) * 0.0002;
             eventPending = true;
             tPoll = std::max(blockedUntil, std::min(tPoll, t + 0.00005 + u(rng) * 0.0004));   // a stalled thread does not wake

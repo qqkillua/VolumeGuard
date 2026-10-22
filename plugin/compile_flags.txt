@@ -1,0 +1,8 @@
+-xc++
+-std=c++17
+--target=x86_64-w64-mingw32
+-Wall
+-Wextra
+-Isrc
+-Idpf/distrho
+-Idpf/dgl

@@ -21,11 +21,19 @@ namespace VolumeGuard
         }
 
         /// The newest app version among the release tags ("v2.8.0"; the plugin's "limiter-v1.3.0" are not the app).
+        /// Pre-releases are skipped (2.8.7): a version is tried there first, and only a normal release is offered.
         public static Version NewestIn(string json)
         {
+            json = json ?? "";
             Version best = null;
-            foreach (Match m in Regex.Matches(json ?? "", "\"tag_name\"\\s*:\\s*\"v(\\d+\\.\\d+(?:\\.\\d+){0,2})\""))
+            var tags = Regex.Matches(json, "\"tag_name\"\\s*:\\s*\"v(\\d+\\.\\d+(?:\\.\\d+){0,2})\"");
+            var all = Regex.Matches(json, "\"tag_name\"\\s*:");
+            foreach (Match m in tags)
             {
+                // this release's fields: from its tag_name up to the next release's tag_name
+                int end = json.Length;
+                foreach (Match t in all) if (t.Index > m.Index) { end = t.Index; break; }
+                if (Regex.IsMatch(json.Substring(m.Index, end - m.Index), "\"prerelease\"\\s*:\\s*true")) continue;
                 Version v;
                 if (TryParse(m.Groups[1].Value, out v) && (best == null || v > best)) best = v;
             }

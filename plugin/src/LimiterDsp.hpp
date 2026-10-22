@@ -7,7 +7,7 @@
 //                rebuilds the wave there, and it can be up to ~3 dB above the samples)
 //   2. need    = gain that would bring this peak down to the ceiling (1 if it is already below)
 //   3. hold    = smallest "need" over the last L samples (sliding minimum)
-//   4. release = hold, but allowed to rise only slowly (one-pole, release time)
+//   4. release = hold, but allowed to rise only slowly (one-pole in decibels, release time)
 //   5. gain    = "release" averaged twice: over A samples, and that over B samples, A + B = L + 1
 //                (two box filters in a row: an S-shaped fade-in with no corners)
 //   6. output  = input delayed by L-1 samples × gain
@@ -102,9 +102,9 @@ public:
     void setReleaseMs(float ms)
     {
         releaseMs_ = std::max(0.1f, ms);
-        relCoef_ = coefMs(releaseMs_);
-        relFastS_ = (float)(sr_ * releaseMs_ * kFastFactor / 1000.0);   // in samples
-        relSlowS_ = (float)(sr_ * releaseMs_ * kSlowFactor / 1000.0);
+        relCoef_ = coefMs(releaseMs_ * kDbReleaseScale);
+        relFastS_ = (float)(sr_ * releaseMs_ * kDbReleaseScale * kFastFactor / 1000.0);   // in samples
+        relSlowS_ = (float)(sr_ * releaseMs_ * kDbReleaseScale * kSlowFactor / 1000.0);
         busyUp_ = 1.0f - coefMs(400.0f);     // ~0.4 s of limiting → counted as "busy"
         busyDown_ = 1.0f - coefMs(1500.0f);  // forgotten over ~1.5 s
         busyGap_ = (int)(sr_ * 0.1);
@@ -117,6 +117,10 @@ public:
     float busy() const { return busy_; }
 
     static constexpr float kFastFactor = 0.5f, kSlowFactor = 3.0f;
+    /// The release works in decibels (step 4). With the same time constant that reaches -1 dB later than the old
+    /// release in linear gain did (the last decibel takes longest); this scale makes the time back to -1 dB after
+    /// a typical 6–20 dB reduction about the same as before, so the Release setting keeps its meaning.
+    static constexpr float kDbReleaseScale = 0.78f;
 
     int latencySamples() const { return D_ + kTpHalf; }
 
@@ -190,17 +194,26 @@ public:
             const float hold = dqVal_[(size_t)dqHead_];
 
             // 4. instant down, slow up (auto release: between fast and slow by how busy the limiter has been)
-            float coef = relCoef_;
             if (autoRelease_)
             {
                 // grows while reducing; short pauses (< 100 ms, the gaps of automatic fire) keep it; longer quiet forgets it
                 if (hold < kBusyBelow) { sinceBusy_ = 0; busy_ += (1.0f - busy_) * busyUp_; }
                 else if (sinceBusy_ < busyGap_) ++sinceBusy_;
                 else if ((busy_ -= busy_ * busyDown_) < 1e-20f) busy_ = 0.0f;   // no denormals in long quiet
-                // the release TIME goes from fast to slow (interpolating the coefficients would lean to fast)
-                coef = std::exp(-1.0f / std::max(1.0f, relFastS_ + (relSlowS_ - relFastS_) * busy_));
             }
-            rel_ = hold < rel_ ? hold : hold + (rel_ - hold) * coef;
+            if (hold <= rel_) rel_ = hold;
+            else
+            {
+                // the release TIME goes from fast to slow (interpolating the coefficients would lean to fast)
+                const float coef = autoRelease_ ? std::exp(-1.0f / std::max(1.0f, relFastS_ + (relSlowS_ - relFastS_) * busy_))
+                                                : relCoef_;
+                // Back up in decibels (2.8.7 / Limiter 1.4.2): the gain in dB approaches the target exponentially,
+                // so it comes back evenly. Before, it approached in linear gain: from -20 dB it jumped to about -5 dB
+                // at once and then crawled the rest of the way, heard as a "breath" right after a shot.
+                // Still never above hold (the ceiling guarantee needs rel_ <= hold).
+                const float lh = std::log(hold);
+                rel_ = std::min(hold, std::exp(lh + (std::log(rel_) - lh) * coef));
+            }
 
             // 5. two box filters (running sums, recomputed now and then so rounding errors cannot build up)
             boxSum_ += (double)rel_ - (double)box_[(size_t)boxPos_];

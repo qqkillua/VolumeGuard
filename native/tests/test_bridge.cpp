@@ -220,6 +220,119 @@ int main()
         std::printf("format conversions: float32, 16, 24, 32-bit, 2/6/8 channels round-trip OK\n");
     }
 
+    // Surround (2.8.7): which channels are processed and where they play.
+    {
+        auto fmt = [](int ch, uint32_t mask) { vga::SampleFormat f; f.channels = ch; f.channelMask = mask; return f; };
+        const uint32_t m71 = vga::defaultChannelMask(8), m51side = vga::kSpFL | vga::kSpFR | vga::kSpFC | vga::kSpLFE | vga::kSpSL | vga::kSpSR;
+        const uint32_t m51back = vga::defaultChannelMask(6), mStereo = vga::kSpFL | vga::kSpFR;
+
+        // stereo game into a 7.1 headset, and 7.1 into stereo: the stereo path, exactly as before
+        vga::ChannelPlan p = vga::planChannels(fmt(2, mStereo), fmt(8, m71));
+        CHECK(!p.surround && p.channels == 2, "2 -> 7.1 should stay stereo");
+        p = vga::planChannels(fmt(8, m71), fmt(2, mStereo));
+        CHECK(!p.surround && p.channels == 2, "7.1 -> 2 should be folded to stereo before processing");
+
+        // 7.1 into 7.1: all 8 positions, each to the same channel, nothing added together
+        p = vga::planChannels(fmt(8, m71), fmt(8, m71));
+        CHECK(p.surround && p.channels == 8, "7.1 -> 7.1: %d channels processed", p.channels);
+        bool identity = true;
+        for (int k = 0; k < p.channels; ++k)
+            for (int c = 0; c < 8; ++c)
+                if (p.fold[k][c] != (c == k ? 1.0f : 0.0f) || p.route[k] != k) identity = false;
+        CHECK(identity, "7.1 -> 7.1 should pass every channel straight through (%s)", p.describe().c_str());
+
+        // 5.1 with side speakers into 7.1: sides stay sides; 5.1 with back speakers into 7.1: backs stay backs
+        p = vga::planChannels(fmt(6, m51side), fmt(8, m71));
+        CHECK(p.surround && p.describe() == "FL FR FC LFE SL SR", "5.1 (side) -> 7.1: %s", p.describe().c_str());
+        CHECK(p.surround && p.route[4] == 6 && p.route[5] == 7, "5.1 sides should play on the 7.1 sides");
+        p = vga::planChannels(fmt(6, m51back), fmt(8, m71));
+        CHECK(p.surround && p.describe() == "FL FR FC LFE BL BR", "5.1 (back) -> 7.1: %s", p.describe().c_str());
+
+        // 7.1 into 5.1 (side): the backs have no speakers, they join the sides (before processing)
+        p = vga::planChannels(fmt(8, m71), fmt(6, m51side));
+        CHECK(p.surround && p.channels == 6, "7.1 -> 5.1: %d channels", p.channels);
+        bool backsToSides = false;
+        for (int k = 0; k < p.channels; ++k)
+            if (p.speaker[k] == vga::kSpSL && p.fold[k][4] == 1.0f && p.fold[k][6] == 1.0f) backsToSides = true;
+        CHECK(backsToSides, "7.1 -> 5.1: back left should be added to side left (%s)", p.describe().c_str());
+
+        // every processed channel plays on its own output channel (no two on one: nothing is added after the limiter)
+        for (const auto& pair : { std::make_pair(m71, m71), std::make_pair(m51side, m71), std::make_pair(m71, m51side),
+                                  std::make_pair(m51back, m51side) })
+        {
+            const int sc = __builtin_popcount(pair.first), oc = __builtin_popcount(pair.second);
+            p = vga::planChannels(fmt(sc, pair.first), fmt(oc, pair.second));
+            for (int a = 0; a < p.channels; ++a)
+            {
+                CHECK(p.route[a] >= 0 && p.route[a] < oc, "route %d out of range", p.route[a]);
+                for (int b = a + 1; b < p.channels; ++b) CHECK(p.route[a] != p.route[b], "two channels play on output %d", p.route[a]);
+            }
+        }
+
+        // device bytes → plan → device bytes, 7.1 float to 7.1 int16: each channel lands where it came from
+        {
+            const vga::SampleFormat in = fmt(8, m71);
+            vga::SampleFormat outF = fmt(8, m71); outF.isFloat = false; outF.bitsPerSample = outF.validBits = 16;
+            p = vga::planChannels(in, outF);
+            float src[8];
+            for (int c = 0; c < 8; ++c) src[c] = 0.1f * (float)(c + 1);
+            float x[8];
+            vga::foldFrames(reinterpret_cast<const uint8_t*>(src), 1, in, p, x);
+            float ch[8][1];
+            float* pc[8];
+            for (int c = 0; c < 8; ++c) { ch[c][0] = x[c]; pc[c] = ch[c]; }
+            std::vector<uint8_t> bytes((size_t)outF.blockAlign());
+            vga::fromChannels(pc, p, 1, outF, bytes.data());
+            double err = 0;
+            for (int c = 0; c < 8; ++c) err = std::max(err, (double)std::fabs(vga::readSample(bytes.data() + c * 2, outF) - src[c]));
+            CHECK(err < 1.0 / 32768 + 1e-6, "7.1 round trip through the plan: error %g", err);
+        }
+        std::printf("surround plans: 2->7.1 and 7.1->2 stereo; 7.1->7.1 straight; 5.1 side/back keep their speakers; 7.1->5.1 backs join sides\n");
+    }
+
+    // Surround through the ring and the drift resampler: channels 0/1 of an 8-channel ring come out exactly like
+    // a stereo ring with the same audio, and every other channel is resampled the same way.
+    {
+        const int n = 48000;
+        vga::FrameRing r2, r8;
+        r2.init(n + 64, 2);
+        r8.init(n + 64, 8);
+        std::vector<float> s2((size_t)n * 2), s8((size_t)n * 8);
+        for (int i = 0; i < n; ++i)
+            for (int c = 0; c < 8; ++c)
+            {
+                const float v = 0.5f * (float)std::sin(2 * kPi * (300.0 + 100.0 * c) * i / 44100.0);
+                s8[(size_t)i * 8 + (size_t)c] = v;
+                if (c < 2) s2[(size_t)i * 2 + (size_t)c] = v;
+            }
+        r2.write(s2.data(), (size_t)n);
+        r8.write(s8.data(), (size_t)n);
+        vga::DriftResampler a, b;
+        a.prepare(44100, 48000, 20.0);
+        b.prepare(44100, 48000, 20.0);
+        std::vector<float> l(4096), r(4096), o8(8 * 4096);
+        float* out8[8];
+        for (int c = 0; c < 8; ++c) out8[c] = o8.data() + (size_t)c * 4096;
+        double diff01 = 0, chErr = 0;
+        int total = 0;
+        for (int k = 0; k < 10; ++k)
+        {
+            const int na = a.produce(r2, l.data(), r.data(), 4096, 0.001);
+            const int nb = b.produce(r8, out8, 4096, 0.001);
+            CHECK(na == nb, "frame counts differ: %d vs %d", na, nb);
+            for (int i = 0; i < std::min(na, nb); ++i)
+            {
+                diff01 = std::max(diff01, (double)std::max(std::fabs(l[i] - out8[0][i]), std::fabs(r[i] - out8[1][i])));
+                // channel 7 resampled the same way: compare with what an interpolated sine should be (amplitude)
+                chErr = std::max(chErr, (double)std::fabs(out8[7][i]));
+            }
+            total += nb;
+        }
+        CHECK(diff01 == 0.0, "8-channel ring: channels 0/1 differ from the stereo ring by %g", diff01);
+        CHECK(chErr > 0.45 && chErr < 0.52, "8-channel ring: channel 7 peak %.3f (want ~0.5)", chErr);
+        std::printf("8-channel ring + resampler, 44.1 -> 48 kHz: front pair bit-identical to stereo, %d frames\n", total);
+    }
+
     if (failures) { std::printf("%d check(s) failed\n", failures); return 1; }
     std::printf("all bridge checks passed\n");
     return 0;

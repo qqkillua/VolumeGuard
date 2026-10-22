@@ -17,36 +17,41 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace vga {
 
-/// Single-producer / single-consumer ring of interleaved stereo frames.
+/// The most channels the engine processes (7.1). More are folded down to stereo, as before 2.8.7.
+constexpr int kMaxChannels = 8;
+
+/// Single-producer / single-consumer ring of interleaved frames (stereo, or up to kMaxChannels).
 class FrameRing
 {
 public:
-    void init(size_t capacityFrames)
+    void init(size_t capacityFrames, int channels = 2)
     {
+        ch_ = std::max(1, std::min(kMaxChannels, channels));
         cap_ = std::max<size_t>(capacityFrames, 16);
-        buf_.assign(cap_ * 2, 0.0f);
+        buf_.assign(cap_ * (size_t)ch_, 0.0f);
         w_.store(0); r_.store(0);
     }
 
     size_t capacity() const { return cap_; }
+    int channels() const { return ch_; }
     size_t fill() const { return (size_t)(w_.load(std::memory_order_acquire) - r_.load(std::memory_order_acquire)); }
 
-    /// Producer. Returns frames written; what does not fit is dropped.
-    /// nowSec: when the packet arrived (any monotonic clock shared with the reader).
-    size_t write(const float* lr, size_t frames, double nowSec = 0.0)
+    /// Producer: `frames` interleaved frames of channels() samples. Returns frames written; what does not fit is
+    /// dropped. nowSec: when the packet arrived (any monotonic clock shared with the reader).
+    size_t write(const float* x, size_t frames, double nowSec = 0.0)
     {
         const uint64_t w = w_.load(std::memory_order_relaxed);
         const size_t room = cap_ - (size_t)(w - r_.load(std::memory_order_acquire));
         const size_t n = std::min(frames, room);
         for (size_t i = 0; i < n; ++i)
         {
-            const size_t k = (size_t)((w + i) % cap_) * 2;
-            buf_[k] = lr[2 * i];
-            buf_[k + 1] = lr[2 * i + 1];
+            const size_t k = (size_t)((w + i) % cap_) * (size_t)ch_;
+            for (int c = 0; c < ch_; ++c) buf_[k + (size_t)c] = x[i * (size_t)ch_ + (size_t)c];
         }
         lastWrite_.store(nowSec, std::memory_order_release);
         w_.store(w + n, std::memory_order_release);
@@ -56,7 +61,8 @@ public:
     double lastWriteSec() const { return lastWrite_.load(std::memory_order_acquire); }
 
     /// Consumer: frame at an absolute index in [readPos, writePos).
-    inline float at(uint64_t frame, int ch) const { return buf_[(size_t)(frame % cap_) * 2 + (size_t)ch]; }
+    inline float at(uint64_t frame, int ch) const { return buf_[(size_t)(frame % cap_) * (size_t)ch_ + (size_t)ch]; }
+    inline const float* frame(uint64_t frame) const { return &buf_[(size_t)(frame % cap_) * (size_t)ch_]; }
     uint64_t readPos() const { return r_.load(std::memory_order_relaxed); }
     uint64_t writePos() const { return w_.load(std::memory_order_acquire); }
     void advance(size_t frames) { r_.store(r_.load(std::memory_order_relaxed) + frames, std::memory_order_release); }
@@ -64,6 +70,7 @@ public:
 private:
     std::vector<float> buf_;
     size_t cap_ = 0;
+    int ch_ = 2;
     std::atomic<uint64_t> w_{ 0 }, r_{ 0 };
     std::atomic<double> lastWrite_{ 0.0 };
 };
@@ -219,16 +226,26 @@ public:
     /// kHalf frames the interpolation needs. Returns the number of frames written.
     int produce(FrameRing& ring, float* l, float* r, int maxFrames, double corr)
     {
+        float* out[2] = { l, r };
+        return produce(ring, out, maxFrames, corr);
+    }
+
+    /// The same for any channel count: out[c] for each of ring.channels() channels.
+    int produce(FrameRing& ring, float* const* out, int maxFrames, double corr)
+    {
         corr_ = std::max(-kMaxCorrection, std::min(kMaxCorrection, corr));
         const double step = nominal_ * (1.0 + corr_);
         const uint64_t base = ring.readPos();
         const uint64_t avail = ring.writePos();
+        const int nch = ring.channels();
+        float v[kMaxChannels];
         int i = 0;
         for (; i < maxFrames; ++i)
         {
             const uint64_t i0 = base + (uint64_t)frac_;
             if (i0 + kHalf >= avail) break;
-            interpolate(ring, i0, frac_ - std::floor(frac_), l[i], r[i]);
+            interpolate(ring, i0, frac_ - std::floor(frac_), v);
+            for (int c = 0; c < nch; ++c) out[c][i] = v[c];
             frac_ += step;
         }
         const double whole = std::floor(frac_) - (double)kHalf;
@@ -307,21 +324,30 @@ private:
 
     inline void interpolate(const FrameRing& ring, uint64_t i0, double t, float& outL, float& outR) const
     {
+        float v[kMaxChannels];
+        interpolate(ring, i0, t, v);
+        outL = v[0];
+        outR = v[ring.channels() > 1 ? 1 : 0];
+    }
+
+    /// Every channel of the ring at once (the same sums, in the same order, as the stereo version had).
+    inline void interpolate(const FrameRing& ring, uint64_t i0, double t, float* out) const
+    {
         const double fp = t * kPhases;
         const int ph = std::min(kPhases - 1, (int)fp);
         const float a = (float)(fp - ph);
         const float* c0 = &table_[(size_t)ph * 2 * kHalf];
         const float* c1 = c0 + 2 * kHalf;
-        float sl = 0, sr = 0;
+        const int nch = ring.channels();
+        float s[kMaxChannels] = {};
         const uint64_t first = i0 - (kHalf - 1);
         for (int k = 0; k < 2 * kHalf; ++k)
         {
             const float c = c0[k] + (c1[k] - c0[k]) * a;
-            sl += c * ring.at(first + (uint64_t)k, 0);
-            sr += c * ring.at(first + (uint64_t)k, 1);
+            const float* f = ring.frame(first + (uint64_t)k);
+            for (int ch = 0; ch < nch; ++ch) s[ch] += c * f[ch];
         }
-        outL = sl;
-        outR = sr;
+        for (int ch = 0; ch < nch; ++ch) out[ch] = s[ch];
     }
 
     std::vector<float> table_;
@@ -587,6 +613,7 @@ struct SampleFormat
     int bitsPerSample = 32;     // container size
     int validBits = 32;
     bool isFloat = true;
+    uint32_t channelMask = 0;   // WAVEFORMATEXTENSIBLE::dwChannelMask; 0 = not given (the usual layout for the count)
     int blockAlign() const { return channels * bitsPerSample / 8; }
 };
 
@@ -676,6 +703,194 @@ inline void fromStereo(const float* l, const float* r, size_t frames, const Samp
             writeSample(fr, f, l[i]);
             writeSample(fr + bytes, f, r[i]);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Surround (2.8.7). Before, everything was folded down to stereo and played on the output's front left and
+// right only: a 7.1 game into a 7.1 headset lost where the sounds came from. When both devices have more than
+// two channels, the engine now processes each speaker position on its own (with one gain for all, so the
+// balance between them is kept) and plays it on the same position of the output.
+
+/// Speaker positions: the bits of WAVEFORMATEXTENSIBLE::dwChannelMask, in the order the channels sit in a frame.
+constexpr uint32_t kSpFL = 0x1, kSpFR = 0x2, kSpFC = 0x4, kSpLFE = 0x8, kSpBL = 0x10, kSpBR = 0x20,
+                   kSpFLC = 0x40, kSpFRC = 0x80, kSpBC = 0x100, kSpSL = 0x200, kSpSR = 0x400;
+
+/// The layout Windows assumes for a channel count when a format gives no mask.
+inline uint32_t defaultChannelMask(int channels)
+{
+    switch (channels)
+    {
+    case 1: return kSpFC;
+    case 2: return kSpFL | kSpFR;
+    case 3: return kSpFL | kSpFR | kSpLFE;
+    case 4: return kSpFL | kSpFR | kSpBL | kSpBR;
+    case 5: return kSpFL | kSpFR | kSpFC | kSpBL | kSpBR;
+    case 6: return kSpFL | kSpFR | kSpFC | kSpLFE | kSpBL | kSpBR;
+    case 7: return kSpFL | kSpFR | kSpFC | kSpLFE | kSpBC | kSpSL | kSpSR;
+    case 8: return kSpFL | kSpFR | kSpFC | kSpLFE | kSpBL | kSpBR | kSpSL | kSpSR;
+    default: return 0;
+    }
+}
+
+/// The speaker of each channel of a format (0 for a channel the mask does not name).
+inline void speakersOf(const SampleFormat& f, uint32_t* sp, int maxCh)
+{
+    uint32_t mask = f.channelMask ? f.channelMask : defaultChannelMask(f.channels);
+    for (int c = 0; c < f.channels && c < maxCh; ++c)
+    {
+        const uint32_t bit = mask & (~mask + 1);   // lowest set bit
+        sp[c] = bit;
+        mask &= ~bit;
+    }
+}
+
+inline const char* speakerName(uint32_t s)
+{
+    switch (s)
+    {
+    case kSpFL: return "FL"; case kSpFR: return "FR"; case kSpFC: return "FC"; case kSpLFE: return "LFE";
+    case kSpBL: return "BL"; case kSpBR: return "BR"; case kSpFLC: return "FLC"; case kSpFRC: return "FRC";
+    case kSpBC: return "BC"; case kSpSL: return "SL"; case kSpSR: return "SR"; default: return "?";
+    }
+}
+
+/// How the source's channels become the processed channels, and where those go in the output.
+/// Folding (adding channels together) happens only BEFORE the processing; afterwards every processed channel is
+/// copied to exactly one output channel, so the output can never be louder than the processing's ceiling.
+struct ChannelPlan
+{
+    static constexpr int kMaxSource = 32;
+    bool surround = false;                  // false: the stereo path (toStereo / fromStereo), exactly as before
+    int channels = 2;                       // channels processed
+    int sourceChannels = 2;
+    int route[kMaxChannels] = { 0, 1 };     // output channel of each processed channel
+    uint32_t speaker[kMaxChannels] = { kSpFL, kSpFR };
+    float fold[kMaxChannels][kMaxSource] = {};   // [processed][source] weight
+
+    std::string describe() const
+    {
+        std::string s;
+        for (int c = 0; c < channels; ++c) { if (c) s += ' '; s += speakerName(speaker[c]); }
+        return s;
+    }
+};
+
+/// Surround only when both devices have more than two channels (and at most 8 positions end up processed);
+/// otherwise the stereo plan: the same sound as before 2.8.7.
+inline ChannelPlan planChannels(const SampleFormat& src, const SampleFormat& out)
+{
+    ChannelPlan p;
+    p.sourceChannels = src.channels;
+    if (src.channels <= 2 || out.channels <= 2 || src.channels > ChannelPlan::kMaxSource || out.channels > 32) return p;
+
+    uint32_t sIn[ChannelPlan::kMaxSource] = {}, sOut[32] = {};
+    speakersOf(src, sIn, ChannelPlan::kMaxSource);
+    speakersOf(out, sOut, 32);
+    uint32_t outMask = 0;
+    for (int c = 0; c < out.channels; ++c) outMask |= sOut[c];
+    if ((outMask & (kSpFL | kSpFR)) != (kSpFL | kSpFR)) return p;   // no front pair to fall back on
+    auto has = [&](uint32_t s) { return (outMask & s) != 0; };
+    auto outIndex = [&](uint32_t s) { for (int c = 0; c < out.channels; ++c) if (sOut[c] == s) return c; return -1; };
+
+    // where a source speaker plays: the same position, a close one (side ↔ back, front-centre pairs → front),
+    // or nowhere (0: folded into the front pair instead)
+    auto place = [&](uint32_t s) -> uint32_t {
+        if (has(s)) return s;
+        switch (s)
+        {
+        case kSpSL: return has(kSpBL) ? kSpBL : 0;
+        case kSpSR: return has(kSpBR) ? kSpBR : 0;
+        case kSpBL: return has(kSpSL) ? kSpSL : 0;
+        case kSpBR: return has(kSpSR) ? kSpSR : 0;
+        case kSpFLC: return kSpFL;
+        case kSpFRC: return kSpFR;
+        default: return 0;
+        }
+    };
+    auto addTo = [&](uint32_t target, int srcCh, float w) -> bool {
+        int k = 0;
+        for (; k < p.channels; ++k) if (p.speaker[k] == target) break;
+        if (k == p.channels)
+        {
+            if (p.channels == kMaxChannels) return false;
+            p.speaker[k] = target;
+            p.route[k] = outIndex(target);
+            ++p.channels;
+        }
+        p.fold[k][srcCh] += w;
+        return true;
+    };
+
+    p.channels = 0;
+    const float h = 0.7071f;   // folded into the front pair at -3 dB, as toStereo does
+    for (int c = 0; c < src.channels; ++c)
+    {
+        const uint32_t s = sIn[c];
+        if (s == 0) continue;                                   // a channel the layout does not name
+        if (s == kSpLFE && !has(kSpLFE)) continue;              // no subwoofer channel: left out, as in stereo
+        const uint32_t t = s == kSpLFE ? kSpLFE : place(s);
+        bool ok;
+        if (t) ok = addTo(t, c, 1.0f);
+        else if (s == kSpFC || s == kSpBC) ok = addTo(kSpFL, c, h) && addTo(kSpFR, c, h);
+        else if (s == kSpBL || s == kSpSL) ok = addTo(kSpFL, c, h);
+        else if (s == kSpBR || s == kSpSR) ok = addTo(kSpFR, c, h);
+        else continue;
+        if (!ok) return ChannelPlan{ false, 2, src.channels };   // more than kMaxChannels positions
+    }
+    if (p.channels < 2) return ChannelPlan{ false, 2, src.channels };
+    // processed channels in the output's channel order (a stable, readable layout)
+    for (int a = 0; a < p.channels; ++a)
+        for (int b = a + 1; b < p.channels; ++b)
+            if (p.route[b] < p.route[a])
+            {
+                std::swap(p.route[a], p.route[b]);
+                std::swap(p.speaker[a], p.speaker[b]);
+                for (int c = 0; c < ChannelPlan::kMaxSource; ++c) std::swap(p.fold[a][c], p.fold[b][c]);
+            }
+    p.surround = true;
+    return p;
+}
+
+/// Device frames → interleaved processed channels, by the plan's fold weights (surround plans only).
+inline void foldFrames(const uint8_t* data, size_t frames, const SampleFormat& f, const ChannelPlan& p, float* x)
+{
+    const int ch = std::min(f.channels, ChannelPlan::kMaxSource), bytes = f.bitsPerSample / 8, ba = f.blockAlign();
+    float s[ChannelPlan::kMaxSource];
+    for (size_t i = 0; i < frames; ++i)
+    {
+        const uint8_t* fr = data + i * (size_t)ba;
+        for (int c = 0; c < ch; ++c) s[c] = readSample(fr + c * bytes, f);
+        float* o = x + i * (size_t)p.channels;
+        for (int k = 0; k < p.channels; ++k)
+        {
+            float v = 0.0f;
+            for (int c = 0; c < ch; ++c) v += p.fold[k][c] * s[c];
+            o[k] = v;
+        }
+    }
+}
+
+/// Processed channels → device frames: each to its own output channel (no adding), the rest silent.
+inline void fromChannels(const float* const* x, const ChannelPlan& p, size_t frames, const SampleFormat& f, uint8_t* data)
+{
+    const int bytes = f.bitsPerSample / 8, ba = f.blockAlign();
+    std::memset(data, 0, frames * (size_t)ba);
+    for (size_t i = 0; i < frames; ++i)
+    {
+        uint8_t* fr = data + i * (size_t)ba;
+        for (int k = 0; k < p.channels; ++k) writeSample(fr + p.route[k] * bytes, f, x[k][i]);
+    }
+}
+
+/// declickStart for any channel count: x interleaved, from[c] the last value played on each channel.
+inline void declickStartN(float* x, size_t frames, int nch, size_t ramp, const float* from)
+{
+    const size_t n = std::min(frames, ramp);
+    for (size_t i = 0; i < n; ++i)
+    {
+        const float w = 0.5f - 0.5f * (float)std::cos(3.14159265358979323846 * (double)(i + 1) / (double)(n + 1));
+        for (int c = 0; c < nch; ++c) x[i * (size_t)nch + (size_t)c] = from[c] + (x[i * (size_t)nch + (size_t)c] - from[c]) * w;
     }
 }
 

@@ -402,6 +402,41 @@ int main()
         std::printf("4 min of silence after limiting: no denormals\n");
     }
 
+    // 11. The gain comes back up evenly in decibels: after a loud part that needed -12 dB, one half-life of the
+    //     release (Release × kDbReleaseScale × ln 2) later it is at about -6 dB. Coming back in linear gain (before
+    //     2.8.7) it was already at about -4.5 dB then, after a jump in the first milliseconds.
+    {
+        const double sr = 48000.0;
+        const float relMs = 100.0f;
+        LookaheadLimiter lim;
+        lim.prepare(sr, 2);
+        lim.setCeilingDb(-12.0f);
+        lim.setTruePeak(false);
+        lim.setAutoRelease(false);
+        lim.setReleaseMs(relMs);
+        const size_t n = (size_t)(sr * 1.0), loudEnd = (size_t)(sr * 0.3);
+        Stereo in; in.l.assign(n, 0.25f); in.r.assign(n, 0.25f);
+        for (size_t i = (size_t)(sr * 0.1); i < loudEnd; ++i) in.l[i] = in.r[i] = 1.0f;
+        Stereo out = run(lim, in, 9, false);
+        const size_t lat = (size_t)lim.latencySamples();
+        std::vector<double> gDb(n, 0.0);
+        for (size_t i = lat; i < n; ++i) gDb[i] = 20.0 * std::log10(out.l[i] / in.l[i - lat]);
+        size_t start = 0;   // the first sample where the gain rises after the loud part
+        for (size_t i = loudEnd; i + 1 < n; ++i)
+            if (gDb[i] > -12.0 + 0.01) { start = i; break; }
+        const double halfMs = relMs * LookaheadLimiter::kDbReleaseScale * std::log(2.0);
+        const size_t half = start + (size_t)(sr * halfMs / 1000.0);
+        const size_t early = start + (size_t)(sr * 0.005);
+        CHECK(start > 0 && half < n, "release did not start");
+        if (start > 0 && half < n)
+        {
+            CHECK(gDb[half] > -6.8 && gDb[half] < -5.2, "one half-life into the release the gain is %.2f dB (want about -6)", gDb[half]);
+            CHECK(gDb[early] < -9.0, "5 ms into the release the gain is already %.2f dB (a jump, not an even return)", gDb[early]);
+            std::printf("release in dB: -12 dB -> %.1f dB after 5 ms, %.1f dB after one half-life (%.0f ms)\n",
+                        gDb[early], gDb[half], halfMs);
+        }
+    }
+
     // 5. Speed: 60 s of stereo at 48 kHz.
     {
         LookaheadLimiter lim;

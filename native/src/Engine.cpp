@@ -264,6 +264,7 @@ bool parseFormat(const WAVEFORMATEX* wf, vga::SampleFormat& f)
         else if (IsEqualGUID(x->SubFormat, kSubtypePcm)) f.isFloat = false;
         else return false;
         if (x->Samples.wValidBitsPerSample) f.validBits = x->Samples.wValidBitsPerSample;
+        f.channelMask = x->dwChannelMask;   // which speaker each channel is (surround, 2.8.7)
     }
     else return false;
     if (f.channels < 1 || f.channels > 32) return false;
@@ -491,6 +492,9 @@ private:
         // and envelopes fading out in long silence would otherwise reach denormal floats, which the CPU handles
         // many times slower. The DSP code flushes its own envelopes too (the plugin's host decides this there).
         _mm_setcsr(_mm_getcsr() | 0x8040);
+#ifdef VG_TEST_HANG_MS
+        Sleep(VG_TEST_HANG_MS);   // test build only (tests/test_hang.cpp): a Windows audio call that does not return
+#endif
         const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         timeBeginPeriod(1);
         bool first = true;
@@ -596,10 +600,16 @@ private:
                 narrow(deviceName(srcDev.p)).c_str(), describe(capFormat_, srcRate).c_str(), srcPeriodMs, srcLow ? ", low-latency" : "",
                 narrow(deviceName(outDev.p)).c_str(), describe(outFormat, outRate).c_str(), outPeriodMs, outLow ? ", low-latency" : "",
                 renFrames, keep_ ? "" : ", no keep-alive");
+        // stereo, or surround when both devices have more than two channels (see ChannelPlan in Bridge.hpp)
+        const vga::ChannelPlan plan = vga::planChannels(capFormat_, outFormat);
+        const int nch = plan.channels;
+        if (capFormat_.channels > 2 || outFormat.channels > 2)
+            logLine("channels: %s", plan.surround ? ("surround, " + std::to_string(nch) + " processed: " + plan.describe()).c_str()
+                                                  : "stereo (the source is stereo: played on the output's front left and right)");
 
         // --- push mode: one thread takes each source packet, processes it and queues it in the output at once.
         // The only buffer is the output device's queue; OutputPacer keeps it just big enough (see Bridge.hpp).
-        ring_.init((size_t)srcRate);                       // 1 s of room (normally holds less than a packet)
+        ring_.init((size_t)srcRate, nch);                  // 1 s of room (normally holds less than a packet)
         vga::DriftResampler rs;
         rs.prepare(srcRate, outRate, 20.0);
         vga::OutputPacer pacer;
@@ -608,10 +618,13 @@ private:
         vga::SourceWatch watch;   // stopped (feed silence) or only late in lumps (wait for it): see Bridge.hpp
         watch.prepare(srcPeriodMs / 1000.0);
         vga::Processor proc;
-        proc.prepare(outRate);
+        proc.prepare(outRate, nch);
         vga::Params params = currentParams();
         proc.setParams(params);
-        std::vector<float> l(renFrames), r(renFrames), lr(4096 * 2);
+        // one buffer per processed channel (out[c]), and the captured packet interleaved (lr)
+        std::vector<float> outBuf((size_t)nch * renFrames), lr(4096 * (size_t)nch);
+        float* out[vga::kMaxChannels];
+        for (int c = 0; c < nch; ++c) out[c] = outBuf.data() + (size_t)c * renFrames;
         const float lookMs = 1000.0f * (float)proc.latencyFrames() / (float)outRate;
         sourceMs_.store((float)srcPeriodMs);
         lookaheadMs_.store(lookMs);
@@ -638,11 +651,11 @@ private:
         bool produced = false;
         bool silenced = false;   // silence was put into the output since the last audio: fade the next one in
         bool rejoin = false;     // late sound was dropped: crossfade into what comes next
-        float lastProdL = 0.0f, lastProdR = 0.0f;
+        float lastProd[vga::kMaxChannels] = {};   // the last sample played on each channel
         uint64_t drops = 0;
         double droppedMs = 0.0, lastDropLog = -1e9;
         // joins in the source: a gap Windows reports (DATA_DISCONTINUITY) or sound coming back after silence
-        float lastL = 0.0f, lastR = 0.0f;
+        float last[vga::kMaxChannels] = {};       // the last captured sample of each channel
         uint64_t packets = 0, gaps = 0, resumes = 0;
         double lastGapLog = -1e9, lastResumeLog = -1e9;
         const size_t declickFrames = (size_t)std::max(8.0, srcRate * 0.002);   // 2 ms
@@ -685,17 +698,20 @@ private:
                 if (FAILED(hr = capture_->GetBuffer(&cdata, &frames, &flags, nullptr, nullptr))) break;
                 if (frames > 0)
                 {
-                    if (lr.size() < (size_t)frames * 2) lr.resize((size_t)frames * 2);
+                    const size_t samples = (size_t)frames * (size_t)nch;
+                    if (lr.size() < samples) lr.resize(samples);
                     if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) || !cdata || blockAlign <= 0)
-                        std::fill(lr.begin(), lr.begin() + (size_t)frames * 2, 0.0f);
+                        std::fill(lr.begin(), lr.begin() + samples, 0.0f);
+                    else if (plan.surround)
+                        vga::foldFrames(cdata, frames, capFormat_, plan, lr.data());
                     else
                         vga::toStereo(cdata, frames, capFormat_, lr.data());
                     const bool gap = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) && packets > 0;
                     if (gap || wasStalled)
                     {
                         // after silence we played zeros, so fade in from 0; after a gap, from the last sample
-                        if (wasStalled) { lastL = lastR = 0.0f; }
-                        vga::declickStart(lr.data(), frames, declickFrames, lastL, lastR);
+                        if (wasStalled) std::fill(last, last + nch, 0.0f);
+                        vga::declickStartN(lr.data(), frames, nch, declickFrames, last);
                         if (gap)
                         {
                             ++gaps;
@@ -717,8 +733,7 @@ private:
                         }
                         wasStalled = false;
                     }
-                    lastL = lr[(size_t)frames * 2 - 2];
-                    lastR = lr[(size_t)frames * 2 - 1];
+                    for (int c = 0; c < nch; ++c) last[c] = lr[samples - (size_t)nch + (size_t)c];
                     ++packets;
                     ring_.write(lr.data(), frames, now);
                     polledFrames += frames;
@@ -800,7 +815,7 @@ private:
             const vga::Params p = currentParams();
             if (p != params) { params = p; proc.setParams(p); }
             const UINT32 room = renFrames - std::min(renFrames, padding);
-            int n = rs.produce(ring_, l.data(), r.data(), (int)std::min<UINT32>(room, (UINT32)l.size()), corr);
+            int n = rs.produce(ring_, out, (int)std::min<UINT32>(room, renFrames), corr);
             if (n > 0)
             {
                 // after dropping late sound: glide from the last sample played to the new one over 2 ms
@@ -810,13 +825,11 @@ private:
                     for (int i = 0; i < ramp; ++i)
                     {
                         const float w = 0.5f - 0.5f * std::cos(3.14159265f * (float)(i + 1) / (float)ramp);
-                        l[i] = lastProdL + (l[i] - lastProdL) * w;
-                        r[i] = lastProdR + (r[i] - lastProdR) * w;
+                        for (int c = 0; c < nch; ++c) out[c][i] = lastProd[c] + (out[c][i] - lastProd[c]) * w;
                     }
                     rejoin = false;
                 }
-                lastProdL = l[n - 1];
-                lastProdR = r[n - 1];
+                for (int c = 0; c < nch; ++c) lastProd[c] = out[c][n - 1];
             }
             if (n == 0 && produced && stalled)
             {
@@ -825,11 +838,10 @@ private:
                 const UINT32 want = std::min(renFrames, (UINT32)pacer.floorFrames() + outPeriod);
                 if (padding < want)
                 {
-                    n = (int)std::min<UINT32>(want - padding, (UINT32)l.size());
-                    std::fill(l.begin(), l.begin() + n, 0.0f);
-                    std::fill(r.begin(), r.begin() + n, 0.0f);
+                    n = (int)std::min<UINT32>(want - padding, renFrames);
+                    for (int c = 0; c < nch; ++c) std::fill(out[c], out[c] + n, 0.0f);
                     silenced = true;
-                    lastProdL = lastProdR = 0.0f;
+                    std::fill(lastProd, lastProd + nch, 0.0f);
                 }
                 quietUntil = now + 0.3;
                 state_.store(VG_STATE_BUFFERING);
@@ -841,9 +853,10 @@ private:
             }
             if (n > 0)
             {
-                proc.process(l.data(), r.data(), n);
+                proc.process(out, n);
                 if (FAILED(hr = render->GetBuffer((UINT32)n, &data))) { logLine("output: GetBuffer 0x%08lX", (unsigned long)hr); break; }
-                vga::fromStereo(l.data(), r.data(), (size_t)n, outFormat, data);
+                if (plan.surround) vga::fromChannels(out, plan, (size_t)n, outFormat, data);
+                else vga::fromStereo(out[0], out[1], (size_t)n, outFormat, data);
                 if (FAILED(hr = render->ReleaseBuffer((UINT32)n, 0))) { logLine("output: ReleaseBuffer 0x%08lX", (unsigned long)hr); break; }
                 // the newest sample waits behind everything queued
                 const double waitMs = 1000.0 * (double)(padding + (UINT32)n) / outRate;
