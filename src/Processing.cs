@@ -351,7 +351,15 @@ namespace VolumeGuard
         {
             if (!Available || demo) return;
             Interlocked.Increment(ref generation);
-            lock (sync) { try { VgNative.vg_stop(); } catch { } }
+            // A start still in progress holds sync (vg_start waits up to ~8 s): on exit, do not wait for it longer
+            // than this. The process ends right after closing, which also ends the engine thread.
+            if (!Monitor.TryEnter(sync, 3000))
+            {
+                Log.Line("processing: a start is still in progress; closing without waiting for it");
+                return;
+            }
+            try { VgNative.vg_stop(); } catch { }
+            finally { Monitor.Exit(sync); }
         }
 
         /// Why the last start failed (when StartResult != 0).

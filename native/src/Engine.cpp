@@ -123,11 +123,11 @@ void appendToLog(const std::wstring& path, const char* text, DWORD size)
     CloseHandle(h);
 }
 
-char gLogBatch[kLogSlots * kLogLineMax + 64];   // the writer thread's (or, at process exit, logDrainAtExit's)
+char gLogBatch[kLogSlots * kLogLineMax + 64];   // the writer thread's
 
 /// Copies the queued lines, and a note about dropped ones, into gLogBatch; returns the byte count and, in
 /// lines, how many to remove from the queue once they are in the file. Lock held. The lines stay queued while
-/// they are being written: if the process exits in the middle, logDrainAtExit still finds them.
+/// they are being written, so logFlush waits for them too.
 DWORD copyQueuedLocked(int& lines)
 {
     DWORD size = 0;
@@ -172,21 +172,6 @@ DWORD WINAPI logWriter(LPVOID)
             LeaveCriticalSection(&gLogLock);
         }
     }
-}
-
-/// Process exit (the other threads, the writer too, are already gone): write what is still queued, so the
-/// last lines before an exit without vg_stop are not lost. A line the writer had just written when it was
-/// stopped can appear twice; none goes missing. TryEnter: a thread killed holding the lock never releases it.
-void logDrainAtExit()
-{
-    if (!gLogWake || !TryEnterCriticalSection(&gLogLock)) return;
-    int lines = 0;
-    const DWORD size = copyQueuedLocked(lines);
-    popQueuedLocked(lines);
-    LeaveCriticalSection(&gLogLock);
-    if (size == 0) return;
-    const std::wstring path = logPath();
-    if (!path.empty()) appendToLog(path, gLogBatch, size);
 }
 
 BOOL CALLBACK startLogWriter(PINIT_ONCE, PVOID, PVOID*)
@@ -349,7 +334,12 @@ public:
             return fail(VG_ERR_SAME, "source and output are the same device (the sound would feed back into itself)");
 
         EnterCriticalSection(&lock_);
-        stopLocked();
+        if (!stopLocked())
+        {
+            LeaveCriticalSection(&lock_);
+            logFlush(500);
+            return fail(VG_ERR_TIMEOUT, "the previous processing has not stopped yet (Windows audio does not respond)");
+        }
         sourceId_ = sourceId;
         outputId_ = outputId;
         {
@@ -384,7 +374,7 @@ public:
     void stop()
     {
         EnterCriticalSection(&lock_);
-        stopLocked();
+        stopLocked();   // at most kStopWaitMs, even if a Windows audio call hangs
         LeaveCriticalSection(&lock_);
         logFlush(500);   // the app may exit right after: get "stopped" and what came before it into the file
     }
@@ -463,15 +453,29 @@ public:
     }
 
 private:
-    void stopLocked()
+    /// How long vg_stop / vg_start wait for the engine thread to end.
+    static constexpr DWORD kStopWaitMs = 3000;
+
+    /// Asks the engine thread to end and waits up to kStopWaitMs. Returns true when it is gone. Before 2.8.6
+    /// this waited without a limit: a Windows audio call that never returns (the audio service hung, e.g. while
+    /// Windows ran out of memory) then hung vg_stop, and with it closing VolumeGuard. Now the thread is left to
+    /// end on its own (the stop event stays set, so it quits as soon as the call returns); its handle is kept,
+    /// so a new start refuses to run a second engine beside it and a later stop waits for it again.
+    bool stopLocked()
     {
-        if (!thread_) return;
+        if (!thread_) return true;
         SetEvent(stopEvent_);
-        WaitForSingleObject(thread_, INFINITE);
+        if (WaitForSingleObject(thread_, kStopWaitMs) == WAIT_TIMEOUT)
+        {
+            logLine("the processing did not stop within %lu ms (a Windows audio call does not return); left to end on its own",
+                    (unsigned long)kStopWaitMs);
+            return false;
+        }
         CloseHandle(thread_);
         thread_ = nullptr;
         state_.store(VG_STATE_STOPPED);
         logLine("stopped");
+        return true;
     }
 
     static DWORD WINAPI engineThread(LPVOID self)
@@ -1145,10 +1149,9 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
     {
         // FreeLibrary: the app should call vg_stop first; threads cannot be joined safely from here.
     }
-    else if (reason == DLL_PROCESS_DETACH)
-    {
-        logDrainAtExit();   // process exit: the log writer thread is already gone
-    }
+    // Process exit: nothing is done here on purpose. The other threads are already killed, possibly in the middle
+    // of using the heap or a lock, and this runs under the loader lock: file and heap work here can hang the exit
+    // (2.8.5 wrote the log's last lines here). vg_stop and a failed vg_start flush the log instead.
     return TRUE;
 }
 

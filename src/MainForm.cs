@@ -706,6 +706,7 @@ namespace VolumeGuard
                 }
                 return;
             }
+            if (!demo) StartExitWatchdog();
             timer.Stop();
             if (hotkeysRegistered)
                 foreach (int id in new[] { HkProcessing, HkMode, HkLimiter }) Native.UnregisterHotKey(Handle, id);
@@ -721,6 +722,27 @@ namespace VolumeGuard
             if (!demo) { s.StopSaver(); s.Save(); }
             tray.Visible = false;
             base.OnFormClosing(e);
+        }
+
+        const int ExitWatchdogMs = 15000;
+
+        /// Closing must end the process, whatever Windows does (2.8.6). Every step of closing waits for Windows
+        /// audio (volumes put back, the processing stopped, COM objects released); when the audio service hangs
+        /// (it did while Windows ran out of memory during a game) a step can wait for ever, and VolumeGuard stayed
+        /// in memory using the CPU. If the process is still alive ExitWatchdogMs after closing began, it is ended.
+        static void StartExitWatchdog()
+        {
+            var t = new Thread(() =>
+            {
+                Thread.Sleep(ExitWatchdogMs);
+                // the log itself may hang on a struggling disk: give it a second at most
+                var log = new Thread(() => Log.Line("closing took longer than " + ExitWatchdogMs / 1000 +
+                                                    " s (a Windows call does not return): process ended")) { IsBackground = true };
+                log.Start();
+                log.Join(1000);
+                Native.ExitNow(1);
+            }) { IsBackground = true, Name = "VolumeGuard exit watchdog" };
+            t.Start();
         }
 
         /// The program used to be called "Sound Lock+": move its autostart entry over to the new name.
@@ -881,6 +903,10 @@ namespace VolumeGuard
             }
             Application.Run(form);
             GC.KeepAlive(mutex);
+            // Everything is saved, the volumes are back and the processing is stopped (OnFormClosing). End the process
+            // right here instead of the normal .NET shutdown: that releases the remaining Windows audio COM objects
+            // and unloads the DLLs, and each of those can wait for the audio service when it does not respond.
+            if (!demo) Native.ExitNow(0);
         }
 
         static Settings DemoSettings()

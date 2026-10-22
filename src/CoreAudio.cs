@@ -207,6 +207,15 @@ namespace VolumeGuard
         public static extern IntPtr GetCurrentProcess();
 
         [DllImport("kernel32.dll")]
+        static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+        /// Ends this process at once: no finalizers, no DLL unloading (see Program.Run and the exit watchdog).
+        public static void ExitNow(uint exitCode)
+        {
+            try { TerminateProcess(GetCurrentProcess(), exitCode); } catch { }
+        }
+
+        [DllImport("kernel32.dll")]
         public static extern bool SetProcessWorkingSetSize(IntPtr process, IntPtr minSize, IntPtr maxSize);
 
         /// Gives unused memory back to Windows (used when the window goes to the tray).
